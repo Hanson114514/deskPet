@@ -275,12 +275,12 @@ def _run_checks() -> int:
         f"{volume.minimum}–{volume.maximum}",
     )
     check(
-        # ⚠ task12 起 `呼出快捷键` 已接线，只剩 `开机自启`（task14）。
-        # 这三条期望值是 task12 按事实更新的——它们原文就是"本 task 的边界"，
-        # 而那个边界已经被下游 task 推掉了（与 task10 更新 task07 那两条同理）。
-        "未实现的只剩 开机自启 一行",
-        tuple(field.title for field in st.FIELDS if not field.implemented)
-        == ("开机自启",),
+        # ⚠ task12 接上了 `呼出快捷键`、**task14 接上了 `开机自启`**，于是一行都不剩。
+        # 这条期望值原文写的是"未实现的只剩 `开机自启` 一行"——那正是 task11 自己
+        # 划下、又被下游 task 推掉的边界（与 task10 更新 task07、task12 更新 task11
+        # 那几条同理）。§2.19 的"未实现的项"机制本身仍然有效，只是现在没有用户了。
+        "描述表里已经没有未实现的项（task14 把最后一行接上了）",
+        tuple(field.title for field in st.FIELDS if not field.implemented) == (),
         "、".join(field.title for field in st.FIELDS if not field.implemented) or "（没有）",
     )
     check(
@@ -356,12 +356,26 @@ def _window_sections() -> int:
             "、".join(t for t in _label_texts(window) if "快捷键" in t),
         )
         check(
-            "开机自启行标题带 `（暂未开放）`",
-            "开机自启（暂未开放）" in _label_texts(window),
+            # ⚠ task14 接上了这一行，于是它不再带后缀（原文写的是"带"）。
+            # 与上面那条 `呼出快捷键` 同一条理由：这是被下游 task 推掉的边界。
+            "开机自启行标题**不带** `（暂未开放）`（task14 已接线）",
+            "开机自启" in _label_texts(window)
+            and "开机自启（暂未开放）" not in _label_texts(window),
             "、".join(t for t in _label_texts(window) if "自启" in t),
         )
         check(
-            "未实现的项是**禁用**不是隐藏（控件仍在界面上）",
+            "开机自启的控件是**可用**的（task14 已接线）",
+            window._widgets.get(st.AUTOSTART_KEY) is not None
+            and window._widgets[st.AUTOSTART_KEY].isEnabled(),
+            f"enabled={window._widgets.get(st.AUTOSTART_KEY) is not None and window._widgets[st.AUTOSTART_KEY].isEnabled()}",
+        )
+        check(
+            # ⚠ 原文写的是"未实现的项是禁用不是隐藏"；task12/task14 之后**没有**
+            # 未实现的项了，所以这里退化成一条通用的"控件真的挂在界面上"的断言
+            # ——`FieldKind.KEYSEQ` 那一行是最容易在建控件时被漏掉的。
+            # §2.19 的"禁用而不是隐藏"机制本身没变（`_build_control` 里那段仍在），
+            # 只是现在没有 `implemented=False` 的行去触发它。
+            "控件真的挂在界面上（不是只存在于描述表里）",
             "hotkey" in window._widgets and window._widgets["hotkey"].isVisibleTo(window),
             "控件对象存在且属于窗口",
         )

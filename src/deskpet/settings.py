@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import keycapture, pet_loader
+from . import autostart, keycapture, pet_loader
 from .config import ConfigStore, SetResult, VALIDATION_ERROR
 from .idle_state import normalize_idle_seconds
 from .pet_spec import DEFAULT_PET_NAMESPACE
@@ -73,11 +73,9 @@ NOT_READY_SUFFIX: Final[str] = "（暂未开放）"
 #: 左下角逃生门按钮（附录 B）。本 task 只要求"能打开那个文件夹"。
 TEXT_OPEN_STARTUP: Final[str] = "打开启动文件夹"
 
-#: 状态栏前缀（附录 B）：`开机自启：`。本 task 这一行未实现，恒为 `未开启`。
-STATUS_PREFIX: Final[str] = "开机自启："
-
-#: 本 task 阶段那一行的状态文字（真值在 task14 的 `autostart`，这里不猜）。
-STATUS_NOT_READY: Final[str] = "未开启"
+#: 状态栏前缀（附录 B）：`开机自启：`。**真值在 `autostart.STATUS_PREFIX`**，
+#: 这里直接引用它（§4.1：同一个真值只允许定义一处）。
+STATUS_PREFIX: Final[str] = autostart.STATUS_PREFIX
 
 #: 写失败时状态栏的说法（task11 §6 逐字要求）。
 FAILED_PREFIX: Final[str] = "设置失败："
@@ -101,8 +99,13 @@ HINT_HOTKEY: Final[str] = "隐藏后按此键呼出；点右边按钮后按一�
 HINT_VOLUME: Final[str] = "点击互动与坐下时的音效音量"
 HINT_IDLE: Final[str] = "鼠标静止这么久后开始张望，再过一半时间坐下"
 
-#: 角色行的提示（task11 那条边界的原文）：**不同意重启**时显示它。
+#: 角色行提示（task11 那条边界的原文）：**不同意重启**时显示它。
 PET_RESTART_HINT: Final[str] = "重启后生效"
+
+#: `开机自启` 那一行**没有配置键**（它是系统状态）。界面按这个标记认它。
+#: ⚠ 与 `FieldSpec.key=""` 配套：所有"这一行是不是自启"的判断都走这个常量，
+#: 不许在界面代码里散落 `field.title == "开机自启"` 这类文字比较。
+AUTOSTART_KEY: Final[str] = "@autostart"
 
 #: 同意重启之后要说的话（task13 §4："同意才重启"）。
 PET_RESTARTING_HINT: Final[str] = "正在重启…"
@@ -176,6 +179,34 @@ ConfirmHandler = Callable[[str, str], bool]
 
 
 @dataclass(frozen=True)
+class AutostartOutcome:
+    """一次"开 / 关开机自启"的结果（task14）。
+
+    界面**不碰启动文件夹**：它只问一句"帮我开/关一下"，真正的
+    快捷方式生成、`.cmd` 回退、删除都在 `autostart` 模块里。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `ok` | 这次操作**真的成了**（成功或幂等成功） |
+    | `enabled` | 操作之后自启项**到底能不能用**（以只读查询为准） |
+    | `status_text` | 状态栏要显示的那段文字（`autostart` 给的固定文案） |
+    | `reason` | 失败原因（**系统原文优先**，成功时空串） |
+
+    ⚠ `ok` 与 `enabled` 是**两件事**：`disable()` 幂等成功时 `ok=True`
+    而 `enabled=False`（"本来就没有"也是一种成功）。
+    """
+
+    ok: bool
+    enabled: bool
+    status_text: str = ""
+    reason: str = ""
+
+
+#: 开关开机自启的函数签名：`(要开启吗) -> AutostartOutcome`。由 `app.py` 装上。
+AutostartHandler = Callable[[bool], AutostartOutcome]
+
+
+@dataclass(frozen=True)
 class FieldSpec:
     """一行设置的描述（**界面的唯一真相源**）。
 
@@ -213,13 +244,14 @@ FIELDS: Final[tuple[FieldSpec, ...]] = (
     ),
     FieldSpec(
         group="常规",
-        # **没有配置键**：开机自启是系统状态（task14 的 `autostart`），
+        # **没有配置键**：开机自启是系统状态（`autostart` 模块），
         # 不是 `config.json` 里的一项。写一个假键进去才是真的会分叉。
+        # task14 接线：这一行解锁，勾选/取消直接读写系统的自启项。
         key="",
         title="开机自启",
         hint=HINT_AUTOSTART,
         kind=FieldKind.CHECK,
-        implemented=False,
+        implemented=True,
     ),
     FieldSpec(
         group="常规",
@@ -360,6 +392,11 @@ class SettingsWindow(QDialog):
         self._value_labels: dict[str, QLabel] = {}
         #: 最近一次失败的原因；**空串 = 没有失败**。状态栏渲染时先看它。
         self._last_failure: str = ""
+        #: `开机自启` 那一行旁边的状态文字（`_build_control` 里填）。
+        self._autostart_label: QLabel | None = None
+        #: 最近一次**只读查询**得到的自启状态（`autostart.AutostartState`）。
+        #: `None` = 还没查过。状态栏渲染用它（**不重新查**：渲染不是查询）。
+        self._autostart_state: autostart.AutostartState | None = None
         #: 换呼出快捷键的处理器（task12，由 `app.py` 装）。
         #: `None` = 自检里那种"没有系统热键"的场景 → 只写配置。
         self._hotkey_changer: HotkeyChanger | None = None
@@ -369,6 +406,9 @@ class SettingsWindow(QDialog):
         #: 询问"要不要现在重启"（task13，由 `app.py` 装）。
         #: `None` = 不问，直接按"不同意"处理（**默认不重启**才安全）。
         self._confirm_handler: ConfirmHandler | None = None
+        #: 开关开机自启的处理器（task14，由 `app.py` 装）。
+        #: `None` = 自检里那种"不真动启动文件夹"的场景 → 只刷新状态、不写盘。
+        self._autostart_handler: AutostartHandler | None = None
         #: 最近一次"重启成功"已经发生（供自检观察；**不写配置**）。
         self.restart_requested = False
 
@@ -464,6 +504,19 @@ class SettingsWindow(QDialog):
 
             widget = QCheckBox()
             widget.toggled.connect(lambda checked: self._on_check(field, checked))
+            if field.key == AUTOSTART_KEY:
+                # 开机自启那一行再挂一个状态文字（`未开启［…］` 这类说明比
+                # 一个光秃秃的勾选框有用得多）。⚠ 状态栏那一份才是**契约**
+                # （`开机自启：<状态>`），这里只是把同一段文字再显示一次。
+                self._autostart_label = QLabel()
+                self._autostart_label.setWordWrap(True)
+                container = QWidget()
+                container_layout = QVBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(2)
+                container_layout.addWidget(widget)
+                container_layout.addWidget(self._autostart_label)
+                return container
         elif field.kind is FieldKind.KEYSEQ:
             widget = keycapture.KeyCaptureEdit()
             widget.captured.connect(lambda text: self._on_keyseq(field, text))
@@ -475,6 +528,10 @@ class SettingsWindow(QDialog):
             widget.setEnabled(False)
         if field.key:
             self._widgets[field.key] = widget
+        elif field.kind is FieldKind.CHECK:
+            # `开机自启` 没有配置键，但界面照样要能找到它的控件（刷新/回滚），
+            # 所以用一个**内部标记键**登记它（绝不写进配置）。
+            self._widgets[AUTOSTART_KEY] = widget
         return widget
 
     def _build_slider(self, field: FieldSpec) -> QWidget:
@@ -507,6 +564,10 @@ class SettingsWindow(QDialog):
 
         整个过程包在 `_applying` 里：填充控件会触发 `valueChanged`，
         没有守卫的话"打开设置窗口"就等于"把当前值重新写一遍配置"。
+
+        `开机自启` 那一行**没有配置键**：它的值是 `autostart.query_state()`
+        的**只读查询**结果（task14）。所以这里排在配置填充之后、**同样在
+        `_applying` 守卫之内**（勾选框的 `setChecked` 会发 `toggled`）。
         """
         self._applying = True
         try:
@@ -525,9 +586,61 @@ class SettingsWindow(QDialog):
                         self._update_value_label(field, int(value))
                 elif field.kind is FieldKind.KEYSEQ:
                     widget.set_shortcut_text(str(value))  # type: ignore[attr-defined]
+            self._fill_autostart()
         finally:
             self._applying = False
         self.refresh_status()
+
+    def _fill_autostart(self) -> None:
+        """把自启状态摆到勾选框上（**只读**）。
+
+        ⚠ **必须包在 `_applying` 里调用**：`setChecked()` 会发 `toggled`，
+        没有守卫的话"打开设置窗口"就等于"按当前状态再写一遍系统自启项"
+        ——正好是 task14 §5 的头号红线。
+
+        ⚠ 这里**只查询、不清理**：`cleanup_legacy_markers()` 是写操作，
+        它由 `app.py` 在**用户明确动作**（打开窗口的那一次编排）里调，
+        绝不挂在"读状态"这条路径上。
+        """
+        if self._autostart_handler is None:
+            # 没装处理器（自检 / 精简场景）→ 只能读，不能改。
+            # 仍然显示真实状态：`query_state()` 是纯只读的。
+            state = autostart.query_state()
+        else:
+            state = self._query_autostart()
+        self._apply_autostart_state(state)
+
+    def _query_autostart(self) -> autostart.AutostartState:
+        """问一次自启状态（**只读**，不经过处理器）。
+
+        处理器负责"开 / 关"这类**写**操作；"查一下现在是什么状态"本身
+        没有第二种做法，所以这里直接调 `autostart.query_state()`
+        ——处理器接口上**故意不放** `query`：少一个入口就少一处
+        可能被实现成"顺手自愈"的地方。
+        """
+        return autostart.query_state()
+
+    def _apply_autostart_state(self, state: autostart.AutostartState) -> None:
+        """把一次查询结果摆到控件与状态栏上（**不改守卫标志**，调用方负责）。"""
+        self._autostart_state = state
+        checkbox = self._widgets.get(AUTOSTART_KEY)
+        if checkbox is not None:
+            checkbox.setChecked(bool(state.enabled))  # type: ignore[attr-defined]
+        if self._autostart_label is not None:
+            self._autostart_label.setText(state.status_text)
+        self.refresh_status()
+
+    def set_autostart_handler(self, handler: AutostartHandler | None) -> None:
+        """装上"开关开机自启"的处理器（task14；`app.py` 用）。
+
+        与 `set_hotkey_changer()` / `set_restart_handler()` 同一个模式：
+        **装没装决定这一行走哪条路**。没装（自检里）→ 只能读状态、改不动。
+
+        ⚠ 与本窗口其余处理器同一条教训：`SettingsController.open()` 里
+        **每个新窗口都要重新装**，否则第二次打开设置时勾选**只改界面、
+        不动系统自启项**（又一种假成功）。
+        """
+        self._autostart_handler = handler
 
     def set_hotkey_changer(self, changer: HotkeyChanger | None) -> None:
         """装上"换呼出快捷键"的处理器（task12；`app.py` 用）。
@@ -597,11 +710,21 @@ class SettingsWindow(QDialog):
         """刷新状态栏：**`error` 存在时失败原因优先于状态本身**（task11 §4）。
 
         所以这里是"先看有没有失败、再看普通状态"两段，不是把两段拼起来。
+
+        普通状态 = **开机自启那一行**（task14 §4 的契约：前缀 `开机自启：`）。
+        它取自最近一次**只读查询**的结果（`_autostart_state`），
+        **不在渲染时重新查询**——渲染会被频繁调用，而每次查询都要起一个
+        PowerShell 进程。
+
+        还没查过时显示 `未开启`：`autostart.TEXT_DISABLED` **就是**那个值，
+        所以这里不另写一个字面量（真值只一处）。
         """
         if self._last_failure:
             self._status_label.setText(f"{FAILED_PREFIX}{self._last_failure}")
             return
-        self._status_label.setText(f"{STATUS_PREFIX}{STATUS_NOT_READY}")
+        state = self._autostart_state
+        status_text = state.status_text if state is not None else autostart.TEXT_DISABLED
+        self._status_label.setText(f"{STATUS_PREFIX}{status_text}")
 
     def _set_failure(self, result: SetResult) -> None:
         """记一次失败并刷新状态栏（**只在真的失败时调用**）。"""
@@ -640,7 +763,14 @@ class SettingsWindow(QDialog):
 
         用配置当真值来源的理由：界面可能落后于配置（例如另一条路径改过它），
         "回滚到打开窗口时的快照"会把两者永久拉开（task11 §4"回滚到真实状态"）。
+
+        `开机自启` 那一行没有配置键，真值来源是**系统里的自启项**，
+        走 `_rollback_autostart()`（先查一次再摆上去）。
         """
+        if not field.key:
+            if field.kind is FieldKind.CHECK:
+                self._rollback_autostart()
+            return
         widget = self._widgets.get(field.key)
         if widget is None:
             return
@@ -674,10 +804,108 @@ class SettingsWindow(QDialog):
         self._write_field(field, int(value))
 
     def _on_check(self, field: FieldSpec, checked: bool) -> None:
-        """勾选框动了（本 task 该控件是禁用的，接上后走这里）。"""
+        """勾选框动了。
+
+        `开机自启`（task14）与别的行**走的不是同一条路**：
+
+        | 行 | 真值在哪 | 怎么写 |
+        | --- | --- | --- |
+        | 其余 `CHECK` 行 | `config.json` | `_write_field()` → `ConfigStore.apply()` |
+        | `开机自启` | **系统里的自启项** | 处理器（`app.py` 装）→ `autostart.enable()/disable()` |
+
+        所以这里先按 `field.key` 分一次流。自启那条路上有一条**与写配置
+        同构的规矩**：写入失败 → **勾选恢复原样** + 状态栏
+        `设置失败：<系统原因>`，**绝不显示假的成功状态**（task14 §4）。
+
+        ⚠ 回滚赋值走 `_applying` 守卫：`setChecked()` 会再发一次 `toggled`，
+        没有守卫就是"回滚又触发一次写入"的死循环（§4.9 的信号回路）。
+        """
         if self._applying:
             return
+        if not field.key and field.kind is FieldKind.CHECK:
+            self._on_autostart_check(checked)
+            return
         self._write_field(field, bool(checked))
+
+    def _on_autostart_check(self, checked: bool) -> None:
+        """勾 / 取消 `开机自启`：**先动系统，再按只读查询的结果刷新界面**。
+
+        ## 为什么"刷新"必须是一次**新查询**而不是"按勾选态显示"
+
+        勾选成功不等于功能可用：`.cmd` 回退、快捷方式写了但核验不过
+        都可能让"用户勾上了"与"实际能不能用"分家。所以：
+
+        - 成功（含 `disable` 的**幂等成功**）→ 用返回的 `status_text`；
+        - 失败 → `_last_failure` 放**系统原文** + **勾选回滚到真实状态**。
+
+        处理器没装（自检）时**什么都不做、也不改界面**：宁可显示"没变化"，
+        也不能假装成功——这与 `_on_keyseq` 里"没装处理器就只写配置"不同，
+        因为这里**没有配置可写**，写不了就是写不了。
+        """
+        handler = self._autostart_handler
+        if handler is None:
+            logger.warning("设置：没有装开机自启的处理器，勾选被忽略（不会假装成功）")
+            self._last_failure = "这次运行里开机自启功能不可用（没能装上处理器）"
+            self._rollback_autostart()
+            self.refresh_status()
+            return
+
+        try:
+            outcome = handler(bool(checked))
+        except Exception as exc:  # 处理器自己炸了也要报出来，不许静默
+            logger.error("设置：开机自启处理器抛异常（%s: %s）", type(exc).__name__, exc)
+            self._last_failure = f"{type(exc).__name__}: {exc}"
+            self._rollback_autostart()
+            self.refresh_status()
+            return
+
+        if not outcome.ok:
+            logger.error("设置：开机自启没能改过来：%s", outcome.reason)
+            self._last_failure = outcome.reason or "改不动系统里的自启项"
+            self._rollback_autostart()
+            self.refresh_status()
+            return
+
+        # 成功：**处理器给的结论就是权威**，别再拿界面自己的查询去推翻它。
+        #
+        # 为什么不"再查一次、以查询为准"（第一版就是这么写的，自检当场抓到两个问题）：
+        # ① 界面查的是**真实**启动文件夹，而真正干活的是处理器；
+        #    两者只要不是同一处（自检注入的假文件夹、将来换成注册表实现），
+        #    "查询"就会把处理器刚做成的结果**覆盖成相反的值**
+        #    ——用户勾上了，界面却弹回未勾选（假的失败，与假成功一样糟）；
+        # ② `enabled` 取查询、`status_text` 取处理器，两个来源拼出来的状态
+        #    可能自相矛盾（勾选态与文字对不上）。
+        #
+        # 所以规矩只有一条：**`AutostartOutcome` 是这一次操作的唯一结论**。
+        # `autostart.enable()/disable()` 自己已经在内部做完了"写完再读回核验"
+        # （见 `enable()` 里那次 `query_state()`），核验不过时它返回的就是
+        # `ok=False`——那份核验比界面这里的第二次查询更贴近真相。
+        self._last_failure = ""
+        state = autostart.AutostartState(
+            enabled=bool(outcome.enabled),
+            status_text=outcome.status_text or autostart.TEXT_DISABLED,
+            error=None,
+            detail=f"设置界面的操作结论：enabled={outcome.enabled}",
+        )
+        self._applying = True
+        try:
+            self._apply_autostart_state(state)
+        finally:
+            self._applying = False
+        logger.info("设置：开机自启已切换为 %s（%s）", outcome.enabled, state.status_text)
+
+    def _rollback_autostart(self) -> None:
+        """把勾选恢复到**系统里的真实状态**（重新查一次，不是取反）。
+
+        与 `_rollback()` 用配置当真值来源同一个道理：界面可能落后于现实。
+        查询本身是只读的，失败时它也只会返回"未开启"那类结论，不会更糟。
+        """
+        state = self._query_autostart()
+        self._applying = True
+        try:
+            self._apply_autostart_state(state)
+        finally:
+            self._applying = False
 
     def _on_keyseq(self, field: FieldSpec, text: str) -> None:
         """录到一个快捷键（task12 接线）：**先注册成功，再写配置**。

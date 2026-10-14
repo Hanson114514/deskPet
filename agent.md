@@ -99,7 +99,7 @@ C:\projects\deskPet\
 | `size.py` | 数据 | 10 级档位（**精确有理数**）、像素换算、屏幕自适应、右下角锚点与夹取 | ✅ task04 |
 | `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转）；`region_for_frame` 的真实现 | ✅ task08 |
 | `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 | ✅ task10 |
-| `autostart.py` | 系统 | 开机自启（读与修**分开**） | ⬜ task14 |
+| `autostart.py` | 系统 | 开机自启：`query_state`（**纯只读**）/ `enable`（快捷方式，失败回退 `.cmd`）/ `disable`（幂等）/ `startup_dir` / `cleanup_legacy_markers` | ✅ task14 |
 | `single_instance.py` | 系统 | 单实例保护（**D6 = 命名互斥体**；作用域仅当前登录会话） | ✅ task13 |
 | `restart.py` | 系统 | 重启自己（拉起新实例 → 放锁 → 退出；含 `--restart-delay`） | ✅ task13 |
 | `win32.py` | 系统 | **Win32 薄绑定**（唯一的 `ctypes` 出口；非 Windows 上导入不炸、只报"不可用"） | ✅ task12 |
@@ -585,6 +585,40 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 角色回退写回配置 | `app._persist_pet_fallback()`：配置里的包不可用 → 写回空串。**只在 `query_only=False` 时调**（只读查询一个字节都不许写） |
 | 时序留痕 | `logger.log_restart_stage()`，前缀 `重启时序[等待|抢锁|放锁]`（验收要从日志里读出这个时序） |
 
+### 2.22 开机自启（task14 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| **读与修分开** | `autostart.query_state()` **纯只读**（打开设置窗口走它）；写只有 `enable()` / `disable()` / `cleanup_legacy_markers()` 三个入口，**只能由用户明确动作触发** |
+| 判定 = "能不能用" | **不是"文件在不在"**：用 `read_shortcut.ps1` 读回目标，读不出 → 坏；指向别处/参数不符 → 未开启。`.lnk` 不在但 `.cmd` 在 → 按 `.cmd` 判 |
+| 常量真值 | `autostart.py` 一处：`SHORTCUT_NAME = "deskpet.lnk"` / `FALLBACK_NAME = "deskpet.cmd"` / `STATUS_PREFIX = "开机自启："` / 五段状态文案 / `LEGACY_MARKERS` / `STARTUP_RELATIVE`。`settings.STATUS_PREFIX` **直接引用**它 |
+| ⚠ 文案两类 | **完整句子**（`TEXT_DISABLED`/`TEXT_BROKEN`/`TEXT_ELSEWHERE`，自带"未开启"）与**后缀**（`TEXT_WORKDIR_SUFFIX`/`TEXT_FALLBACK`，接在"已开启"后）。混用会渲染出 `已开启已开启［…］`（第一版就是这么错的） |
+| 自我定位 | `paths.autostart_target() -> (目标, 参数)`：打包 → exe 自己；源码 → 同目录 `pythonw.exe` + `<程序目录>/run.py`。**绝不写死**（与 `restart.build_args()` 判据一致，**故意不合并**） |
+| 启动文件夹 | `startup_dir()`：向系统问（`[Environment]::GetFolderPath('Startup')`，就是 `SHGetKnownFolderPath`）；问不到退回 `%APPDATA%` 推导 + 警告。**进程内缓存**一次（`_startup_dir_cached()`），否则每渲染一次状态就起一个 PowerShell |
+| 外部脚本 | `tools/make_shortcut.ps1` / `tools/read_shortcut.ps1`，**UTF-8 with BOM**（§4.3）。结果**写文件再 `utf-8-sig` 读回**，**不解析 stdout** |
+| 结果文件 | 放**临时目录**（`mkstemp`），**绝不放启动文件夹**（那里任何文件都会被当启动项，§4.10） |
+| 子进程 | 固定位置 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`（**不用 `pwsh`**）+ `-NoProfile -NonInteractive -ExecutionPolicy Bypass`，并用 `STARTF_USESHOWWINDOW`/`SW_HIDE` **不闪黑框** |
+| **`enable()` 的成功判据** | 写完**再做一次 `query_state()` 核验**（"文件存在"≠"功能正常"）；核验不过 → `error` 带出来，**不算成功** |
+| `enable()` 的顺序 | 先删残留 `.cmd` → 试 `.lnk` → 成功就返回；失败 → 写 `.cmd`；**两条原因都进日志**（`logger.log_autostart_outcome`，前缀 `自启[开启\|关闭\|清理]`） |
+| `disable()` 幂等 | 本来就没有 → `enabled=False`、`error=None`（**幂等成功**）；删不掉 → `error` 带系统原文 + `enabled=True`（没删掉就是还开着） |
+| **只删两个名字** | `disable()` 只删 `deskpet.lnk`/`deskpet.cmd`；`cleanup_legacy_markers()` 只删 `LEGACY_MARKERS` 清单里的名字。**不做通配删除**（会误伤用户的启动项） |
+| 回退文案 | `.cmd` 那条路状态是 `已开启［回退方式：登录时会闪一下命令行窗口］`，`error` 仍是 `None`（**这是成功，不是失败**） |
+| 诊断文案 | 最可能的原因 + 逃生门写在 **`HINT_BLOCKED`**（日志里），**不塞进状态栏那段固定文案**；**不写**"重新开启即可修正"这种没验证过的承诺（§4.2） |
+| 界面接线 | `settings` 那一行**没有配置键**（`FieldSpec.key=""` + 内部标记键 `settings.AUTOSTART_KEY`）；值来自只读查询，写在 `_on_autostart_check()` 里走处理器 |
+| **回滚的真值来源** | 失败 → `_rollback_autostart()` **重新查一次**系统状态（不是取反、也不是回滚到打开窗口时的快照） |
+| ⚠ 成功**不再查第二次** | `AutostartOutcome` 是**唯一结论**。第一版写成"再查一次、以查询为准"，结果是"处理器写进假文件夹、界面查真文件夹"→ 把刚做成的结果**覆盖成相反的值**（假的失败），而且 `enabled` 取查询、`status_text` 取处理器会自相矛盾 |
+| 清理挂在哪 | `app.AutostartController.open_hook()`（打开设置窗口）+ `apply()`（勾选/取消）。**不挂启动路径**——启动不是用户对自启的明确表态 |
+| `_applying` 守卫 | 自启那一行的初值填充 / 回滚 / 成功刷新**都要包在守卫里**：`setChecked()` 会发 `toggled`，没有守卫就等于"打开设置窗口顺手写一次系统自启项"（正好撞头号红线） |
+| 每个新窗口都要重装 | 与 task12 换热键、task13 重启同一条：`SettingsController.open()` 里每次都 `set_autostart_handler()`，否则**第二次打开设置勾选只改界面、不动系统** |
+
+**⚠ 打包待办（本阶段不打包）**：两个 `.ps1` 是**外部文件**，
+打包数据必须**显式声明**（`datas` 里带上 `tools/make_shortcut.ps1` /
+`tools/read_shortcut.ps1`，且 `autostart.tools_dir()` 按
+`paths.program_dir()/tools` 找）。漏掉的表现是"**打包后开机自启永远显示不可用**"，
+而**源码运行完全看不出来**——`make_shortcut.ps1` 找不到时 `enable()`
+会走 `.cmd` 回退，两条都失败才报错（task14 §4 / §4.3 同一类坑）。
+
+
 ---
 
 ## 3. 新对话工作流
@@ -982,6 +1016,43 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
   （`01:12:22` 抢到锁，之后一直活着）。所以"关闭父进程的窗口/控制台
   不会连带关掉新实例"这条**在本机成立**，且已被真进程验过。
 
+### 4.22 开机自启的四个实测坑（task14）
+
+- **⚠ 状态文案有"完整句子"与"后缀"两类，混用会渲染出 `已开启已开启［…］`**。
+  task14 §4 的文案表里五条并列，但**拼法不同**：`TEXT_BROKEN` /
+  `TEXT_ELSEWHERE` 自带"未开启"开头，而 `TEXT_WORKDIR` / `TEXT_FALLBACK`
+  是接在 `TEXT_ENABLED` **后面**的后缀。第一版把 `TEXT_WORKDIR` 写成了
+  完整句子又去 `f"{TEXT_ENABLED}{TEXT_WORKDIR}"`，被自检当场抓到。
+  对策：名字里带 `_SUFFIX` 的才是后缀，另有一个拼好的完整常量供比对。
+- **⚠ "成功之后再查一次、以查询为准"是个陷阱**。界面查的是**真实**启动文件夹，
+  而干活的是**处理器**；两者只要不是同一处（自检注入的假文件夹、将来换实现），
+  那次查询就会把刚做成的结果**覆盖成相反的值**——用户勾上了、界面却弹回未勾选。
+  正确规矩：**`AutostartOutcome` 是这一次操作的唯一结论**
+  （`enable()` 内部已经做过"写完再读回核验"，那份核验更贴近真相）；
+  只有**失败**那一路才重新查询（回滚要的是"系统现在到底什么样"）。
+- **`.ps1` 的 BOM 会被编辑工具悄悄吃掉**。含中文的 `.ps1` 缺 BOM 时
+  PowerShell 5.1 按 ANSI 解码 → `ParserError`。自检里有一条
+  `[Parser]::ParseFile` 的**只解析不执行**检查盯着它（§6 那条验收的自动化版）；
+  改完脚本记得让它过。⚠ `[ref]$errors` 的变量**必须先声明**，否则报的是
+  "变量不存在"，与"脚本语法错"分不出来（§4.3 同源）。
+- **PowerShell 子进程的返回值形状**：`make_shortcut.ps1` 用
+  `Write-Lines @("STATUS=OK", ...)`（逐行 `键=值`）与 `read_shortcut.ps1`
+  **格式统一**；第一版前者写的是 `"OK\n详情"`，父进程按 `STATUS=` 解析
+  → 永远读不到结论，于是"快捷方式建好了却报失败"。判据：两个脚本的结果
+  文件格式必须能被**同一个** `_parse_key_values()` 吃下。
+
+**顺带核实的两条系统事实**（支撑"自我定位"与"回退"这两条验收）：
+
+- **`QProcess.startDetached()` 在不存在的程序上返回 `(False, -1)`**，
+  对存在的程序（参数就算指向不存在的文件）返回 `(True, pid)`。
+  所以 task14 用它验"快捷方式的目标真的能启动桌宠"是成立的。
+- **DSH 文件沙箱会拒绝写工作区外的路径**：本机实测
+  `%APPDATA%\...\Startup\` 下直接写文件报 `PermissionError [Errno 13]`。
+  于是 `check_task14_real.py` 在默认沙箱下**只能验到"两条路都失败"那一段**
+  （而这恰好是"安全软件拦住"那条验收的真实复现——产品表现完全正确：
+  两条原因都报出来、界面回滚、不显示假成功）。要在真启动文件夹里建出
+  `.lnk`，必须用 `sandbox_permissions=danger-full-access` 跑一次。
+
 ---
 
 ## 5. 当前进度
@@ -1001,7 +1072,7 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ✅ 已完成 |
 | task12 | 全局热键：藏起来还能叫回来 | ✅ 已完成 |
 | task13 | 单实例与重启自己：换完形象要能活着回来 | ✅ 已完成 |
-| task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ **下一个** |
+| task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ✅ 已完成 |
 
 **task01（已完成）** —— 透明置顶窗口可拖可退，`setMask` 真穿透已实测。
 交付 `run.py` / `main.py` / `src/deskpet/{__init__,__main__,app,pet_window,placeholder}.py`。
@@ -1517,7 +1588,7 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > ⑥ 顺带按事实更新了 `check_task11.py` 的 **3 条期望值**（它们原文写着"呼出快捷键未实现"，
 > 而那正是 task11 自己划的、被 task12 推掉的边界；与 task10 更新 task07 那两条同理）。
 
-**下一步**：`tasks/task14.md`（开机自启）。**⚠ 开工前先读 §A**。
+**下一步**：`tasks/task14.md`（开机自启）——**已完成，见本节末**。
 
 **task13（已完成）** —— 单实例与重启自己。**约定见 §2.21，踩坑见 §4.21**；
 新增 `single_instance.py`（命名互斥体）、`restart.py`（拉起 + 交接 + 失败不退出）；
@@ -1608,8 +1679,116 @@ task12 更新 task11 同理）。
 > 本实现验的是 **3 轮锁的交接**（真起进程的那个 §2 只重启 1 次）——
 > 因为每多一轮就多一个"不会自己退出"的真桌宠要收拾。
 
-**已知待清理（不阻塞主线）**：
+**task14（已完成）** —— 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件。
+**约定见 §2.22，踩坑见 §4.22**；
+新增 `autostart.py`（`query_state` / `enable` / `disable` / `startup_dir` /
+`cleanup_legacy_markers`）+ 两个外部脚本
+`tools/make_shortcut.ps1` / `tools/read_shortcut.ps1`（**UTF-8 with BOM**）；
+`paths.autostart_target()`（按当前进程反推目标，**绝不写死**）；
+`logger.log_autostart_outcome()`（前缀 `自启[动作]`，两条尝试的原因都落日志）；
+`settings.py` 解锁 `开机自启` 行（`implemented=True`、`AUTOSTART_KEY` 标记键、
+`set_autostart_handler()`、`AutostartOutcome`、失败回滚到真实状态）；
+`app.py` 加 `AutostartController`（`apply()` + `open_hook()`）并在
+`SettingsController.open()` 里**每个新窗口都重装处理器**。
 
+实测（本机 Windows 11 / 2560×1440）：
+
+- **启动文件夹的真值**（向系统问来的，与 `%APPDATA%` 推导完全一致）：
+  `C:\Users\hanso\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`。
+- **`.lnk` 的实际目标**（源码运行）：`C:\Python314\pythonw.exe` +
+  参数 `C:\projects\deskPet\run.py`、工作目录 `C:\projects\deskPet`
+  （= `paths.autostart_target()`，**字面量与实测完全吻合**）。
+- **真平台实测通过 35 项**：真建出 `deskpet.lnk` → 读回目标/参数/工作目录全对 →
+  **用那个目标真的拉了一次桌宠子进程、它活过了启动阶段**
+  （这是"快捷方式真能启动程序"最硬的判据）→ 真关掉 → 文件消失 →
+  重复关掉幂等成功 → 再开启仍然成功 → 收尾把启动文件夹恢复原样。
+- **"恰好只有一个我们的文件"**：真启动文件夹实测 `['Ollama.lnk', 'deskpet.lnk', 'desktop.ini']`
+  ——只有**一个**是我们的（`deskpet.cmd` 不并存）；从 `.cmd` 回退切回 `.lnk` 时
+  回退项被清掉；残留 `.cmd` + 开启 → 只剩 `.lnk`。
+- **"读状态是纯只读"是怎么被验证的**（§4.2 指定的方式）：把 `enable` / `disable` /
+  `cleanup_legacy_markers` / `_write_shortcut` / `_write_fallback` / `_remove` /
+  `_write_text` **全部换成会抛 `PermissionError` 的桩**，然后
+  ① `query_state()` 连查 3 次；② 真建 `SettingsWindow` 并 `reload_from_config()` +
+  `refresh_status()`。两次都是 **桩调用 0 次、快捷方式 SHA 不变、
+  连 `config.json` 都没被创建**。另有一条源码级检查：用 `ast` 切出
+  `query_state()` 的函数体，里面**没有任何写调用**。
+- **"回退方式"真的被触发过吗**：**触发过，且文案准确**。两种触发途径都实测到：
+  ① 把 `make_shortcut_script()` 指向不存在的路径 → 状态栏/返回状态是
+  `已开启［回退方式：登录时会闪一下命令行窗口］`（`error` 仍是 `None`，
+  因为**这是成功**），启动文件夹里恰好只有 `deskpet.cmd`，内容里目标与参数都对；
+  ② **真实环境**：本会话的 DSH 沙箱拒绝写工作区外的路径，于是在真启动文件夹上
+  两条路**都**失败，`error` 里同时能看到
+  `生成快捷方式：Unable to save shortcut "…deskpet.lnk".` 与
+  `写回退脚本失败（…deskpet.cmd）：[Errno 13] Permission denied`——
+  **正是 task14 §6"注入两条都失败"那条验收的自然复现**，产品表现正确
+  （两条原因都带出来 + 勾选回滚 + 状态栏 `设置失败：…` + 不显示假成功）。
+  随后用 `danger-full-access` 跑一次真平台自检，`.lnk` 那条路**全部通过**。
+- **状态文案逐字符核对**：`未开启` / `已开启` /
+  `未开启［启动文件夹里那个快捷方式是坏的（读不出目标），取消勾选再勾选一次即可重建］` /
+  `未开启［它指向的是别的地方：…］` / `已开启［工作目录对不上，重新开启即可修正］` /
+  `［回退方式：登录时会闪一下命令行窗口］` / 前缀 `开机自启：`——**七条各有一条断言**。
+  其中"指向别处"与"坏壳"两条是**真造出来的**：用产品自己的脚本把 `.lnk` 改成
+  指向 `notepad.exe`、以及把 `.lnk` 清成 0 字节。
+- **遗留标记清理**：手工放 `deskpet.marker` → 程序**主动删掉**、自启状态不变；
+  清理**不碰**用户自己的启动项（`用户的启动项.lnk` 全程原封不动）——
+  清单式删除，**不做通配**。
+- **幂等**：重复 `disable()` 返回 `error=None` + `未开启`；清理在没有遗留文件时
+  是空操作。
+- **退出/启动干净**：`python run.py --exit-after 3` → rc=0，启动行与音效日志正常。
+
+验收：task14 §6 的 **18 条逐条跑过**（其中 2 条只能人工确认，见下）。
+两个脚本**留在仓库里**：`tools/check_task14.py`（offscreen，**111 项断言全过**，
+全程在自检自己造的假启动文件夹里跑，**不碰用户的真实启动文件夹**）+
+`tools/check_task14_real.py`（真平台，**35 项全过**，真建真读真启动、
+跑完把启动文件夹恢复原样）。改过 `app.py` / `settings.py` / `paths.py` /
+`logger.py` 之后**回归跑了 task04–13 的全部 offscreen 自检**
+（30 / 55 / 128 / 123 / 128 / 115 / 117 / 116 / 110 / 83 项，**全过**）
+与全部真平台检查（task05 / 11 / 12 / 13 real，**全过**）。
+另按事实更新了 `check_task11.py` 的 **4 条**与 `check_task12.py` 的 **2 条**期望值
+（它们原文写着"`开机自启` 未实现 / 带 `（暂未开放）`"，而那正是被 task14 推掉的边界；
+与 task10 更新 task07、task12 更新 task11、task13 更新 task11 同理）。
+
+**⚠ 没能自动化的 2 条（必须人工确认）**：① **注销并重新登录（或重启）后桌宠自动起来**
+——这一次登录没法在脚本里重来一遍；可自动化的证据是"`.lnk` 在真启动文件夹里、
+目标正确、**且那个目标真的能启动桌宠**"三条合起来（都已实测通过），
+剩下的是 Windows 的登录时机问题。② **双击 `打开启动文件夹` 真的弹出资源管理器**
+——自检拦下 `QDesktopServices.openUrl` 验到了 URL 是 `shell:startup`
+（task11 起就这么验的），"资源管理器窗口真的弹出来"要看观感。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——首轮 10 项 FAIL 里 **8 项一次就
+> 判定是测试自己写错**（`_code_only()` 把 `read_shortcut(` 拆成
+> `read_shortcut (` 却拿带括号的字面量去判、同一份代码里出现了**第 6 次**；
+> 拿 `APPDATA` 去搜已剥掉字符串的代码；`[ref]$errors` 的变量没声明；
+> `_function_body` 靠"下一个 `def`"切边界把后面的函数圈了进来；
+> 拿"全程结束后只剩两个文件"去断言一个**已经被自己删掉一个**的目录）。
+> 产品按事实改了**两处**，每一处都有现场判据：
+> **①** `TEXT_WORKDIR` 混用"完整句子"与"后缀" → 渲染出 `已开启已开启［…］`（自检抓到）；
+> **②** "成功后再查一次、以查询为准"会把处理器刚做成的结果覆盖成相反的值、
+> 且 `enabled` 与 `status_text` 来源不一致（自检抓到）。
+> 第一轮我把真平台那 16 项 FAIL 直接当成产品 bug，**停下来查了一次**才确认是
+> DSH 沙箱拒绝写工作区外路径——**没有**去改产品逻辑迁就它（§4.11"先怀疑测试写错了"）。
+> ② **没有**改到卡范围之外：打包 / `.spec` / 计划任务 / 管理员权限 / 全机器级自启 /
+> 自动重试 / 注册表 `Run` 键 / 托盘一律没碰（卡里明写不做），
+> 自启项的去留**只由用户勾选决定**。
+> ③ 文档改动集中在 §2.22 新增小节 + §4.22 新增小节 + §1.2 一行 + 本节，
+> 与代码改动（1 个新模块 + 2 个外部脚本 + 4 个模块改）**同量级**。
+> ④ 临时探针（`data/probe_t14_*.py`、`data/probe_t14_scratch/`、`data/probe_ps_out.*`、
+> `data/task14_scratch/`、`data/task14_real_scratch/`，以及回归跑出来的
+> `data/task13_scratch*`）**已全部删掉**（`data/` 下现在只剩日志与各 task 的
+> `*_check.txt` / `*_real.txt`）。
+> ⑤ **规格缺口**：卡里要求先读的 `agent.md` 那一段与「附录 B」都在你删掉的
+> `迁移清单.md` 里，**本机已无该文件**。处理方式：卡里 §4 那张**状态文案表**
+> 本身给全了七条真值，逐字符照做；卡里没给的部分按合理默认落地并记在此：
+> **① `.cmd` 回退项的文件名**取 `deskpet.cmd`（卡里 §1/§2 明写）；
+> **② `LEGACY_MARKERS` 清单**卡里只说"主动删除早期版本误放的标记文件"，
+> 没给文件名，取了四个最可能的名字（`deskpet.marker` / `deskpet.state` /
+> `deskpet.autostart` / `.deskpet`），**只删这些名字、不做通配**；
+> **③ 状态栏在只读查询失败时的兜底**取 `autostart.TEXT_DISABLED`。
+> ⑥ **下一阶段需你确认**：task15（截屏）/ task16（录屏）**当前不存在这两个文件**，
+> 且 D11 已定案"本阶段不做截屏/录屏"。**主功能（task01–14）到此全部完成**，
+> 要不要新开截屏/录屏任务请你定。
+
+**已知待清理（不阻塞主线）**：
 - 遗留兜底帧率表 `pet_spec.LEGACY_ACTION_FPS` 条件已满足（两个包都补完 `fps`），可作为一次独立清理任务删掉（**D9**）。
 - task01 的五个模块里带的 `from __future__ import annotations` 由用户自行删除（§2.1），后续 task 不要再加回来。
 
@@ -1625,15 +1804,19 @@ task12 更新 task11 同理）。
 | D8 | `hitmask.json` 是否继续支持 | task03 之前 | ✅ **已定案：不再需要**（`setMask` 按 alpha 生成区域），读取与降级一律不做 |
 | D9 | 遗留兜底表何时删除 | 用户补完 `fps` 之后 | ⬜ 未定——**条件已满足**，可随时作为一次独立清理任务删掉 |
 | D10 | 项目命名统一 | task01 之前 | ✅ **已定案：统一为 `deskPet`**（包名 `deskpet`） |
-| D11 | 是否需要"截屏 / 录屏"功能 | task14 之后 | ✅ **已定案：本阶段不做**（将来要做再新开任务） |
+| D11 | 是否需要"截屏 / 录屏"功能 | task14 之后 | ✅ **已定案：本阶段不做**（task14 已完成，14 个 task 全部收尾；将来要做再新开任务） |
 | D12 | **动作名** | task03 之前 | ✅ **已定案（2025 用户）**：`idle` / `running_left` / `running_right` / `waiting` / `rest` / `waving`；`review` / `sit` / `jumping` **全部作废、不许做别名映射**；编程侧与素材侧统一 |
 | D14 | **`--fps`** | task03 之前 | ✅ **已定案：已删除，不得复活**（帧率由素材决定） |
 
 > （上面没有 D13，因为该编号不被使用。）
 
-**其他待办（不阻塞主线）**：本阶段 14 个 task 完成后，截屏 / 录屏若要新开任务，用
-`tasks/task15.md` / `tasks/task16.md` 的编号（**当前不存在这两个文件**）。
-打包阶段注意：`main.py` 顶层静态 import；`.ps1` 必须显式声明进打包数据；出包脚本要自检关键文件，
-构建机留在 `data/` 的日志必须删掉再发。版本控制：仓库已 `git init`（分支 `main`），`.gitignore` 已忽略
+**其他待办（不阻塞主线）**：本阶段 14 个 task **已全部完成**（task01–14）。
+截屏 / 录屏若要新开任务，用 `tasks/task15.md` / `tasks/task16.md` 的编号
+（**当前不存在这两个文件**，且 D11 已定案本阶段不做）。
+打包阶段注意：`main.py` 顶层静态 import；
+**⚠ `tools/make_shortcut.ps1` 与 `tools/read_shortcut.ps1` 必须显式声明进打包数据**
+（漏掉的表现是"打包后开机自启永远显示不可用"，而**源码运行看不出来**，见 §2.22 末段）；
+出包脚本要自检关键文件，构建机留在 `data/` 的日志必须删掉再发。
+版本控制：仓库已 `git init`（分支 `main`），`.gitignore` 已忽略
 `data/`、`__pycache__/`、`dist/`、`build/`、`*.spec`、虚拟环境目录；**每个 task 完成提交一次**
 （`feat(阶段): 描述`，提交信息写到仓库外的临时文件再引用）。

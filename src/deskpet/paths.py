@@ -195,6 +195,54 @@ def resource_dir() -> Path:
 # ------------------------------------------------------------------ 用户数据
 
 
+# ------------------------------------------------------------------ 自启项目标
+
+
+def _source_interpreter_path() -> Path | None:
+    """同目录下的 `pythonw.exe`（不带控制台的那个）；没有就返回 `None`。
+
+    `sys.executable` 是**当前那个解释器**：用户敲 `python run.py` 时它是
+    `python.exe`（控制台程序），拿它当自启项目标会让每次登录都弹出一个黑框。
+    同目录的 `pythonw.exe` 正是"不带控制台"的那一个。
+    """
+    current = getattr(sys, "executable", "") or ""
+    if not current:
+        return None
+    try:
+        windowless = Path(current).parent / "pythonw.exe"
+        return windowless if windowless.is_file() else None
+    except OSError:  # pragma: no cover - 探测失败不是错误
+        return None
+
+
+def autostart_target() -> tuple[str, str]:
+    """开机自启项该指向什么：返回 `(目标程序, 启动参数)`。
+
+    **按当前进程反推，绝不写死路径**（task14 §4 的硬规则）：
+
+    | 运行方式 | 目标 | 参数 |
+    | --- | --- | --- |
+    | 打包（`is_frozen()`） | **exe 自己** | `""` |
+    | 源码运行 | `pythonw.exe`（同目录；没有则退回 `sys.executable`） | `run.py` 的绝对路径 |
+
+    工作目录另算（`program_dir()`）：源码运行时要让 `<程序目录>/run.py`
+    能找到同目录的 `assets/` 与 `data/`。
+
+    ⚠ 与 `restart.build_args()` **问的是同一类问题**（"新进程该用什么命令"），
+    所以解释器这条分支的判据也保持一致（优先 `pythonw.exe`）。两处**故意不共用**
+    一个函数：重启那边还要拼 `--restart-delay`，合并会让两边互相牵制。
+    """
+    if is_frozen():
+        return (getattr(sys, "executable", "") or "", "")
+
+    windowless = _source_interpreter_path()
+    program = str(windowless) if windowless is not None else (getattr(sys, "executable", "") or "")
+    return (program, str(program_dir() / "run.py"))
+
+
+# ------------------------------------------------------------------ 用户数据
+
+
 def data_dir() -> Path:
     """**用户数据目录** `<程序目录>/data`。
 

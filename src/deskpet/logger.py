@@ -396,6 +396,32 @@ def log_restart_stage(stage: str, detail: str) -> None:
         pass
 
 
+# ------------------------------------------------------------------ 自启留痕
+
+
+def log_autostart_outcome(action: str, ok: bool, detail: str) -> None:
+    """把一次自启操作的结果写进日志，**统一前缀**便于按行读。
+
+    为什么单独开一个函数（task14 §3 点名要改 `logger.py`）：
+    "开机自启"这件事**根本看不见**——它改的是登录时的行为，用户在当次会话里
+    什么都不会发生。所以**每一次尝试的完整原因都必须落进日志**，
+    尤其是"快捷方式失败 → 退回 `.cmd`"这条路上**两条尝试各自的原因**：
+    只看最终状态是分不出"一直没用快捷方式"和"这次才退化"的。
+
+    前缀固定为 `自启[<动作>]`（动作如 `查询` / `开启` / `关闭` / `清理`）。
+    **写日志失败绝不抛异常**（agent.md §2.10）。
+    """
+    try:
+        record = logging.getLogger("deskpet.autostart")
+        text = f"自启[{action}]：{detail}"
+        if ok:
+            record.info(text)
+        else:
+            record.error(text)
+    except Exception:  # pragma: no cover - 日志层不该抛，但绝不冒这个险
+        pass
+
+
 # ------------------------------------------------------------------ 崩溃兜底
 
 

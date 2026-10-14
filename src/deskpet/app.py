@@ -48,6 +48,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import PROGRAM_NAME, __version__
+from . import autostart
 from . import context_menu
 from . import geometry
 from . import hotkey as hotkey_mod
@@ -65,6 +66,8 @@ from .pet_spec import DEFAULT_PET_NAMESPACE, PetSpec
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
 from .settings import (
+    AutostartHandler,
+    AutostartOutcome,
     ConfirmHandler,
     HotkeyChanger,
     HotkeyOutcome,
@@ -850,6 +853,8 @@ class SettingsController:
         #: 重启处理器与"要不要重启"的确认框（task13）。同样**每个新窗口都要重装**。
         self._restart_handler: "RestartHandler | None" = None
         self._confirm_handler: "ConfirmHandler | None" = None
+        #: 开关开机自启的处理器（task14）。同样**每个新窗口都要重装**。
+        self._autostart_handler: "AutostartHandler | None" = None
 
     def set_hotkey_changer(self, changer: "HotkeyChanger | None") -> None:
         """由 `app.py` 装上"换热键"的函数（task12）。"""
@@ -873,6 +878,18 @@ class SettingsController:
         self._confirm_handler = confirm
         if self._dialog is not None:
             self._dialog.set_restart_handler(restart, confirm)
+
+    def set_autostart_handler(self, handler: "AutostartHandler | None") -> None:
+        """由 `app.py` 装上"开关开机自启"（task14）。
+
+        ⚠ 与 `set_hotkey_changer()` / `set_restart_handler()` 同一条教训
+        （task12 §4 / task13 §4）：**每个新窗口都要重装**。忘了重装的表现是
+        "第二次打开设置窗口勾『开机自启』时**只改界面、不动系统自启项**"
+        ——用户以为设好了，登录时什么都没发生（又一种假成功）。
+        """
+        self._autostart_handler = handler
+        if self._dialog is not None:
+            self._dialog.set_autostart_handler(handler)
 
     @property
     def dialog(self) -> "SettingsWindow | None":
@@ -903,6 +920,10 @@ class SettingsController:
         # 第二、三次打开设置窗口换角色时**只会写配置、不会问也不会重启**。
         if self._restart_handler is not None or self._confirm_handler is not None:
             dialog.set_restart_handler(self._restart_handler, self._confirm_handler)
+        # ⚠ 同理，**每个新窗口都要重新装自启处理器**（task14）：不装的话，
+        # 第二、三次打开设置窗口勾「开机自启」**只改界面、不动系统自启项**。
+        if self._autostart_handler is not None:
+            dialog.set_autostart_handler(self._autostart_handler)
         dialog.finished.connect(self._on_finished)
         # 设置里改的值要**立刻**作用到运行时（音量已在 `store.config_changed`
         # 上接了；久置时间由状态机每次判定现读）。
@@ -1012,6 +1033,110 @@ class RestartController:
         _logger.info("重启：新实例已接管，旧实例现在退出")
         QTimer.singleShot(0, self._app.quit)
         return RestartOutcome(True)
+
+
+class AutostartController:
+    """把**设置窗口里那一行**接到系统自启项上（task14 的组装层，`app.py` 独有）。
+
+    ## 为什么这层薄得几乎没有逻辑
+
+    "开机自启"的真正内容全在 `autostart` 模块里（启动文件夹怎么找、
+    快捷方式怎么建、`.cmd` 怎么回退、失败原因怎么拼）。这一层只干两件事：
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | 把 `autostart` 的结果翻译成界面要的 `AutostartOutcome` | `apply()` |
+    | **在用户明确动作时**顺手清理启动文件夹里的遗留标记 | `open_hook()` |
+
+    ## ⚠ 清理为什么挂在这里、而不是"读状态"里
+
+    task14 §5 的头号红线是"**读状态路径绝不写盘**"。
+    `autostart.cleanup_legacy_markers()` 是**写操作**（删文件），
+    所以它只能挂在"用户明确做了某件事"上：
+
+    | 触发点 | 为什么算"明确动作" |
+    | --- | --- |
+    | 用户点开设置窗口 | 他正要看/改自启设置，这时清掉旧版遗留物是这件事的一部分 |
+    | 用户勾选 / 取消勾选 | 同上，而且那一刻本来就允许写 |
+    | 启动时 | **不挂**：启动不是用户对自启的明确表态，而且启动路径越短越好 |
+
+    ## 幂等
+
+    `cleanup_legacy_markers()` 删的是**写死的几个名字**（`LEGACY_MARKERS`），
+    本来就不存在时什么都不做、也不报错。所以它可以被反复调用。
+    """
+
+    def __init__(self) -> None:
+        #: 最近一次操作的结论（诊断与自检观察用）。
+        self.last: "AutostartOutcome | None" = None
+
+    def cleanup(self) -> list[str]:
+        """清掉启动文件夹里的遗留标记文件（**由用户明确动作触发**）。
+
+        失败只记日志：清理类操作尽力而为，**绝不阻断设置窗口**
+        （agent.md §2.10 第三类）。
+        """
+        try:
+            return autostart.cleanup_legacy_markers()
+        except Exception as exc:  # pragma: no cover - 清理不该抛，但绝不冒这个险
+            _logger.warning("自启：清理遗留标记文件时出错（%s: %s）", type(exc).__name__, exc)
+            return []
+
+    def open_hook(self) -> None:
+        """打开设置窗口前的那一下（**只做清理，不做别的**）。
+
+        顺手把启动文件夹的内容记进日志：这是"那里到底有什么"的唯一线索，
+        而验收要求"开启后恰好只有一个我们的文件"——留一行证据便于回看。
+        """
+        removed = self.cleanup()
+        contents = [path.name for path in autostart.our_files()]
+        _logger.info(
+            "自启：打开设置窗口，启动文件夹（%s）里我们的文件：%s%s",
+            autostart.startup_dir(),
+            "、".join(contents) if contents else "（没有）",
+            f"；顺手清掉了遗留标记文件：{'、'.join(removed)}" if removed else "",
+        )
+
+    def apply(self, enabled: bool) -> "AutostartOutcome":
+        """**开 / 关**自启项（用户在设置里勾选或取消勾选）。
+
+        ## 为什么这里也要清理一次
+
+        勾选的那一刻本来就允许写启动文件夹，顺手清掉遗留标记文件最省事
+        ——否则"用户勾了一次"之后那里可能还躺着一个旧版标记文件，
+        而验收要求"**恰好只有一个**我们的文件"。清完再写，顺序不能反。
+
+        ## 成功与"幂等成功"都是 `ok=True`
+
+        `disable()` 在"本来就没有"时也返回成功（task14 §6 明写要幂等）。
+        所以 `ok` 判的是"这次操作没有失败"，`enabled` 判的是"现在能不能用"。
+        """
+        self.cleanup()
+        try:
+            state = autostart.enable() if enabled else autostart.disable()
+        except Exception as exc:
+            # `enable()` 内部该兜的都兜了；真漏出来也不能让设置窗口崩掉，
+            # 但**必须**如实报错（绝不显示假成功）。
+            detail = f"{type(exc).__name__}: {exc}"
+            _logger.error("自启：%s 失败（%s）", "开启" if enabled else "关闭", detail)
+            outcome = AutostartOutcome(
+                ok=False,
+                enabled=not enabled,
+                status_text=autostart.TEXT_ENABLED if not enabled else autostart.TEXT_DISABLED,
+                reason=detail,
+            )
+            self.last = outcome
+            return outcome
+
+        ok = state.error is None
+        outcome = AutostartOutcome(
+            ok=ok,
+            enabled=bool(state.enabled),
+            status_text=state.status_text,
+            reason=state.error or "",
+        )
+        self.last = outcome
+        return outcome
 
 
 def _install_sigint_handler(app: QApplication) -> QTimer | None:
@@ -1529,8 +1654,14 @@ def run(argv: list[str] | None = None) -> int:
         重置的理由与 `调整大小…` 一样（task09 §4 的"菜单项"那条）：
         用户刚跟界面交互过，紧接着就张望会显得"没在听"。
         真值仍然只有一个（`IdleStateMachine.on_mouse_moved()`）。
+
+        ⚠ 顺序：**先清理启动文件夹的遗留标记文件，再打开窗口**（task14）。
+        `autostart.cleanup_legacy_markers()` 是写操作，它只能挂在
+        "用户明确做了某件事"上——点开设置窗口正是那件事。反过来的话，
+        窗口会先按"那里还有一个遗留文件"的状态渲染一次，白闪一下。
         """
         idle_state.on_mouse_moved()
+        autostart_controller.open_hook()
         settings_controller.open()
 
     window.set_settings_handler(_open_settings)
@@ -1543,6 +1674,10 @@ def run(argv: list[str] | None = None) -> int:
     settings_controller.set_restart_handler(
         restart_controller.restart, restart_controller.confirm
     )
+    # 开机自启那一行（task14）：界面**不碰启动文件夹**，它只问一句
+    # "帮我开/关一下"。快捷方式生成、`.cmd` 回退、失败原因都在 `autostart` 里。
+    autostart_controller = AutostartController()
+    settings_controller.set_autostart_handler(autostart_controller.apply)
 
     # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
     # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；

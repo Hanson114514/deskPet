@@ -793,9 +793,13 @@ def _run_checks() -> int:
         hotkey_field.title,
     )
     check(
-        "现在只剩 `开机自启` 一行未实现（task14）",
-        [f.title for f in st.FIELDS if not f.implemented] == ["开机自启"],
-        "、".join(f.title for f in st.FIELDS if not f.implemented),
+        # ⚠ 原文写的是"现在只剩 `开机自启` 一行未实现（task14）"——那句是 task12
+        # 对**当时**边界的描述，而 task14 已经把最后一行接上了。
+        # 与 task10 更新 task07、task12 更新 task11 那几条同理：被下游 task
+        # 推掉的边界要按事实改，不能留一句"其实还有一个"的旧说法。
+        "描述表里已经没有未实现的项了（task14 把 `开机自启` 也接上了）",
+        [f.title for f in st.FIELDS if not f.implemented] == [],
+        "、".join(f.title for f in st.FIELDS if not f.implemented) or "（没有）",
     )
 
     scratch = _fresh_dir(SCRATCH)
@@ -808,7 +812,8 @@ def _run_checks() -> int:
         key_widget.isEnabled(),
         f"enabled={key_widget.isEnabled()}",
     )
-    # 用户看得见的是**渲染出来的标题**：`（暂未开放）` 只该挂在那一个未实现的项上。
+    # 用户看得见的是**渲染出来的标题**：`（暂未开放）` 现在**一个都不该有**
+    # （task14 接上了最后一行；`NOT_READY_SUFFIX` 机制仍在 `_build_row_label` 里）。
     from PySide6.QtWidgets import QLabel
 
     labels = [label.text() for label in sw.findChildren(QLabel)]
@@ -818,10 +823,9 @@ def _run_checks() -> int:
         "、".join(t for t in labels if "快捷键" in t),
     )
     check(
-        "`（暂未开放）` 只挂在 `开机自启` 上",
-        "开机自启（暂未开放）" in labels
-        and [t for t in labels if "（暂未开放）" in t] == ["开机自启（暂未开放）"],
-        "、".join(t for t in labels if "（暂未开放）" in t),
+        "`（暂未开放）` 已经一个都不剩（task14 之后没有未实现的行）",
+        [t for t in labels if "（暂未开放）" in t] == [],
+        "、".join(t for t in labels if "（暂未开放）" in t) or "（没有）",
     )
     check(
         "初始显示配置里的值",
