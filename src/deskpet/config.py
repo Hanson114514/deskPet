@@ -314,12 +314,13 @@ class ConfigStore(QObject):
             if key not in raw:
                 continue  # 缺字段 = 没设过，**不**记警告
             value, reason = normalize_value(key, raw[key])
-            if reason is not None:
-                logger.warning("配置项 %s 有不可用的部分：%s", key, reason)
             if value is None:
-                # 只有"整体不可用"才回退默认值；`mirror` 过滤后为空**照样采用**。
-                values[key] = DEFAULTS[key]
+                # "整体不可用" → 回退默认值。
+                logger.warning("配置项 %s 不可用，回退默认值：%s", key, reason)
                 continue
+            if reason is not None:
+                # "部分不可用" → 合规的部分**照样采用**（`mirror` 过滤后可能为空对象）。
+                logger.warning("配置项 %s 只采用了合规的部分：%s", key, reason)
             values[key] = value
             present.add(key)
 
