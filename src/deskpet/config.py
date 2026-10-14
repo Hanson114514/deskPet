@@ -19,7 +19,7 @@ import os
 import tempfile
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Final, Mapping
+from typing import Any, Final, Mapping, NamedTuple
 
 from PySide6.QtCore import QObject, Signal
 
@@ -56,6 +56,48 @@ def _build_defaults() -> dict[str, Any]:
 
 #: 配置默认值表。**不要在别处再写一份默认值。**
 DEFAULTS: Final[dict[str, Any]] = _build_defaults()
+
+
+# ------------------------------------------------------------------ 写结果
+
+#: 写失败，但**原因不是系统的写盘错误**（类型校验没过 / 不是已知键）。
+#: 界面据此把"我们自己的拒收"与"操作系统的原始原文"分开措辞（task11 §4）。
+VALIDATION_ERROR: Final[str] = "validation"
+
+
+class SetResult(NamedTuple):
+    """一次 `ConfigStore.set()` 的**结构化结果**（task11 §4："结果用结构化对象表达"）。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `ok` | 值真的改了 / 真的确认了（等价于旧的 `bool` 返回值） |
+    | `changed` | 值**真的变了**（`False` = 走的"值没变、不写盘"短路） |
+    | `error` | 失败原因，**系统原文优先**；成功时是空串 |
+    | `detail` | 失败类别：`validation`（我们拒收）/ 其它（`OSError` 类名） |
+
+    ⚠ **界面不许把 `error` 拼进文案之后才决定"要不要显示失败"**——
+    拼接时决定正是"显示假成功"的来源。渲染时先问 `ok`，再取 `error`
+    （agent.md §2.10："失败原因优先于成功状态"）。
+    """
+
+    ok: bool
+    changed: bool
+    error: str = ""
+    detail: str = ""
+
+
+class ApplyError(RuntimeError):
+    """必需配置项没写进去（"启动期致命"那条路径）。
+
+    只有"少了它程序就没法按用户的意思跑"的项才会抛它——目前是**角色 `pet`**：
+    选中的包不可用时按 task11 §6 要"退回默认形象 + 把配置也改回默认"，
+    这次回写失败意味着下次启动还会踩同一个坑，必须当场让用户知道。
+    """
+
+    def __init__(self, key: str, result: SetResult) -> None:
+        self.key = key
+        self.result = result
+        super().__init__(f"写配置项 {key} 失败：{result.error}")
 
 
 # ------------------------------------------------------------------ 校验
@@ -102,6 +144,28 @@ def normalize_mirror(value: Any) -> tuple[dict[str, bool] | None, str | None]:
     return kept, reason
 
 
+#: 类型校验失败的文案前缀（**唯一写法**）：`validate_value()` 按它生成，
+#: `apply()` 按它把"我们自己拒收"与"操作系统的写盘错误"分开（task11 §4）。
+TYPE_ERROR_PREFIX: Final[str] = "类型不符：期望"
+TYPE_ERROR_TEMPLATE: Final[str] = "{key} " + TYPE_ERROR_PREFIX + " {default}，实际 {actual}（{value}）"
+
+#: "这个键在内存里没有旧值"的哨兵（`None` 是合法值，不能拿它当判据）。
+#: 目前只有 `set()` 用得到——正常配置键都在默认值表里，只有**未知键**
+#: （直接调 `set("xxx", ...)`）才会走到"没有旧值"那一支。
+_MISSING: Final[Any] = object()
+
+
+def type_error_message(key: str, value: Any) -> str:
+    """类型不符的那句话（`apply()` 的分类判据与这里是同一条规则，别写两遍）。"""
+    default = DEFAULTS.get(key)
+    return TYPE_ERROR_TEMPLATE.format(
+        key=key,
+        default=type(default).__name__,
+        actual=type(value).__name__,
+        value=value,
+    )
+
+
 def normalize_value(key: str, value: Any) -> tuple[Any, str | None]:
     """按 `key` 的默认值类型校验并规范化。返回 `(值, 警告原因)`。
 
@@ -116,10 +180,7 @@ def normalize_value(key: str, value: Any) -> tuple[Any, str | None]:
         return kept, reason
 
     if not is_valid_type(value, default):
-        return None, (
-            f"{key} 类型不符：期望 {type(default).__name__}，"
-            f"实际 {type(value).__name__}（{value!r}）"
-        )
+        return None, type_error_message(key, value)
     return value, None
 
 
@@ -135,10 +196,7 @@ def validate_value(key: str, value: Any) -> tuple[bool, str | None]:
 
     default = DEFAULTS[key]
     if not is_valid_type(value, default):
-        return False, (
-            f"{key} 类型不符：期望 {type(default).__name__}，"
-            f"实际 {type(value).__name__}（{value!r}）"
-        )
+        return False, type_error_message(key, value)
     return True, None
 
 
@@ -366,29 +424,84 @@ class ConfigStore(QObject):
         if filter_reason is not None:
             logger.warning("配置项 %s 写入前做了过滤：%s", key, filter_reason)
 
-        if self._values.get(key) == normalized:
+        # 未知键不会出现在 `_values` 里（默认值表决定内存的形状），所以先记下
+        # "有没有旧值"——写失败要回滚到它，回滚不了的就整个删掉。
+        previous = self._values.get(key, _MISSING)
+
+        if previous != _MISSING and previous == normalized:
             # 值没变 → 不发信号、**不写盘**（拖动过程不逐帧写配置）。
             # 但"用户确实写过这一项"这件事必须记下来。
             self._present.add(key)
             return True
 
-        previous = self._values.get(key)
         self._values[key] = normalized
         if not self._write():
-            # **内存回滚**（task06 补）：写盘失败时内存必须退回去，
-            # 否则会同时坏两件事：
+            # **内存回滚**（task06 补，task11 起也覆盖未知键）：写盘失败时内存必须
+            # 退回去，否则会同时坏两件事：
             #   ① 界面上"内存说成功、磁盘是旧值"，`get()` 与实际不符；
+            #      设置窗口正是拿 `get(key)` 回滚控件的，脏内存 = 显示假成功；
             #   ② 下一次 `set()` 拿**已经改过的**内存去比"值没变"，
             #      于是走"不写盘"的短路并返回 `True` —— 用户看到翻转成功了，
             #      但磁盘上一个字节都没落（这个坑是 task06 的写失败自检抓到的）。
-            self._values[key] = previous
-            reason = self._last_errors.get(key) or self.last_error() or "写配置失败"
+            if previous is _MISSING:
+                self._values.pop(key, None)
+            else:
+                self._values[key] = previous
+            reason = self._last_errors.get("*") or "写配置失败"
+            # **按 key 记一份**：界面要问的是"用户刚改的这一项为什么没写进去"，
+            # 而 `_write()` 只知道"整个文件写失败了"（原因记在 `"*"` 上）。
+            # 不复制这一份的话，`last_error("volume")` 会**回**到上一次那个键的
+            # 陈旧原因（实测：改完 `volume` 失败后读到的是前一次 `nope` 的消息）。
             self._last_errors[key] = reason
             return False
 
         self._present.add(key)
         self.config_changed.emit(key, normalized)
         return True
+
+    # -------------------------------------------------- 结构化写（task11）
+
+    def apply(self, key: str, value: Any) -> SetResult:
+        """`set()` 的**结构化版本**：把结果翻译成 `SetResult`（永不抛）。
+
+        界面（设置窗口）用这一条判断"该不该回滚控件、状态栏该显示什么"：
+        `ok` 为假时 `error` **已经带着系统原文**，界面只负责渲染，不再自己拼。
+
+        `set()` 本身仍是布尔接口（`pet_window` / `mirror` / 自检都在用它），
+        两者共用同一份实现，**不会分叉**。
+        """
+        ok = self.set(key, value)
+        if ok:
+            # `changed` 无从判断（`set()` 只回布尔）——按"确认过"算真：
+            # 值没变时它照样是"这次写入被接受了"，界面不需要区分这两个。
+            return SetResult(True, True, "", "")
+
+        # **未知键**也是"我们拒收"，不是系统的写盘错误（task11 §4 的分类
+        # 直接决定状态栏措辞，所以判据要收在这里一处）。
+        if key not in DEFAULTS:
+            return SetResult(False, False, f"{key} 不是已知配置键", VALIDATION_ERROR)
+
+        # 失败发生在写盘那一步时，`set()` 已经把原因复制到了本键上；
+        # 万一没有（别的路径调 `_write()`），退回通用原因。
+        raw = self.last_error(key) or self.last_error() or f"写配置项 {key} 失败"
+        if raw.startswith(f"{key} {TYPE_ERROR_PREFIX}"):
+            # 类型校验没过：原因是我们自己写的措辞（没有系统原文可带）
+            # → 归成 validation，界面按"我们拒收"措辞。
+            return SetResult(False, False, raw, VALIDATION_ERROR)
+
+        # 其余（含写盘失败）一律带**系统原文**：`_write()` 把
+        # `（类型: 原因）` 原样塞进了 `last_error`（agent.md §2.10 第二类）。
+        return SetResult(False, False, raw, "write")
+
+    def require(self, key: str, value: Any) -> SetResult:
+        """同 `apply()`，但写失败时抛 `ApplyError`（供"少了它就没法跑"的项）。
+
+        目前只有换角色用它：见 `ApplyError` 的说明。
+        """
+        result = self.apply(key, value)
+        if not result.ok:
+            raise ApplyError(key, result)
+        return result
 
     def write(self) -> bool:
         """按 `DEFAULTS` 的键过滤后原子落盘当前全部值（不校验、不改内存）。"""

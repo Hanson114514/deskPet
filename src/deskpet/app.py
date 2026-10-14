@@ -60,6 +60,7 @@ from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
+from .settings import SettingsWindow
 from .sounds import SOUND_CHIME, SoundPlayer, normalize_volume
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
@@ -546,6 +547,81 @@ class ControlBarController:
             self.bar.place_relative_to(self._pet_rect(), self.bar.screen_rect())
 
 
+class SettingsController:
+    """把**设置窗口**接到宠物上（task11 的"组装"那一层，`app.py` 独有）。
+
+    它只做四件事，每一件在 task11 §4 都有出处：
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | **单例** | 只持有一个 `SettingsWindow`；重复打开 → 把已有的**前置**（`open()`） |
+    | 定位 | 每次打开都 `center_on_screen()`——屏幕可能换了，位置不该记死 |
+    | 刷新时机 | 打开时重新读一遍配置（`_load_from_config()`），免得窗口停在上次的值上 |
+    | 释放引用 | 关掉之后把实例扔掉（`WA_DeleteOnClose`），下次打开是**一个全新的窗口** |
+
+    ⚠ **不加 `WindowStaysOnTopHint`**：设置窗口是个普通模态对话框，
+    宠物按既有约定仍在最上层飘着（用户已确认的取舍）。给设置窗口也加上
+    "始终置顶"会让两个窗口抢最上层，反而更难用。
+    """
+
+    def __init__(self, store: ConfigStore, window: PetWindow) -> None:
+        self._store = store
+        self._window = window
+        self._dialog: SettingsWindow | None = None
+
+    @property
+    def dialog(self) -> "SettingsWindow | None":
+        """当前那个设置窗口（没开着就是 `None`）。自检与诊断用。"""
+        return self._dialog
+
+    def open(self) -> None:
+        """打开设置窗口；已经开着就**前置**（不叠第二个，task11 §6）。"""
+        current = self._current_pet_namespace()
+
+        if self._dialog is not None:
+            self._dialog.reload_from_config(current)
+            self._dialog.center_on_screen()
+            self._dialog.raise_()
+            self._dialog.activateWindow()
+            return
+
+        dialog = SettingsWindow(self._store, current_pet=current, parent=None)
+        # 关掉之后**释放实例引用**：下次打开是一个全新的窗口，
+        # 不会带着上一次的状态（task11 §2 第 4 条："关闭后再打开正常"）。
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.finished.connect(self._on_finished)
+        # 设置里改的值要**立刻**作用到运行时（音量已在 `store.config_changed`
+        # 上接了；久置时间由状态机每次判定现读）。
+        dialog.settings_changed.connect(self._on_settings_changed)
+        self._dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def close(self) -> None:
+        """退出收尾：把设置窗口收掉（模态窗口不关会让 `app.exec()` 不返回）。"""
+        if self._dialog is not None:
+            self._dialog.close()
+
+    def _on_finished(self, _result: int) -> None:
+        """窗口关了：**必须**清掉引用，否则下次打开会去 `raise_()` 一个已析构的对象。"""
+        self._dialog = None
+
+    def _on_settings_changed(self, key: str, value: object) -> None:
+        """用户在设置里改了一项（**写入成功才会走到这里**）。"""
+        _logger.info("设置已生效：%s=%r", key, value)
+
+    def _current_pet_namespace(self) -> str:
+        """配置里**真正生效**的角色（空串 = 没表态 → 默认形象）。
+
+        界面显示"当前角色"必须用这个，而不是"窗口正在显示的那个"：
+        换角色的生效方式是**重启**（task11 §5 的边界），所以"真实生效"
+        永远以配置为准。
+        """
+        configured = str(self._store.get("pet") or "").strip()
+        return configured or pet_loader.DEFAULT_PET_NAMESPACE
+
+
 def _install_sigint_handler(app: QApplication) -> QTimer | None:
     """把 SIGINT（Ctrl+C）转成"退出请求"，并返回心跳定时器。
 
@@ -935,6 +1011,23 @@ def run(argv: list[str] | None = None) -> int:
     window.position_changed.connect(lambda _pos: bar_controller.sync_follow())
     bar_controller.reposition()
 
+    # ------------------------------------------------------------ 设置窗口（task11）
+    #
+    # 组装与单例都在 `SettingsController` 里；这里只负责"菜单项点下来做什么"。
+    settings_controller = SettingsController(store, window)
+
+    def _open_settings() -> None:
+        """`设置…` 的动作 = **打开/前置设置窗口** + 重置静置计时。
+
+        重置的理由与 `调整大小…` 一样（task09 §4 的"菜单项"那条）：
+        用户刚跟界面交互过，紧接着就张望会显得"没在听"。
+        真值仍然只有一个（`IdleStateMachine.on_mouse_moved()`）。
+        """
+        idle_state.on_mouse_moved()
+        settings_controller.open()
+
+    window.set_settings_handler(_open_settings)
+
     # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
     # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；
     # task10 阶段"手改 config.json"要生效**仍需重启**（`ConfigStore` 是内存快照，
@@ -973,6 +1066,9 @@ def run(argv: list[str] | None = None) -> int:
         # 控制栏是**独立顶层窗口**：不显式收起的话它会比宠物活得久
         # （`Qt.Tool` 不计入"最后一个主窗口"，agent.md §4.9）。
         bar_controller.close()
+        # 设置窗口是**模态**的：不关掉的话 `app.exec()` 不会返回
+        # （退出时用户手里正好开着设置的场合）。
+        settings_controller.close()
         idle_timer.stop()
         # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条）。

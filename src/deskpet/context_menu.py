@@ -12,9 +12,10 @@
 
 ## 未接线的项是**禁用**不是隐藏
 
-`调整大小…`（task09）/ `设置…`（task11）/ `隐藏宠物`（task12）本 task 都还没有实现，
-但一律**照常出现在菜单里、只是灰掉**——保持菜单位置稳定，
+`隐藏宠物`（task12）还没有实现，但**照常出现在菜单里、只是灰掉**——保持菜单位置稳定，
 免得用户以后找不到（task06 §2 第 2 条）。
+（`调整大小…` 已由 task09 接上、`设置…` 已由 task11 接上：两者的"可用性"都是
+**装没装处理器**，没装时仍然灰掉。）
 
 ## 文字的真值
 
@@ -64,8 +65,9 @@ MENU_ORDER: Final[tuple[str, ...]] = (
     ID_QUIT,
 )
 
-#: 本 task 尚未接线的项（**显示为灰色不可点**，不是隐藏）。
-NOT_WIRED_YET: Final[tuple[str, ...]] = (ID_RESIZE, ID_SETTINGS, ID_VISIBILITY)
+#: 尚未接线的项（**显示为灰色不可点**，不是隐藏）。
+#: task09 接上了 `调整大小…`、task11 接上了 `设置…`，现在只剩 `隐藏宠物`（task12）。
+NOT_WIRED_YET: Final[tuple[str, ...]] = (ID_VISIBILITY,)
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,7 @@ class MenuState:
     | `mirror_on` | 当前动作的镜像是不是开着（决定勾选态） |
     | `can_mirror` | 当前动作在不在镜像适用范围内 |
     | `can_rest` | 素材里有没有 `rest`（缺动作时那一项点了也没用，灰掉） |
-    | `resize_available` / `settings_available` / `visibility_available` | 那三项接上了没有（本 task 恒为 False） |
+    | `resize_available` / `settings_available` / `visibility_available` | 那三项接上了没有（各自看"装没装处理器"） |
 
     `mirror_on` 与 `can_mirror` **分开**：适用范围外"没有勾选"与"勾选了但无效"
     是两件事，后者会让用户以为点了没反应。
@@ -172,8 +174,9 @@ def _apply_state(action: QAction, item_id: str, state: MenuState) -> None:
 def _availability(item_id: str, state: MenuState) -> bool:
     """`调整大小…` / `设置…` / `隐藏宠物` 各自接上了没有。
 
-    本 task 这三个都还没实现，`MenuState` 里对应的字段恒为 `False`，
-    于是它们**显示为灰色不可点**（不是消失）。下游 task 接上时把字段置真即可，
+    `调整大小…`（task09）与 `设置…`（task11）都是**装没装处理器**；
+    `隐藏宠物`（task12）还没实现，`MenuState` 里对应字段恒为 `False`，
+    于是它**显示为灰色不可点**（不是消失）。下游 task 接上时把字段置真即可，
     本函数不必改。
     """
     if item_id == ID_RESIZE:

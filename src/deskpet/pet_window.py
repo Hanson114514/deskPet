@@ -265,6 +265,10 @@ class PetWindow(QWidget):
         #: 而不是给用户一个点了没反应的项（§2.10：绝不显示假成功）。
         self._resize_handler: Callable[[], None] | None = None
 
+        #: `设置…` 的处理函数（task11）：`app.py` 装进来，负责"打开/前置设置窗口"。
+        #: 与 `_resize_handler` 同一种做法：**没装就灰掉**。
+        self._settings_handler: Callable[[], None] | None = None
+
         #: **底部预留边距**（task09 的"缩放中按钮不动"机制）：窗口底边距屏幕底边的
         #: 逻辑单位数。`0` = 贴屏幕底边（缺省落点的样子）；`RESERVED` = 抬起来给
         #: 控制栏腾地方。**它只在"没被用户显式指定位置"时生效**（见 `_reserved`）。
@@ -711,6 +715,14 @@ class PetWindow(QWidget):
         """装上 `调整大小…` 的处理函数（`app.py` 用；`None` 卸下 → 菜单项重新灰掉）。"""
         self._resize_handler = handler
 
+    def set_settings_handler(self, handler: Callable[[], None] | None) -> None:
+        """装上 `设置…` 的处理函数（task11；`None` 卸下 → 菜单项重新灰掉）。
+
+        与 `set_resize_handler()` 同一个模式：**菜单项的可用性 = 装没装处理器**。
+        `app.py` 用闭包把"打开/前置设置窗口 + 重置静置计时"接进来。
+        """
+        self._settings_handler = handler
+
     def set_reserved(self, on: bool) -> None:
         """打开 / 关闭"底部预留机制"（task09 §4："用户显式指定位置时不生效"）。
 
@@ -1026,6 +1038,7 @@ class PetWindow(QWidget):
         `resize_available` **task09 起恒为真**：`调整大小…` 已经接线
         （`set_resize_handler()` 装了处理器才为真——没装时仍然灰掉，
         这样"自检里没接控制栏"的窗口不会给用户一个点了没反应的菜单项）。
+        `settings_available` 同理（task11：`set_settings_handler()`）。
         """
         action = self._animation.render_action
         can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
@@ -1036,6 +1049,7 @@ class PetWindow(QWidget):
             can_mirror=can_mirror,
             can_rest=self.can_rest(),
             resize_available=self._resize_handler is not None,
+            settings_available=self._settings_handler is not None,
         )
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
@@ -1078,10 +1092,14 @@ class PetWindow(QWidget):
             # 没装（自检）时菜单项本来就是灰的，到不了这里；真到了也什么都不做。
             if self._resize_handler is not None:
                 self._resize_handler()
+        elif item_id == context_menu.ID_SETTINGS:
+            # task11：`设置…` 同理，处理器由 `app.py` 装（打开/前置设置窗口）。
+            if self._settings_handler is not None:
+                self._settings_handler()
         elif item_id == context_menu.ID_QUIT:
             self.close()
-        # settings / visibility 本 task 一律是禁用的，
-        # 能点到它们说明禁用没生效——那种情况什么都不做，绝不"顺手实现"。
+        # visibility 本 task 仍是禁用的，
+        # 能点到它说明禁用没生效——那种情况什么都不做，绝不"顺手实现"。
 
     def toggle_mirror(self) -> bool:
         """翻转**当前动作**的镜像；返回是否成功（写失败 → `False`）。

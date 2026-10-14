@@ -113,8 +113,8 @@ C:\projects\deskPet\
 | `pet_window.py` | 视图 | 宠物主窗口（事件处理器、显示、隐藏、遮罩、按档位定尺寸 + 右下角锚点切档、**动画驱动 `AnimationDriver`**、**右键菜单入口**、**底部预留边距**） | ✅ |
 | `control_bar.py` | 视图 | 尺寸控制栏（独立顶层窗口 + layout） | ✅ task09 |
 | `context_menu.py` | 视图 | 右键菜单（每次弹出前重建） | ✅ task06 |
-| `settings.py` | 视图 | 设置窗口（字段描述表驱动） | ⬜ task11 |
-| `keycapture.py` | 视图 | 快捷键录入控件 | ⬜ task11 |
+| `settings.py` | 视图 | 设置窗口（字段描述表驱动） | ✅ task11 |
+| `keycapture.py` | 视图 | 快捷键录入控件（**骨架**，task12 接线） | ✅ task11 |
 | `app.py` | 装配 | `QApplication` 引导、命令行解析、启动编排、信号接线、退出收尾 | ✅ |
 
 ---
@@ -506,6 +506,29 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 退出 | `finally` 里 `startup_chime_timer.stop()` + `preload_timeout_timer.stop()` + `sound_player.close()`（句柄不释放 = 再启动一次没声音） |
 | **音频格式** | **不维护"哪些格式能播"的清单**：支持什么由 **Qt 的 FFmpeg 后端**决定。播放路径**不按扩展名过滤**，"打不开"由 `_poll_error()` 判定。`KNOWN_AUDIO_SUFFIXES` 只影响日志措辞；"到底支持什么"运行时问 `decoder_file_formats()` / `decoder_audio_codecs()`（启动日志会打出来）。⚠ **打包必须带上 Qt multimedia 插件与 FFmpeg 动态库**，否则"开发机能响、打包后没声音" |
 
+### 2.19 设置窗口与写入结果（task11 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| **字段描述表** | **`settings.FIELDS` 一处**（有序 = 界面顺序）。`FieldSpec` 六列：`group` / `key` / `title` / `hint` / `kind` / `minimum` / `maximum` / `unit` / `implemented`。**界面代码不许手写行顺序或控件类型** |
+| `FieldKind` | `COMBO`（角色）/ `CHECK`（自启）/ `KEYSEQ`（快捷键）/ `SLIDER`（音量、久置时间） |
+| **`key=""` 的行** | `开机自启` **没有配置键**：它是系统状态（task14 的 `autostart`），不是 `config.json` 的一项。别为它造一个假键 |
+| 未实现的项 | `implemented=False` → 控件 `setEnabled(False)` + 标题追加 `（暂未开放）`，**不是隐藏**（布局稳定）。本 task：`开机自启` / `呼出快捷键` |
+| 窗口形态 | `QDialog` + **`setModal(True)`**（抓住输入焦点）；**不加 `WindowStaysOnTopHint`**——宠物仍按既有约定在最上层飘着（已确认的取舍） |
+| 尺寸与截断 | `560 × 516` 逻辑单位 + `setMinimumSize` + 五行装在 **`QScrollArea`** 里；状态栏与按钮行在滚动区**之外** → 拉小也点得到按钮。**不要**靠"把数字调大" |
+| 定位 | `center_on_screen()`：水平居中、**垂直取屏幕高度的 1/3 处**并夹进 `availableGeometry()`（`VERTICAL_RATIO` 一处） |
+| **单例** | `app.SettingsController`：**只持有一个窗口**；重复 `设置…` → `reload_from_config()` + `center_on_screen()` + `raise_()`（**不 show 第二个**）。关掉后**释放引用**（`WA_DeleteOnClose` + `finished` → `_dialog=None`） |
+| 角色候选 | `settings.pet_choices(current)`：**列出所有发现的包**（坏的也列）；`PetChoice.label(current)` 给出 `● 展示名（命名空间）` 与 `　⚠ 不可用`。当前项**排第一位**；配置指向的包已消失时**补一项**（否则下拉没有当前项） |
+| **写失败回滚** | `ConfigStore.apply()` → `SetResult(ok/changed/error/detail)`；失败时控件**回滚到 `store.get(key)`**（配置里的真值），状态栏 `设置失败：<系统原文>` |
+| **不许有写入回路** | **`SettingsWindow._applying` 守卫标志**：凡是程序自己动控件（初值填充 / 回滚）一律置真，槽函数见真即返回。**没有它 → 回滚又触发一次写入 → 死循环**（自检用计数器盯着"一次改动只写一次"） |
+| **失败不报成功** | `settings_changed(key, value)` **只在写入成功时发**；状态栏渲染先看 `error`（`_last_failure`），有就显示失败原因，**不在拼字符串时决定** |
+| **读操作只读** | 打开/重开设置窗口只 `get()`，**不写盘**（判据：`config.json` 都不该被创建）。填充控件必须包在 `_applying` 里 |
+| 逃生门 | `打开启动文件夹` 在**左下角**（按钮行里排最左），动作 = `QDesktopServices.openUrl(QUrl("shell:startup"))`。**不自己拼 `%APPDATA%`**（启动文件夹的推导真值留给 task14） |
+| 快捷键骨架 | `keycapture.KeyCaptureEdit`：`MODIFIER_ORDER = Ctrl→Alt→Shift→Win`；**只看实测按下的键**（不看 `modifiers()`）；修饰键单独按下不算；至少一个修饰键；Esc 取消；**本类不碰配置**。展示名 `display_text`（**别叫 `text()`**，会与 Qt 撞名） |
+| **角色切换的当前边界** | 可用包 → 写 `pet` + 状态栏 `重启后生效`（**自动重启属 task13**）；坏包 → **不写配置**（不让下次启动必然踩同一个坑）+ 提示详情 + 界面退回真实状态。task13 补：询问重启、坏包时把配置改回默认形象、写失败提示"保存失败，重启后会回到原来的角色" |
+| 菜单接线 | `设置…` 的可用性 = **装没装处理器**（`PetWindow.set_settings_handler()`），与 `调整大小…` 同一模式。处理器里**先 `idle_state.on_mouse_moved()`**（重置静置计时）再开窗口 |
+| **任务栏高度** | `QScreen.geometry()` 在真机上是 **1392**（1440 − 48 任务栏）；`availableGeometry()` 也是 1392。**别把 1440 当屏幕高度写进断言** |
+
 ---
 
 ## 3. 新对话工作流
@@ -848,8 +871,8 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task08 | 拖动与命中：只有按在人物身上才起拖，松手记住位置 | ✅ 已完成 |
 | task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ✅ 已完成 |
 | task10 | 音效与双击手势：坐下有声音，双击会挥手 | ✅ 已完成 |
-| task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ⬜ **下一个** |
-| task12 | 全局热键：藏起来还能叫回来 | ⬜ 未开始 |
+| task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ✅ 已完成 |
+| task12 | 全局热键：藏起来还能叫回来 | ⬜ **下一个** |
 | task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ 未开始 |
 | task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ 未开始 |
 
@@ -1130,8 +1153,6 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > **② "上移一个条带高度"取 `RESERVED`(52)** 而不是 `BAR_HEIGHT`(40)，
 > 因为 52 才是"栏高 + 间距 + 余量"，保证栏放得下（用户已确认此处理方式）。
 
-**下一步**：`tasks/task11.md`（设置窗口）。**⚠ 开工前先读 §A**。
-
 **task10（已完成）** —— 音效与双击手势。**约定见 §2.18，踩坑见 §4.18**；
 新增 `sounds.py`；`app.py` 加异步预热 + 启动音 + 音量联动 + 退出关设备；
 `pet_window.py` 加 `mouseDoubleClickEvent` 手势 / `wave_once()` / `_play_sound()`；
@@ -1211,6 +1232,85 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > §4.19 新增小节 + 本节）与代码改动（`sounds.py` 一个常量 + 三个查询函数 +
 > `app.py` 一行日志）**同量级**。④ 临时探针（`data/pets/fmtprobe`、
 > `data/fmtprobe`、`t10r/t10re.txt`）**已全部删掉**。
+
+**task11（已完成）** —— 设置窗口。**约定见 §2.19**；
+新增 `settings.py`（`FIELDS` 字段描述表 + `SettingsWindow` + `pet_choices()`）与
+`keycapture.py`（录入控件骨架）；`config.py` 加 `SetResult` / `apply()` / `require()`；
+`context_menu.py` 的 `NOT_WIRED_YET` 去掉 `settings`；
+`pet_window.py` 加 `set_settings_handler()`；`app.py` 加 `SettingsController`。
+
+实测（本机 **2560×1440，屏幕逻辑高度 1392**（1440 − 48 任务栏）/ DPI 100%）：
+
+- **窗口实际尺寸 560 × 516**，落点 `1000,206`（水平居中；窗口中心 y=464 = 1392 的 1/3）；
+  **真平台实测通过**（`check_task11_real.py`）。
+- **五行量程**：`音量` 滑块 **0–100**、单位**空**（数字裸显示 `70`）；
+  `久置时间` 滑块 **5–300**、单位 ` 秒`（显示 `20 秒`）；
+  `呼出快捷键` 与 `开机自启` 两行**灰色不可点**且标题带 `（暂未开放）`。
+- **改完立即生效**：拖音量 → `config.json` 的 `volume` 同步更新（实测 70→35→45 都落盘）；
+  拖久置时间 → 立即写盘（状态机每次判定现读，无需重启）。
+  截图见 `docs/task11_settings.png`。
+- **写失败回滚的最终做法**：`store.apply()` 返回 `SetResult`；失败 → 控件回滚到
+  `store.get(key)`（**配置里的真值**，不是"改之前那个值"）+ 状态栏
+  `设置失败：<系统原文>`。**注入 `os.replace` 抛 `PermissionError("拒绝访问")` 实测**：
+  状态栏显示 `设置失败：写配置失败：…（PermissionError: 拒绝访问）`，滑块回到 45，
+  磁盘仍是 45。
+- **不触发写入回路的具体做法 = `SettingsWindow._applying` 守卫标志**：
+  初值填充与回滚都把它置真，`_on_slider/_on_check/_on_combo/_on_keyseq` 见真即返回。
+  自检用一个**计数 `_write` 桩**盯它：一次改动 `_write` 只被调 **1 次**（回路会无限增长）。
+- **打开设置窗口只读不写**：实测构造窗口后 `config.json` **连文件都没被创建**
+  （`ConfigStore` 只在 `set()` 真的改变值时才落盘）。
+- **单例**：连点 5 次 `设置…` → 始终是**同一个实例**、`show()` 被调 **0 次**
+  （走 `reload + center_on_screen + raise_`）；Esc / `关闭` 之后引用被释放，
+  再打开是**新实例**且值来自配置。
+- **角色候选**：自检造了一个好包 + 一个坏包（只写在 scratch 里，`assets/` 未动），
+  两个都出现在候选里；坏包带 `　⚠ 不可用`、当前项带 `● ` 且排第一位。
+  **选可用包** → 写 `pet` + 状态栏 `重启后生效`；**选坏包** → **不写配置**（见下）
+  + 说出默认形象 + 带出那个包的问题 + 界面退回真实状态。
+- **逃生门**：`打开启动文件夹` 在按钮行**最左**（实测次序 `打开启动文件夹、关闭`），
+  点击打开的是 `shell:startup`（自检拦下 `QDesktopServices` 验的 URL）。
+- `mirror` 不在界面上，但设置窗口写过盘之后它**仍在** `config.json` 里。
+
+**角色切换的当前边界（task13 补齐）**：本 task 只做"写配置 + 提示重启后生效"
+与"坏包不动配置 + 提示详情"；**询问是否现在重启**、**坏包时把配置改回默认形象**、
+**写失败提示"保存失败，重启后会回到原来的角色"** 三条留给 task13。
+
+**为什么坏包不改配置**：`config.pet` 的默认值是空串（"用户还没表态"），
+所以"回到默认形象"本来就不需要写任何东西；而把一个**已知不可用**的命名空间写进去，
+等于让下次启动必然走一遍"回退默认形象"的警告路径。task13 §6 要的是
+"配置被改回默认形象"——空串正是这个意思。**task13 若想显式写 `weedy`，改一处即可。**
+
+验收：task11 §6 的 **24 条逐条跑过**。两个脚本**留在仓库里**：
+`tools/check_task11.py`（offscreen，**115 项断言全过**）+
+`tools/check_task11_real.py`（真平台，**18 项全过**：真屏幕居中与 1/3、
+模态、走真菜单路径打开、宠物仍置顶、真写失败回滚、事件循环正常返回）。
+改过 `config.py` / `pet_window.py` / `context_menu.py` / `app.py` 之后
+**回归跑了 task04–10 的全部 offscreen 自检**（30 / 55 / 128 / 123 / 128 / 115 / 117 项，**全过**），
+并**实跑了一次 `python run.py --exit-after 3`**（rc=0，启动行与音效日志正常）。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——首轮 FAIL 全部**一次定位到测试自己写错**
+> （期望里把 `key` 当成 `title`；提示文字抄漏一个「后」字；`layout().children()` 里
+> 一个 widget 都没有（要用 `itemAt(i)`）；`button()` 只收 `StandardButton`；
+> 拿 `_source_of` 判 "APPDATA" 结果命中了解释"为什么不用它"的**注释**——
+> 这一条 §4.11 早就写过，我又踩了一次）。产品按事实改了**三处**，每处都有现场判据：
+> ① `set()` 写失败时**按 key 复制一份原因**（原来只记在 `"*"` 上，
+> `last_error("volume")` 会**回**到上一次那个键的陈旧原因，是探针实测出来的）；
+> ② `set()` 的**未知键**也要能写进去再回滚（否则 `apply("nope")` 会假装成功）；
+> ③ `keycapture` 的属性改名 `text` → `display_text`（与 Qt 撞名，
+> 实测 `TypeError: 'str' object is not callable`）。
+> ② **没有**改到卡范围之外：自启 / 热键注册 / 重启 / 单实例 / 隐藏呼出 / 主题
+> 一律没碰（卡里明写不做），`呼出快捷键` 与 `开机自启` 两行**只建骨架并禁用**。
+> ③ 文档改动集中在 §2.19 新增小节 + §1.2 两行 + §5 本节，与代码改动
+> （2 个新模块 + 4 个模块改）**同量级**。
+> ④ 临时探针（`data/t11_probe.json` / `t11w.json` / `t11v*.json` / `t11smoke*` /
+> `t11shot.json` / `task11_scratch` / `task11_real_scratch`）**已全部删掉**。
+> ⑤ **规格缺口（已按用户决定处理）**：卡里要求先读的「第二部分 §4 / 3.4 / 3.5 /
+> 3.13 / 3.15 / 附录 B」都在你删掉的 `迁移清单.md` 里。**附录 B 已由用户当场贴出**，
+> 相关文字（含设置窗口那一组）一律照它落地；**卡里没给的**两项按合理默认落地并记在此：
+> **① `开机自启` 那一行的状态栏文字取 `未开启`**（task14 §4 的 `AutostartState`
+> 是它的真值，本 task 只是占位，task14 接上时换成真实查询结果）；
+> **② 状态栏的成功提示文案**（`已切换到「…」；重启后生效`）卡里没给，属自定。
+
+**下一步**：`tasks/task12.md`（全局热键）。**⚠ 开工前先读 §A**。
 
 **已知待清理（不阻塞主线）**：
 
