@@ -41,7 +41,7 @@ import logging
 import signal
 import sys
 
-from PySide6.QtCore import QPoint, QRect, QTimer
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -60,6 +60,7 @@ from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
+from .sounds import SOUND_CHIME, SoundPlayer, normalize_volume
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
 #: Qt 的事件循环不会自己回到解释器，没有这个心跳时 Ctrl+C 不会及时生效。
@@ -73,6 +74,14 @@ IDLE_TICK_MS = 250
 #: `--action` 的默认值。**它是"首选"而不是"必须有"**：素材里没有 `idle` 时
 #: 按 `action_order` 的第一个动作退化（见 `pet_window._pick_action`）。
 DEFAULT_ACTION = "idle"
+
+#: 启动音延迟（毫秒）：等窗口画出来之后再响，免得"开机那一下"与合成器抢时间。
+#: task10 §2 第 1 条的"约 80 ms"就是这个值。
+STARTUP_CHIME_DELAY_MS = 80
+
+#: 预热超时（毫秒）：等音效预热有结果的时间上限，**超时按"没有音效"照常启动**。
+#: 它是"不能阻塞"这条要求的兜底——没有它，预热一旦卡住启动音就永远不来。
+PRELOAD_TIMEOUT_MS = 2000
 
 #: 只读查询返回的退出码。
 _EXIT_OK = 0
@@ -624,6 +633,30 @@ def _log_config_summary(store: ConfigStore) -> None:
     )
 
 
+def _log_sound_summary(player: SoundPlayer) -> None:
+    """把音效状况**一次说清**：汇报文案 + 三条诊断可见性（task10 §4"诊断可见性"）。
+
+    汇报文案的格式由 `SoundReport.summary()` 一处定义（**不可改**）：
+    `音效 2/2` / `无音效` / `无音效（未在索引里声明：bgm.mp3）` /
+    `音效 1/2（缺 rest）（无法播放：bgm.ogg）`。
+
+    三条诊断各记一条 `INFO`/`WARNING`：**只记日志、不弹窗**
+    （用户无需行动的内部退化，agent.md §2.10）。
+    """
+    report = player.diagnose()
+    _logger.info("音效：%s", report.summary())
+    for name in report.missing:
+        _logger.warning("音效 %s：索引里声明了，但文件不在", name)
+    for name, reason in report.unplayable:
+        _logger.warning("音效 %s：文件在，但打不开（%s）", name, reason)
+    if report.undeclared:
+        _logger.info(
+            "音效：sounds/ 里有 %d 个没在索引里声明的文件（不会被播放）：%s",
+            len(report.undeclared),
+            "、".join(report.undeclared),
+        )
+
+
 def _report_resolution_problems(issues: tuple, fell_back: bool, config_pet: str | None) -> None:
     """把解析素材包时攒下的问题**一次性全部**写进日志（§2.10 第三类）。"""
     for issue in issues:
@@ -788,7 +821,20 @@ def run(argv: list[str] | None = None) -> int:
     # 的那一类，绝不能让静置行为因为它失效）。
     idle_state = IdleStateMachine(lambda: normalize_idle_seconds(store.get("idle_seconds")))
 
-    window = PetWindow(pet, level, mirror=mirror, idle_state=idle_state, config=store)
+    # 音效（task10）：**按素材索引的 `sounds` 声明**构建，没有声明就是没有声音。
+    # 音量取自配置 `volume`（越界夹取；类型不合法的值配置层已经回退成默认值）。
+    # ⚠ 所有播放器调用都在 GUI 线程（`QMediaPlayer` 不是线程安全的，agent.md §4.9）：
+    # 本进程**不建任何音频线程**，播放全部经由 `SoundPlayer.play()` 这一条路径。
+    sound_player = SoundPlayer(pet, normalize_volume(store.get("volume")))
+
+    window = PetWindow(
+        pet,
+        level,
+        mirror=mirror,
+        idle_state=idle_state,
+        config=store,
+        sounds=sound_player,
+    )
     window.play_action(action)
     if position is None:
         window.showing_at_default_position()
@@ -803,6 +849,65 @@ def run(argv: list[str] | None = None) -> int:
     window.show()
 
     _print_startup_line(window, level_source, position_source)
+
+    # ------------------------------------------------------------ 音效预热与启动音（task10）
+    #
+    # **不能阻塞**是这一块的全部要点（task10 §4）：
+    #   1. `preload()` 立即返回，预热结果走 `sound_ready(available, reason)` 信号回来；
+    #   2. 启动音由 `QTimer.singleShot(80, ...)` 排，**不在主线程 sleep 或忙等**；
+    #   3. 预热超过 `PRELOAD_TIMEOUT_MS` 没结果 → **另一个定时器**兜底，
+    #      按"没有音效"照常启动（用户不该因为一块网卡/声卡卡住就用不上桌宠）。
+    #
+    # 三个定时器是**互相取消**的：谁先到就把另外两个停掉，所以 `chime` 只会响一次。
+    startup_chime_timer = QTimer()
+    startup_chime_timer.setSingleShot(True)
+    startup_chime_timer.setTimerType(Qt.PreciseTimer)
+    startup_chime_timer.timeout.connect(lambda: sound_player.play(SOUND_CHIME))
+
+    preload_timeout_timer = QTimer()
+    preload_timeout_timer.setSingleShot(True)
+    preload_timeout_timer.setTimerType(Qt.PreciseTimer)
+
+    def _on_sound_ready(available: bool, reason: str) -> None:
+        """预热有结果了：**先停掉超时兜底**，再按 80 ms 排启动音。
+
+        预热失败也照常排：`play()` 自己会静默跳过，"没声明 chime"与"文件坏了"
+        都不该让启动流程分叉（音效是可选功能，agent.md §2.10 第三类）。
+
+        **只排一次**：`settle()` 之后会再发一次 `sound_ready`（把异步结论带过来），
+        那时不该把已经排好的启动音重置一遍。
+        """
+        preload_timeout_timer.stop()
+        if not available:
+            _logger.info("本次运行没有可用音效：%s", reason)
+        if not startup_chime_timer.isActive():
+            startup_chime_timer.start(STARTUP_CHIME_DELAY_MS)
+
+    def _on_preload_timeout() -> None:
+        """预热超时：**不等了**，按"没有音效"照常启动，并留一条日志说明白了。
+
+        顺手调一次 `settle()`：`QMediaPlayer.setSource()` 是**异步**加载的，
+        超时这一刻"没报错"的声音就该按能播算（`sounds.SoundPlayer.settle()`），
+        否则一个只是加载慢的好音效会被永久判死。
+        """
+        startup_chime_timer.stop()
+        sound_player.settle()
+        _logger.warning(
+            "音效预热超过 %d ms 没有结果，本次按没有音效继续（程序照常可用）",
+            PRELOAD_TIMEOUT_MS,
+        )
+
+    sound_player.sound_ready.connect(_on_sound_ready)
+    preload_timeout_timer.timeout.connect(_on_preload_timeout)
+    preload_timeout_timer.start(PRELOAD_TIMEOUT_MS)
+    # 预热排在窗口 `show()` 之后：启动音与窗口出现**同时**发生，
+    # 用户从双击图标到听见声音是一条连贯的体验（task10 §6"启动时不卡"）。
+    sound_player.preload()
+    # `preload()` 里的加载是**异步**的（`QMediaPlayer.setSource()` 立即返回），
+    # 所以"能播几个"要等一拍才定得下来（`settle()`）。汇总日志放在 settle 之后，
+    # 免得它报的是"还没结论"的中间态。
+    sound_player.settle()
+    _log_sound_summary(sound_player)
 
     # ------------------------------------------------------------ 尺寸控制栏（task09）
     #
@@ -821,6 +926,18 @@ def run(argv: list[str] | None = None) -> int:
     # 跟随：位置变化信号驱动**增量平移**，绝不轮询（task09 §5）。
     window.position_changed.connect(lambda _pos: bar_controller.sync_follow())
     bar_controller.reposition()
+
+    # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
+    # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；
+    # task10 阶段"手改 config.json"要生效**仍需重启**（`ConfigStore` 是内存快照，
+    # 与 task07 的 `idle_seconds` 同一个道理）。task11 的设置界面会走 `set()`，
+    # 于是滑块一动这里就跟着变。
+    def _on_config_changed(key: str, value: object) -> None:
+        if key == "volume":
+            applied = sound_player.set_volume(normalize_volume(value))
+            _logger.info("音量已改为 %d", applied)
+
+    store.config_changed.connect(_on_config_changed)
 
     heartbeat = _install_sigint_handler(app)
 
@@ -842,9 +959,8 @@ def run(argv: list[str] | None = None) -> int:
     try:
         code = app.exec()
     finally:
-        # 退出收尾。本阶段没有热键 / 音效设备 / 单实例锁要放，
-        # 只收掉自己的心跳定时器、久置计时器与光标轮询
-        # （音效 / 热键 / 单实例锁属 task10 / task12 / task13）。
+        # 退出收尾。本阶段还没有热键 / 单实例锁要放（task12 / task13），
+        # 收掉自己的心跳定时器、久置计时器、光标轮询与**音效设备**。
         window.stop_animation()
         # 控制栏是**独立顶层窗口**：不显式收起的话它会比宠物活得久
         # （`Qt.Tool` 不计入"最后一个主窗口"，agent.md §4.9）。
@@ -853,6 +969,11 @@ def run(argv: list[str] | None = None) -> int:
         # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条）。
         cursor_watch.stop()
+        # 音效设备必须**真的释放**（task10 §4"退出"）：句柄不释放的表现是
+        # "退出后音频设备被占着，立刻再启动一次就没声音了"。
+        startup_chime_timer.stop()
+        preload_timeout_timer.stop()
+        sound_player.close()
         if heartbeat is not None:
             heartbeat.stop()
     _logger.info("%s 退出（退出码 %d）", PROGRAM_NAME, code)

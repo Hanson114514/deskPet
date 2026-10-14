@@ -98,7 +98,7 @@ C:\projects\deskPet\
 | `pet_loader.py` | 数据 | 两根扫描、`asset.json` 解析、**一次性列全校验**、统一解析"一个说法"、`load_frame_image()` | ✅ |
 | `size.py` | 数据 | 10 级档位（**精确有理数**）、像素换算、屏幕自适应、右下角锚点与夹取 | ✅ task04 |
 | `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转）；`region_for_frame` 的真实现 | ✅ task08 |
-| `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 | ⬜ task10 |
+| `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 | ✅ task10 |
 | `autostart.py` | 系统 | 开机自启（读与修**分开**） | ⬜ task14 |
 | `single_instance.py` | 系统 | 单实例保护 | ⬜ task13 |
 | `restart.py` | 系统 | 重启自己（含锁交接） | ⬜ task13 |
@@ -484,6 +484,27 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 菜单项 | `调整大小…` 的 `MenuState.resize_available` = **装没装处理器**（`set_resize_handler()`）。没装 → 仍然灰掉。动作 = **重置静置计时**（`idle_state.on_mouse_moved()`）+ 开关控制栏 |
 | 退出收尾 | `finally` 里 `bar_controller.close()`（独立顶层窗口要显式收起，否则它比宠物活得久） |
 
+### 2.18 音效与双击手势（task10 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| **逻辑名只有两个** | `rest`（主动休息 + 久置自动休息**共用**）/ `chime`（启动音 + 双击交互音）。真值 `sounds.SOUND_NAMES` |
+| 映射来源 | **只认素材索引 `sounds` 声明**；无兜底表、不自动认 `sounds/rest.mp3`、不从目录自动发现 |
+| 后端（**D4 定案**） | **`QMediaPlayer` + `QAudioOutput`**（要能播 mp3；`QSoundEffect` 只支持 wav）。**不需要额外依赖**，PySide6 自带 `QtMultimedia`（实测可用） |
+| 线程 | **所有播放器调用都在 GUI 线程**（`QMediaPlayer` 不是线程安全的，§4.9）。**不建音频线程**；唯一出口是 `SoundPlayer.play()` |
+| 音量 | `sounds.VOLUME_MIN/MAX` = 0/100 一处；**越界数字夹取**（1000→100）、**非数字归 0**。`set_volume()` 直接作用到已打开的播放器 |
+| 异步 | `preload()` **不阻塞**（立即返回，结果走 `sound_ready` 信号）；启动音用 `QTimer.singleShot(STARTUP_CHIME_DELAY_MS=80)`，预热超时 `PRELOAD_TIMEOUT_MS=2000` 由**另一个定时器**兜底。**绝不 `sleep` / 忙等** |
+| **判"能不能播"** | **不能只看 `errorOccurred`**（真平台实测：设备被别的播放器占用时那个信号**根本不发**）。判据是 `player.error()` + `mediaStatus() == InvalidMedia`（`sounds._poll_error()`），由 `settle()` 落定 |
+| `settle()` | 预热后调一次把异步结论定下来。**没问出问题就按能播算**（加载慢的好音效不许被判死） |
+| 汇报文案 | **格式真值在 `SoundReport.summary()` 一处**：`音效 2/2` / `无音效` / `无音效（未在索引里声明：bgm.mp3）` / `音效 1/2（缺 rest）（无法播放：bgm.ogg）` |
+| 三条诊断 | ① 声明了但文件不在；② 格式打不开；③ `sounds/` 里有却没声明。**只记日志**，不弹窗（§2.10 第三类） |
+| 休息音效落点 | **`PetWindow._on_stage_changed()` 一处**（阶段变成 `rest` 就响）。主动与自动天然共用，**不按"是谁点的"分** |
+| 双击手势 | 双击 → `play_sequence((("waving", None, ("loop", 1)),))` **整段一次** + 播 `chime`，播完 `sequence_done` → 回 `idle`。**不裁帧** |
+| **拖动中双击** | **明确忽略**（`drag_controller.active` 时直接返回，不挥手不响） |
+| 手势收尾判据 | **`PetWindow._gesture_active`**，**不是** `animation.in_sequence`：`sequence_done` 发出时 `_segments` 已被清空，那一刻问它**永远是假**（见 §4.18 的 bug） |
+| 缺 `waving` | 不挥手，但 **`chime` 照播**（它是"双击这个交互"的声音，与素材有没有挥手动作无关） |
+| 退出 | `finally` 里 `startup_chime_timer.stop()` + `preload_timeout_timer.stop()` + `sound_player.close()`（句柄不释放 = 再启动一次没声音） |
+
 ---
 
 ## 3. 新对话工作流
@@ -770,6 +791,27 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 - 推论（写自检的通则）：**"某个坐标全程不变"这种断言必须用屏幕坐标
   （`mapToGlobal`）**。窗口内坐标不变只是布局稳定，两者不是一回事。
 
+### 4.18 音效层的三个真陷阱（task10 实测）
+
+- **`QMediaPlayer.setSource()` 是异步的，同步读 `mediaStatus()` 永远拿到 `NoMedia`。**
+  第一版实现读它判"能不能播"，**把每一个坏文件都判成"能播"**；是自检里
+  "往 `sounds/` 放一个打不开的文件"那条当场抓到的（日志里 Qt 自己打着
+  `Could not open media`，而我们的代码说它没问题）。
+- **`errorOccurred` 也不保证送达。** 实测：设备已被另一个播放器占用时，
+  坏文件的报错**根本没发出来**（连 `error()` 都是 `NoError`）。
+  所以判据要取**能问到的状态本身**（`error()` + `mediaStatus()`），
+  并留一个 `settle()` 让调用方在预热后把结论定下来——**不要赌信号一定到**。
+- **"改名的 txt"不一定被拒**：FFmpeg 的探测很宽容，某些内容会被当成裸流
+  加载成 `LoadedMedia` 且 `NoError`。自检**造坏文件时要选实测会被拒的内容**
+  （`b"not audio\n" * 40` / 随机字节 / 单字节可以；`b"definitely not audio\n"*40`
+  和带 PNG 头的字节**不行**）。这不是产品判错，是那个文件真的被解码器接受了。
+- **`sequence_done` 在"任何一次播完"时都会发**，不只是片段序列；而且信号发出时
+  `Animation._segments` **已经被清空**（`_finish()` 先清再发）→ 在那个槽里问
+  `animation.in_sequence` **永远是假**。第一版拿它当"手势播完"的判据，于是普通的
+  `play_action("waving")` 播完也被切回 `idle`，把 task05 的
+  "一次性动作停在末帧、定时器已停"整条约定打掉（**真平台自检抓到**：
+  期望停在末帧 29，实际 41 且 `running=True`）。对策：自己记 `_gesture_active`。
+
 ---
 
 ## 5. 当前进度
@@ -785,8 +827,8 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task07 | 久置行为：鼠标一停就张望，再等一会儿坐下 | ✅ 已完成 |
 | task08 | 拖动与命中：只有按在人物身上才起拖，松手记住位置 | ✅ 已完成 |
 | task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ✅ 已完成 |
-| task10 | 音效与双击手势：坐下有声音，双击会挥手 | ⬜ **下一个** |
-| task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ⬜ 未开始 |
+| task10 | 音效与双击手势：坐下有声音，双击会挥手 | ✅ 已完成 |
+| task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ⬜ **下一个** |
 | task12 | 全局热键：藏起来还能叫回来 | ⬜ 未开始 |
 | task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ 未开始 |
 | task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ 未开始 |
@@ -1068,7 +1110,59 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > **② "上移一个条带高度"取 `RESERVED`(52)** 而不是 `BAR_HEIGHT`(40)，
 > 因为 52 才是"栏高 + 间距 + 余量"，保证栏放得下（用户已确认此处理方式）。
 
-**下一步**：`tasks/task10.md`（音效与双击手势）。**⚠ 开工前先读 §A**。
+**下一步**：`tasks/task11.md`（设置窗口）。**⚠ 开工前先读 §A**。
+
+**task10（已完成）** —— 音效与双击手势。**约定见 §2.18，踩坑见 §4.18**；
+新增 `sounds.py`；`app.py` 加异步预热 + 启动音 + 音量联动 + 退出关设备；
+`pet_window.py` 加 `mouseDoubleClickEvent` 手势 / `wave_once()` / `_play_sound()`；
+`idle_state`→`_on_stage_changed()` 接休息音效。
+
+**D4 最终选择 = `QMediaPlayer` + `QAudioOutput`**（要能播 mp3；`QSoundEffect` 只支持 wav）。
+**不需要额外依赖**：`PySide6.QtMultimedia` 实测可用（已随 PySide6 装上）。
+**预热方式**：`preload()` 立即返回 → 结果走 `sound_ready` 信号 → `QTimer.singleShot(80)` 排启动音；
+**另一个定时器（2 s）兜底超时**，超时按"没有音效"照常启动。全程**不 sleep、不忙等、不建音频线程**。
+
+实测（本机 2560×1440 / DPI 100%）：
+- **两个自带包都没有 `sounds` 声明** → 启动**静默**，日志 `音效：无音效` + 原因
+  `素材索引里没有声明任何音效`。`--pet weedy --exit-after 3` 实测 rc=0、无任何声音。
+- **四条汇报文案逐字符实测**（用自检造的临时包，`assets/` 一个字节没动）：
+  `音效 2/2` / `无音效` / `无音效（未在索引里声明：bgm.mp3）` /
+  `音效 0/2（缺 chime）（无法播放：rest（Could not open file））`。
+- **启动音时机真平台实测 81.3 ms**（约定 80 ms）；音量运行时读得回、改完立刻生效
+  （`set_volume(1000)→100`、`(-5)→0`、`"大声"→0`）。
+- **双击手势**：`waving` 整段 30 帧恰好一圈 → `sequence_done` → 回 `idle`；
+  **拖动途中双击 wave 调用 0 次**（正常时 1 次）；连点两次各播一次 `chime` 且回到片段起点。
+- **长跑 50 次**休息 + 双击后设备仍可用（`available=True`、还能真播）；
+  **两次真实启动都 rc=0**（无残留占用）。
+- 三条诊断在真平台上都验过：文件不在 / 格式打不开（Qt 原文 `Could not open file`）/
+  存在却没声明（`sounds/` 里两个文件都被列出）。
+
+验收：task10 §6 的 19 条逐条跑过（其中"能听到声音"那组按卡里前置说明，
+用**自检自己造的临时素材包**验，**没有改 `assets/`、没有要用户同意**）。
+两个脚本**留在仓库里**：`tools/check_task10.py`（offscreen，**92 项全过**）+
+`tools/check_task10_real.py`（真平台，**20 项全过**：真音频设备、启动音时机、
+50 次长跑、打不开的文件、两次真实进程干净退出）。
+改过 `pet_window.py` / `app.py` 之后**回归跑了 task04–09 的全部自检与真平台检查**。
+⚠ 顺手更新了 `check_task07.py` 里**两条已被 task10 取代的期望值**
+（它们原文自己写着"挥手属 task10"）：双击现在会挥手，所以断言改成
+"不再保持休息姿势（进入挥手手势）"与"不改 manual"，手势本身归 task10 自检。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——4 个首轮 FAIL 一次定位到
+> **测试自身**（`_code_only()` 把 `.close()` 拆成 token 后仍拿带点字面量去判；
+> 拿 `_source_of()` 的原文（含 docstring）判"有没有猜文件名"；
+> 自检造的"坏文件"内容其实是 FFmpeg 能接受的；preload 幂等期望写反）。
+> 产品按事实改了**三处**，每一处都有现场判据：① 异步加载不能同步读状态（日志里
+> Qt 自己报着 `Could not open media`）；② `availability` 与 `summary()` 分叉
+> （`available=True` 却报 `音效 0/2`）；③ 手势收尾判据 `in_sequence` 恒为假
+> （task05 真平台自检抓到"停在 41 而非 29"）。
+> ② **没有**改到卡范围之外：设置窗口 / 热键 / 自启 / 单实例 / 混音 / 淡入淡出 /
+> 自动发现一律没碰（卡里明写不做）。③ 文档改动集中在 §2.18 新增小节 + §4.18 新增小节
+> + §1.2 一行 + 本节，与代码改动（1 个新模块 + 3 个模块改）**同量级**。
+> ④ 临时探针（`data/t10probe`、`t10broken`、`t10cands`、`t10c2`、`t10breakchk`、
+> `t10dbg`、`t10brokenprobe`、`data/pets/`、`t10real_out/err.txt`、`crash.log`）
+> **已全部删掉**。⑤ **卡里"打不开的文件"那条只在真设备上成立**：
+> 自检必须选**实测被 Qt 拒绝**的内容，否则"改名的 txt"会被 FFmpeg 当裸流接受
+> ——已记进 §4.18，免得后人以为产品判错了。
 
 **已知待清理（不阻塞主线）**：
 
@@ -1080,7 +1174,7 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 | D1 | 透明方案 | task01 之前 | ✅ **已定案**：素材重做为透明背景 PNG（不做色键转换、不重烘 RGB 帧） |
 | D2 | 点击穿透 | task01 之前 | ✅ **已定案**：`setMask(QRegion)`（接受边缘锯齿） |
 | D3 | 缩放算法：`SmoothTransformation` / 三倍最近邻 | task04 之前 | ✅ **已定案（task04）**：`SmoothTransformation`。理由：源 GIF 是 1 位 alpha，放大时最近邻会把台阶等比放大；`SmoothTransformation` 柔化边缘，代价只是边缘多出半透明像素，而"`setMask` 有锯齿"本来就是已接受的取舍 |
-| D4 | 音频后端：`QMediaPlayer`（可播 mp3）/ `QSoundEffect`（只支持 wav） | task10 之前 | ⬜ 未定（建议 `QMediaPlayer`） |
+| D4 | 音频后端：`QMediaPlayer`（可播 mp3）/ `QSoundEffect`（只支持 wav） | task10 之前 | ✅ **已定案（task10）**：`QMediaPlayer` + `QAudioOutput`（要能播 mp3；**不需要额外依赖**，`PySide6.QtMultimedia` 实测可用） |
 | D5 | 全局热键路线：原生消息过滤器 / 子线程+队列+定时器 | task12 之前 | ⬜ 未定 |
 | D6 | 单实例机制：`QLocalServer` / 命名互斥体 | task13 之前 | ⬜ 未定 |
 | D7 | 自带素材包补 `fps` | 任意 | ✅ **已落实**：两个包、13 个动作全是 `30.0` |

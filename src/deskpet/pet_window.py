@@ -84,6 +84,7 @@ from .idle_state import IdleStateMachine
 from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
+from .sounds import SOUND_CHIME, SOUND_REST, SoundPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,13 @@ REST_STANDUP_ACTION = DEFAULT_ACTION
 #: 久置状态机各阶段对应的动作名。**真值是 `idle_state.Stage.value` 本身**
 #: （阶段名与动作名同形就是为此），这里只做一次显式核对，不另立一张表。
 IDLE_ACTION = DEFAULT_ACTION
+
+#: 双击手势播的动作（task10 §4"双击手势"）：**完整播放一次**，播完回 `idle`。
+WAVING_ACTION = "waving"
+
+#: 双击手势的片段写法：整段一次（等价 `("loop", 1)`）。
+#: **不裁帧**——首帧是抬手（起势）、末帧是收手（收势），衔接 `idle` 更自然。
+WAVING_SEGMENT = ((WAVING_ACTION, None, ("loop", 1)),)
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
@@ -216,6 +224,7 @@ class PetWindow(QWidget):
         mirror: MirrorState | None = None,
         idle_state: IdleStateMachine | None = None,
         config: ConfigStore | None = None,
+        sounds: SoundPlayer | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -231,6 +240,10 @@ class PetWindow(QWidget):
         self._user_positioned = False
         #: **按下那一刻**是不是 `manual` 坐姿（双击判据，见 `mouseDoubleClickEvent`）。
         self._manual_rest_at_press = False
+        #: 双击手势正在进行中（`wave_once()` 置真，播完由 `_on_sequence_done` 清掉）。
+        #: ⚠ **不能**拿 `animation.in_sequence` 代替：`sequence_done` 发出时
+        #: 片段表已经被清空，那一刻问它永远是假（见 `_on_sequence_done`）。
+        self._gesture_active = False
         self._quit_shortcuts: list[QShortcut] = []
 
         #: 镜像状态表（task06）。没给就自己造一个"永远不翻转"的
@@ -241,6 +254,11 @@ class PetWindow(QWidget):
         #: 配置 store（task08）：**松手时**把落脚点写进 `position`。
         #: `None` = 没有配置可写（自检里常见），此时只记 DEBUG 日志、不报错。
         self._config = config
+
+        #: 音效播放器（task10）。`None` = 没有音效可播（自检里常见）——
+        #: 此时"休息有声音""双击有 chime"都**静默**，不影响任何其他行为。
+        #: ⚠ 所有播放器调用都在 GUI 线程（`QMediaPlayer` 不是线程安全的，§4.9）。
+        self._sounds = sounds
 
         #: `调整大小…` 的处理函数（task09）：`app.py` 装进来，负责开关控制栏。
         #: `None` = 本窗口没有控制栏（自检里常见）→ 菜单项**灰掉**，
@@ -288,6 +306,8 @@ class PetWindow(QWidget):
         self._animation = Animation(pet, self._action)
         self._driver = AnimationDriver(self._animation, self)
         self._driver.frame_due.connect(self._on_frame_due)
+        #: 片段序列播完 → 收尾（双击挥手播完回 `idle`，task10 §2 第 4 条）。
+        self._animation.sequence_done.connect(self._on_sequence_done)
         #: 已经显示过的帧号（**用来跳过无变化的重绘**，见 `_on_frame_due`）。
         self._shown_index: int | None = None
         #: 已经显示过的镜像态（**与 `_shown_index` 同理**：镜像变了就要重绘）。
@@ -574,6 +594,9 @@ class PetWindow(QWidget):
         if fps_override is not None:
             self._animation.set_fps_override(fps_override)
 
+        # 换动作 = 手势被打断：标志清掉，免得下一个一次性动作播完时
+        # 被当成"手势播完"而切回 idle（`_on_sequence_done` 的判据）。
+        self._gesture_active = False
         self._action = self._animation.action
         self._shown_index = None
         self._shown_mirrored = None
@@ -943,11 +966,32 @@ class PetWindow(QWidget):
         素材里没有这个动作时**什么都不做**（"缺动作就不切"，agent.md §2.5：
         不许为找不到的动作硬塞替身）；被挂起时也不可能收到本信号
         （状态机自己在挂起期间不发 `stage_changed`，见例外的第 ② 条）。
+
+        ## 休息音效的**唯一落点**就在这里
+
+        主动休息（右键菜单 → `IdleStateMachine.enter_manual()`）与久置自动休息
+        最终都会走到"阶段变成 `REST`"这一步，于是 task10 §2 第 2 条那条
+        "两者**共用**同一个逻辑名 `rest`"在这里天然成立：
+        声音跟着**阶段**走，不跟着"是谁点的"走。写两处必然有一天只响一个。
         """
         action = str(getattr(new, "value", new))
         if not self.pet.has_action(action):
             return
         self.play_action(action)
+        if action == REST_ACTION:
+            self._play_sound(SOUND_REST)
+
+    def _play_sound(self, name: str) -> bool:
+        """播一个逻辑名；**没有播放器就静默**，返回"有没有真的播"。
+
+        唯一的音效出口：`play()` 自己保证"任何一步失败都静默跳过"
+        （task10 §4），所以这里不需要 try/except，也不要在这里做任何判断——
+        判断（声明没声明、文件在不在）全在 `SoundPlayer` 一处，两处判迟早分叉。
+        """
+        if self._sounds is None:
+            logger.debug("没有音效播放器，跳过音效 %s", name)
+            return False
+        return self._sounds.play(name)
 
     def exit_manual_rest(self) -> bool:
         """退出 `manual`（主动坐姿）并站起来；返回是否真的退出了。
@@ -1147,14 +1191,25 @@ class PetWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """双击宠物。
+        """双击宠物：**完整挥手一次 + 播 `chime`**（task10 §4"双击手势"）。
 
-        **拖动途中一律忽略**（task08 §2 第 6 条）：拖动是"按下 → 移动 → 松开"的
-        连续操作，中途插入一个手势会把这次拖动切成两段。本 task **不做**
-        "双击挥手"那个手势（属 task10），只做"拖动途中不触发"这一条。
+        **拖动途中一律忽略**（task10 §2 第 5 条 / task08 §2 第 6 条）：拖动是
+        "按下 → 移动 → 松开"的连续操作，中途插入一个手势会把这次拖动切成两段。
+        判据就是 `self.dragging`——**不看位移**：拖动一旦开始就接管动作控制权，
+        这时候再挥手会与拖动逻辑抢动作，表现是一边走一边抽搐。
 
         不在拖动中且处于 `manual` 坐姿时**退出坐姿**（task07 §2 第 6 条）：
         用户双击的意思是"别一直坐着了"，于是站起来回 `auto` 模式。
+        挥手会在那之后开始（`exit_manual_rest()` 切了 `idle`，随后被手势顶掉）。
+
+        ## 手势怎么表达：`play_sequence` 的 `("loop", 1)` 片段
+
+        "完整播放一次 `waving`，播完回 `idle`"用 `animation.play_sequence()`
+        （等价 `("loop", 1)`）表达，而不是"手动数到末帧再切"：
+        片段序列负责**何时结束**（`sequence_done`），调用方只管收尾。
+        `waving` 是一次性动作（`PLAY_MODES`），片段里仍按它自己的方式走；
+        片段只收窄帧区间——本手势用的是**整段**，所以连帧区间都不收窄。
+        **不裁帧**：首帧是抬手（起势）、末帧是收手（收势），衔接 `idle` 更自然。
 
         ## 为什么最后要 `abort_drag()`
 
@@ -1170,9 +1225,20 @@ class PetWindow(QWidget):
         对策是双击时**明确中止**这次拖动：动作控制权还回去、指针还原。
         用户真要拖动时，第二次按下之后**移动**会重新进入拖动——
         双击的那两次点击本身没有位移，中止它不会丢任何东西。
+
+        ⚠ 手势与 `abort_drag()` 的**先后顺序**：先中止拖动，再做手势。
+        反了的话 `abort_drag()` 之后那次 press 会重新起拖、并把动作抢回 `idle`，
+        挥手当场被打断（表现是"双击没反应"）。
         """
         if event.button() != Qt.LeftButton:
             super().mouseDoubleClickEvent(event)
+            return
+
+        # 拖动途中双击被忽略（task10 §2 第 5 条）：连 `super()` 都不必特殊处理，
+        # 走默认路径即可——关键只是**不触发手势、不响**。
+        if self.drag_controller.active:
+            super().mouseDoubleClickEvent(event)
+            self.abort_drag()
             return
 
         if self._manual_rest_at_press:
@@ -1188,6 +1254,58 @@ class PetWindow(QWidget):
         # 而我们正在处理的那次 press 之前、super 之后还可能再来一次）。
         # 放在前面中止的话，紧随其后的 press 会立刻把拖动又开起来。
         self.abort_drag()
+        # 手势排在**中止之后**：`abort_drag()` 把动作控制权还给了静置逻辑，
+        # 这时才轮到手势接管（见上面那条顺序说明）。
+        self.wave_once()
+
+    def wave_once(self) -> bool:
+        """完整播放一次 `waving` 并播 `chime`；返回手势有没有真的开始。
+
+        素材里没有 `waving` 时**不挥手**（agent.md §2.5："缺 `waving` 就不挥手，
+        按可恢复路径退化"）——但 `chime` **照样播**：它是"双击这个交互"的声音，
+        与素材有没有挥手动作无关（task10 §4 把 `chime` 定义为"双击交互音"）。
+        """
+        started = False
+        if self.pet.has_action(WAVING_ACTION):
+            # 片段序列：播完整段一圈 → `animation.sequence_done` → 回 `idle`。
+            self._animation.play_sequence(WAVING_SEGMENT)
+            self._action = self._animation.render_action
+            self._shown_index = None
+            self._shown_mirrored = None
+            self.show_action_frame(self._animation.render_action, self._animation.index)
+            # 片段必须先 `driver.start()`：`play_sequence` 之后定时器可能正停着
+            # （上一次一次性动作播完就停了），不重启就永远不会推进。
+            self._driver.start()
+            # 手势标志**在开播之后**置真：`play_sequence()` 会中断旧序列，
+            # 万一它触发了收尾，那时标志还该是假（免得收尾逻辑被上一次手势带走）。
+            self._gesture_active = True
+            started = True
+        self._play_sound(SOUND_CHIME)
+        return started
+
+    def _on_sequence_done(self) -> None:
+        """片段序列播完：**回 `idle`**（task10 §2 第 4 条"播完自动回 idle"）。
+
+        ## 为什么必须自己记一个标志，而不是问 `in_sequence`
+
+        `sequence_done` 在**任何**一次"播完"时都会发出来：普通的一次性动作
+        （`play_action("waving")`）播到末帧也发它。而信号发出时
+        `Animation._segments` **已经被清空了**（`_finish()` 先清再发），
+        所以此刻问 `animation.in_sequence` **永远是假** ——
+        拿它当判据会把"普通挥手播完"也当成"手势播完"，于是切回 `idle`
+        让 idle 一直循环下去（task05 的真平台自检当场抓到：
+        期望"停在末帧 29、定时器已停"，实际停在 41 且 `running=True`）。
+
+        所以判据是 `_gesture_active`：**只有双击手势才收尾**。
+        """
+        if not self._gesture_active:
+            return
+        self._gesture_active = False
+        if self.drag_controller.active:
+            # 拖动中途播完：动作控制权在拖动逻辑手里，不许抢（§2.16）。
+            return
+        if self.pet.has_action(IDLE_ACTION):
+            self.play_action(IDLE_ACTION)
 
     def abort_drag(self) -> bool:
         """立即中止当前拖动（不写配置、不发 `drag_finished`）；返回是否真的中止了。

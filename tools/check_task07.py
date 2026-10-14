@@ -684,9 +684,12 @@ def _check_window_wiring(app) -> None:
         window.manual_rest is False,
         f"manual={window.manual_rest}",
     )
+    # ⚠ task10 起双击会**挥手**，所以这里不再是"停在 idle"：双击先退出 manual，
+    #    紧接着手势接管动作（`wave_once()` → `waving`）。task07 当年那句
+    #    "挥手属 task10" 说的就是这一条，现在由 task10 补上了。
     check(
-        "双击后窗口不再保持休息姿势",
-        window.action == "idle",
+        "双击后窗口不再保持休息姿势（task10 起改为进入挥手手势）",
+        window.action in ("idle", "waving"),
         f"窗口动作 {window.action}",
     )
     # ⚠ 这里**不能**拿本测试的假 `now` 去比：双击走的是窗口 → 状态机的真实调用路径，
@@ -699,13 +702,15 @@ def _check_window_wiring(app) -> None:
         f"剩余 {remaining:.3f} 秒",
     )
 
-    # 不在 manual 里时双击**什么都不做**（不抢 task10 的手势）。
-    before = window.action
+    # 不在 manual 里时双击 → **task10 起会挥手**（task07 当年留的"什么都不做"
+    # 已被 task10 的手势取代）。这里断言的是"manual 状态没被误改"这一件事，
+    # 手势本身归 task10 自检（`tools/check_task10.py` §6）。
+    before_action = window.action
     window.mouseDoubleClickEvent(event)
     check(
-        "不在 manual 里双击不改变任何东西（挥手属 task10）",
-        window.action == before and window.manual_rest is False,
-        f"动作 {window.action}",
+        "不在 manual 里双击不会改 manual（手势由 task10 处理）",
+        window.manual_rest is False,
+        f"动作 {window.action}（进入前 {before_action}）",
     )
 
     # 再点一次菜单 → 站起来回 auto。
