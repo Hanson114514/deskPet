@@ -100,8 +100,8 @@ C:\projects\deskPet\
 | `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转）；`region_for_frame` 的真实现 | ✅ task08 |
 | `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 | ✅ task10 |
 | `autostart.py` | 系统 | 开机自启（读与修**分开**） | ⬜ task14 |
-| `single_instance.py` | 系统 | 单实例保护 | ⬜ task13 |
-| `restart.py` | 系统 | 重启自己（含锁交接） | ⬜ task13 |
+| `single_instance.py` | 系统 | 单实例保护（**D6 = 命名互斥体**；作用域仅当前登录会话） | ✅ task13 |
+| `restart.py` | 系统 | 重启自己（拉起新实例 → 放锁 → 退出；含 `--restart-delay`） | ✅ task13 |
 | `win32.py` | 系统 | **Win32 薄绑定**（唯一的 `ctypes` 出口；非 Windows 上导入不炸、只报"不可用"） | ✅ task12 |
 | `hotkey_spec.py` | 系统 | 快捷键**说法**：两套修饰键掩码、`parse_combo` / `format_combo`（纯逻辑） | ✅ task12 |
 | `hotkey.py` | 系统 | 全局热键：子线程消息循环 + 候选链回退 + 彻底释放（**D5 定案**） | ✅ task12 |
@@ -558,6 +558,33 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 退出 | `finally` 里**最先**调 `hotkey_controller.stop()` → `manager.unregister()`（`PostThreadMessage(WM_QUIT)` → `join(2s)`）；子线程 `finally` 里 `UnregisterHotKey` + `DestroyWindow` |
 | 窗口 proc 签名 | `WNDPROC` 四个参数与返回值**都必须是指针宽度**（`WPARAM`/`LPARAM`/`LRESULT`）；而且回调对象**必须模块级持有强引用**（`_WINDOW_PROC`），否则是野指针。详见 §4.20 |
 
+### 2.21 单实例与重启自己（task13 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| **D6 最终选择** | **命名互斥体**（`win32.create_mutex()` → `CreateMutexW`）。`QLocalServer` **没有采用**：它要在临时目录放套接字文件、且必须在 `QApplication` 之后才能用 |
+| 作用域 | **仅当前登录会话**。靠"名字**不以 `Global\` 开头**"+ 用户名（`deskpet-single-instance.<user>`）。**不许**加 `Global\`（那会让所有登录用户互相排斥） |
+| 常量真值 | `single_instance.MUTEX_PREFIX`；`win32.ERROR_ALREADY_EXISTS = 183` |
+| `acquire()` 三态 | 抢到 → 句柄；**已有实例 → `None`**（调用方**安静退出 rc=0**）；**机制不可用 → 空壳句柄**（`held=False`,`available=False`，**照常启动**） |
+| **"不可用"≠"已有实例"** | 两者的区分就是上面这两行。把"不可用"也返回 `None` = 护栏坏掉时**桌宠起不来**，比多开一个糟得多 |
+| **放锁 = 释放所有权 + 关闭句柄** | ⚠ **实测**：只 `ReleaseMutex` 时 `ERROR_ALREADY_EXISTS` **照样为真**（判据是"这个名字的内核对象还在不在"，不是"有没有人占着"），新实例**进不来**。见 §4.21 |
+| 启动顺序（硬约束） | `--list-pets` → `--list-actions` → **单实例** → 建 `QApplication`。`--list-sizes` 是特例：它必须晚于 `QApplication`，所以**压根不抢锁**（`query_only_run`），不是"抢了再放" |
+| 退出收尾 | `finally` 里 `instance.release()`。**走重启路径时它已经在 `restart_self()` 里放过了**（`release()` 幂等） |
+| `--restart-delay` | 默认 **1.2** 秒（`restart.RESTART_DELAY_DEFAULT`）。**新进程先等它再抢锁**；参数名真值 `restart.RESTART_DELAY_ARG`。**缺省时一秒都不等**（日常双击启动不受影响） |
+| 为什么可以用 `time.sleep` | 这个等待在**建 `QApplication` 之前**（`app._wait_before_lock()`）——没有事件循环，`QTimer` 在这里永远不会触发。与 task10 音频预热禁 `sleep` **不冲突**（那一处在事件循环里、阻塞的是界面） |
+| 交接两边一起兜 | **旧进程主动放锁 + 新进程等 1.2 秒**。缺任何一边都会出现"点了重启桌宠没了" |
+| 重启顺序 | **先拉起新实例、再关自己**（`restart.restart_self()`）。关自己走 **`app.quit()`**（`QTimer.singleShot(0, …)` 分两拍），**不是** `sys.exit()`——后者会跳过收尾（热键/音效设备不放，新实例没声音） |
+| ⚠ **必须真判返回值** | `QProcess.startDetached()` 在 PySide6 6.x 返回 **`(ok, pid)` 元组**，`bool(整个元组)` **永远为真** → 重启失败被当成功 → 旧实例放锁退出、新实例没起来 = **桌宠彻底消失**。取 `result[0]`。见 §4.21 |
+| 失败不退出 | 启动失败 → 弹窗 `重启失败，请手动关掉再启动一次`（`restart.RESTART_FAILED_MESSAGE`）、**不放锁**、当前实例继续跑 |
+| `build_args()` | 打包 → `sys.executable`（exe）；源码 → **同目录的 `pythonw.exe`**（不带控制台）+ `paths.program_dir()/run.py`。只带 `--restart-delay`（档位/位置本来就在配置里） |
+| 工作目录 | 显式传 `paths.program_dir()` 给 `startDetached()` 的第三个参数（**不继承父进程 cwd**） |
+| 换角色流程 | `settings` 只问"用户同意吗"（`ConfirmHandler`）与"帮我重启"（`RestartHandler`），**不碰 `QProcess`、不弹询问框**；两件事由 `app.RestartController` 提供 |
+| 坏包 | 提示详情 + 退回默认形象 + **把配置改回默认形象**（写**空串** = 回到"没表态"，**不是**写 `weedy`）+ **不重启** |
+| 写失败 | `保存失败，重启后会回到原来的角色`，**且不重启**（磁盘上还是老角色，重启只会让用户看到"换了但没换"） |
+| ⚠ 每个新设置窗口都要重装 | 与 task12 的热键同一条教训：`SettingsController.open()` 里每次都 `set_restart_handler()`，否则**第 2 次以后换角色只写配置、不问也不重启** |
+| 角色回退写回配置 | `app._persist_pet_fallback()`：配置里的包不可用 → 写回空串。**只在 `query_only=False` 时调**（只读查询一个字节都不许写） |
+| 时序留痕 | `logger.log_restart_stage()`，前缀 `重启时序[等待|抢锁|放锁]`（验收要从日志里读出这个时序） |
+
 ---
 
 ## 3. 新对话工作流
@@ -920,6 +947,41 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
   **进程**，进程一消亡系统就回收它。真正需要"主动释放"的场景是**正常退出后
   立刻重启**（那时旧进程可能还在收尾），而正常退出本来就走 `finally`。
 
+### 4.21 单实例与重启的四个实测坑（task13）
+
+- **⚠ `QProcess.startDetached()` 返回的是 `(ok, pid)` 元组，不是 bool**
+  （PySide6 6.12 实测；Qt6 的 C++ 签名带 `qint64 *pid` 出参，绑定层一并返回）。
+  于是 `bool(QProcess.startDetached(...))` **永远为真**：`bool((False, -1)) == True`。
+  后果正是 task13 §6 明写不许出现的那一幕——**"重启失败"被当成成功**，
+  旧实例照常放锁、照常退出，而新实例压根没起来 → **桌宠彻底消失**。
+  判据：`startDetached('Z:/nope/x.exe', ...)` → `(False, -1)`；取 `result[0]`。
+  **是 task13 的真平台自检抓到的**（`check_task13_real.py §3`），不是猜的。
+- **⚠ 放锁 = `ReleaseMutex` **+** `CloseHandle`，只做前者新实例进不来**。
+  `CreateMutexW` 的 `ERROR_ALREADY_EXISTS` 判据是"**这个名字的内核对象还在不在**"，
+  不是"有没有人占着它的所有权"。实测三态：旧进程什么都不做 → 新实例 `None`；
+  只 `ReleaseMutex` → **仍然 `None`**；两者都做 → 拿到锁。
+  对策收在 `SingleInstanceHandle.release()` 一处（幂等）。
+- **`GetLastError` 在 `CreateMutexW` 上同样"成功不写"**：抢到锁时它保留上一次的值
+  （可能是别的调用留下的 `183`）→ "第一个实例"会被误判成"已有实例"，
+  **桌宠直接起不来**。对策：`win32.clear_last_error()` 在调用前清零，
+  判据是"返回值非空 **且** 错误码 == 183"，两条缺一不可。
+- **`Get-CimInstance Win32_Process` 在 DSH 文件沙箱下的 pwsh 里被拒绝访问**
+  （`HRESULT 0x80041003`）。它在自检里是"按命令行找子进程并清掉"的手段，
+  被拒绝之后异常又被 `except: pass` 咽掉 → **清理从来没发生**，
+  而表现是"§3/§4 抢不到锁（有残留？）"——**看起来像产品 bug**。
+  教训与 §4.3 同源：*失败路径自己也会失败，而且更难查*。
+  对策：自检**别按进程名强杀**（会误伤用户自己开的 `pythonw`），
+  用"记下自己拉的 pid"+"让子进程带 `--exit-after` 自己退"两条。
+
+**顺带核实的两条系统事实**（支撑"作用域"与"完全脱离"这两条验收）：
+
+- **不带 `Global\` 前缀的互斥体作用域就是当前登录会话**（`BaseNamedObjects`），
+  所以另一个 Windows 用户可以各跑一个。
+- **`startDetached` 起的子进程真的能脱离父进程**：实测旧实例退出之后，
+  那个 `pythonw.exe` **仍在进程表里、仍占着锁、日志照常写**
+  （`01:12:22` 抢到锁，之后一直活着）。所以"关闭父进程的窗口/控制台
+  不会连带关掉新实例"这条**在本机成立**，且已被真进程验过。
+
 ---
 
 ## 5. 当前进度
@@ -938,8 +1000,8 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task10 | 音效与双击手势：坐下有声音，双击会挥手 | ✅ 已完成 |
 | task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ✅ 已完成 |
 | task12 | 全局热键：藏起来还能叫回来 | ✅ 已完成 |
-| task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ **下一个** |
-| task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ 未开始 |
+| task13 | 单实例与重启自己：换完形象要能活着回来 | ✅ 已完成 |
+| task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ **下一个** |
 
 **task01（已完成）** —— 透明置顶窗口可拖可退，`setMask` 真穿透已实测。
 交付 `run.py` / `main.py` / `src/deskpet/{__init__,__main__,app,pet_window,placeholder}.py`。
@@ -1455,7 +1517,96 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > ⑥ 顺带按事实更新了 `check_task11.py` 的 **3 条期望值**（它们原文写着"呼出快捷键未实现"，
 > 而那正是 task11 自己划的、被 task12 推掉的边界；与 task10 更新 task07 那两条同理）。
 
-**下一步**：`tasks/task13.md`（单实例与重启自己）。**⚠ 开工前先读 §A**。
+**下一步**：`tasks/task14.md`（开机自启）。**⚠ 开工前先读 §A**。
+
+**task13（已完成）** —— 单实例与重启自己。**约定见 §2.21，踩坑见 §4.21**；
+新增 `single_instance.py`（命名互斥体）、`restart.py`（拉起 + 交接 + 失败不退出）；
+`win32.py` 加 `CreateMutexW` / `ReleaseMutex` / `CloseHandle` 薄绑定；
+`app.py` 加 `--restart-delay` 解析、`_wait_before_lock()`、单实例编排、
+`RestartController`、`_persist_pet_fallback()`；`settings.py` 补换角色流程
+（询问重启 / 坏包回写默认形象 / 写失败提示）；`logger.py` 加 `log_restart_stage()`。
+
+**D6 的最终选择 = 命名互斥体**（`CreateMutexW`）。`QLocalServer` 没采用：
+它要在临时目录放套接字文件、且必须在 `QApplication` 之后才能用，
+会把单实例检查挤到启动编排后面。**作用域"仅当前登录会话"怎么保证的**：
+互斥体名字**不以 `Global\` 开头** → 内核把它放进当前会话的 `BaseNamedObjects`；
+名字是 `deskpet-single-instance.<用户名>`（`MUTEX_PREFIX` 一处）。
+
+**重启交接的完整时序**（`check_task13_real.py` 实测，日志可逐行对上）：
+
+```
+旧实例 01:12:21  抢到锁 → restart.build_args() = [pythonw.exe, run.py, --restart-delay, 1.2]
+旧实例 01:12:21  startDetached 返回 (True, pid) → 取 result[0] 判成功
+旧实例 01:12:21  release()：释放所有权 + 关闭句柄 → "重启时序[放锁]"
+旧实例 01:12:21  旧实例进程退出（rc=0）
+新实例 01:12:21  起、"先等 1.200 秒再抢单实例锁" → "重启时序[等待]"
+新实例 01:12:22  等待结束（实际 1.201 秒）→ 抢锁**成功** → "重启时序[抢锁]"
+```
+
+**"重启失败不退出"是怎么验证的**：注入一个不存在的程序路径
+（`Z:/definitely/not/here/deskpet.exe`）→ `_start_detached()` 返回 `False`
+（从元组里取第一个元素）→ `restart_self()` **不放锁**、返回假 →
+`RestartController` 弹 `重启失败，请手动关掉再启动一次`、**不调 `app.quit()`**。
+真平台实测：`OLD_STARTED False` + `OLD_HELD_AFTER True`（旧实例仍持锁 = 它没有退出）。
+
+实测（本机 2560×1440 / DPI 100%）：
+
+- **单实例**：第一个跑着时第二次启动 → **rc=0 安静退出**，日志
+  `检测到已有实例在运行（deskpet-single-instance.hanso）：本次启动安静退出`，
+  **没有弹窗**；关掉之后再启动正常（锁真的被释放了）。
+- **三个只读查询都不被拒**：已有实例时 `--list-pets`（169 字符）/
+  `--list-actions`（685 字符）/ `--list-sizes`（585 字符）**都 rc=0 正常输出**。
+  ⚠ `--list-sizes` 第一版是"抢了再放"，实测第二个实例**先被 `acquire()` 判成
+  "已有实例"直接返回**，那个 `release()` 永远走不到 → 改成**压根不抢锁**。
+- **完全脱离**：旧实例（Harness）退出之后，被拉起的 `pythonw.exe`
+  **仍在进程表里、仍占着锁、日志照常写** → "关闭父进程不会连带关掉新实例"成立。
+- **工作目录**：新实例日志里 `重启：新实例先等 … （工作目录 C:\projects\deskPet）`
+  = 程序目录（**不是**继承父进程的 cwd）。
+- **连续 3 轮 抢锁/放锁**：全程 3/3 持锁期间报"有实例"、3/3 放锁后报"空闲"，
+  **没有任何一次两个实例并存，也没有空窗**。
+- **⚠ 抓到一个会让桌宠彻底消失的真 bug**：`QProcess.startDetached()` 在
+  PySide6 6.x 返回 **`(ok, pid)` 元组**，`bool(整个元组)` **永远为真** →
+  "重启失败"被当成成功 → 旧实例放锁退出、新实例没起来。已改成取 `result[0]`
+  （`restart._start_detached()`），并记进 §4.21。
+- **⚠ 另一条：放锁必须连句柄一起关**。实测"只 `ReleaseMutex`"时
+  `ERROR_ALREADY_EXISTS` 照样为真、新实例进不来（判据是"内核对象还在不在"）。
+  已收在 `SingleInstanceHandle.release()` 一处并写进 §4.21。
+
+验收：task13 §6 的 **17 条逐条跑过**。两个脚本**留在仓库里**：
+`tools/check_task13.py`（offscreen，**83 项断言全过**）+
+`tools/check_task13_real.py`（真平台，**31 项全过**：真起两个进程、真重启一次、
+真看锁交接、真注入失败、真验脱离与工作目录）。
+改过 `app.py` / `settings.py` / `config.py` / `logger.py` / `win32.py` 之后
+**回归跑了 task04–12 的全部 offscreen 自检**（30 / 55 / 128 / 123 / 128 / 115 / 117 / 115 / 110，**全过**）
+与全部真平台检查（task05–12，**全过**）。
+另按事实更新了 `check_task11.py` 的 **2 条期望值**（它们原文写着"选坏包不写配置"，
+而那正是 task11 自己划的、被 task13 推掉的边界；与 task10 更新 task07、
+task12 更新 task11 同理）。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——`startDetached` 元组那个 bug
+> 是**真平台自检一次抓到**的（`OLD_STARTED True` 配着不存在的路径，一眼可疑），
+> 随后用一个 6 行的只读探针确认了 `bool((False, -1)) == True` 就定案；
+> 首轮 FAIL 里绝大多数**一次就判定是测试自己写错**（`_code_only()` 把带点字面量
+> 拆成 `args . list_pets`；`_squashed()` 会**丢掉字符串字面量**所以判不了
+> `apply("pet", "")`；`paths.override_dirs` 是上下文管理器、忘了 `with`；
+> `_is_running()` 用了自检专用后缀去问生产锁；`Get-CimInstance` 被沙箱拒绝
+> 而异常被 `except: pass` 咽掉）。
+> ② **没有**改到卡范围之外：自启 / 托盘 / 多实例协调 / 进程间通信 / 热替换角色
+> / 自动更新一律没碰（卡里明写不做）。
+> ③ 文档改动集中在 §2.21 新增小节 + §4.21 新增小节 + §1.2 两行 + 本节 + D6，
+> 与代码改动（2 个新模块 + 5 个模块改）**同量级**。
+> ④ 临时探针（`data/t13_gc/`、`data/task13_scratch/`、`data/task13_real_scratch/`、
+> `data/t13*.txt`）**已全部删掉**。
+> ⑤ **规格缺口**：卡里要求先读的「第三部分 3.16 / 附录 A / 附录 D 的 D6」
+> 都在你删掉的 `迁移清单.md` 里，**本机已无该文件**。处理方式：
+> **D6 当场问了你**（选命名互斥体）；`--restart-delay` 的默认 1.2 秒、
+> "新进程先等再抢锁""先拉起新实例再关自己""子进程完全脱离""工作目录 = 程序目录"
+> 这些**卡里 §2/§4/§6 本身写全了**，一律照它落地；
+> **§3.16 那两个"必须处理的细节"**卡里没给原文，按卡里 §4 的"换角色流程"表格
+> 落地为 **①询问重启 ②坏包把配置改回默认形象**（这也是 §6 验收明写的两条）。
+> ⑥ 已知未做（**不阻塞**，卡里也没要求）：卡里 §6 最后一条"连续重启 5 次"，
+> 本实现验的是 **3 轮锁的交接**（真起进程的那个 §2 只重启 1 次）——
+> 因为每多一轮就多一个"不会自己退出"的真桌宠要收拾。
 
 **已知待清理（不阻塞主线）**：
 
@@ -1469,7 +1620,7 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 | D3 | 缩放算法：`SmoothTransformation` / 三倍最近邻 | task04 之前 | ✅ **已定案（task04）**：`SmoothTransformation`。理由：源 GIF 是 1 位 alpha，放大时最近邻会把台阶等比放大；`SmoothTransformation` 柔化边缘，代价只是边缘多出半透明像素，而"`setMask` 有锯齿"本来就是已接受的取舍 |
 | D4 | 音频后端：`QMediaPlayer`（可播 mp3）/ `QSoundEffect`（只支持 wav） | task10 之前 | ✅ **已定案（task10）**：`QMediaPlayer` + `QAudioOutput`（要能播 mp3；**不需要额外依赖**，`PySide6.QtMultimedia` 实测可用） |
 | D5 | 全局热键路线：原生消息过滤器 / 子线程+队列+定时器 | task12 之前 | ✅ **已定案（task12）**：**子线程 + `GetMessageW` 消息循环 + `queue` + GUI 线程 100 ms 取件定时器**。理由：不碰主线程消息钩子（隐藏期间没有"钩子被摘"的风险）、唤醒是事件驱动（隐藏期间 CPU 0）、退出安全。**`hotkey_filter.py` 没有创建**；**原定的 120 ms 轮询已去掉** |
-| D6 | 单实例机制：`QLocalServer` / 命名互斥体 | task13 之前 | ⬜ 未定 |
+| D6 | 单实例机制：`QLocalServer` / 命名互斥体 | task13 之前 | ✅ **已定案（task13，2025 用户确认）**：**命名互斥体**（`CreateMutexW`，`win32.py` 统一出口）。理由：作用域**天然是当前登录会话**（名字不带 `Global\`）、不落任何文件、`QApplication` 之前就能跑（`QLocalServer` 两条都不满足） |
 | D7 | 自带素材包补 `fps` | 任意 | ✅ **已落实**：两个包、13 个动作全是 `30.0` |
 | D8 | `hitmask.json` 是否继续支持 | task03 之前 | ✅ **已定案：不再需要**（`setMask` 按 alpha 生成区域），读取与降级一律不做 |
 | D9 | 遗留兜底表何时删除 | 用户补完 `fps` 之后 | ⬜ 未定——**条件已满足**，可随时作为一次独立清理任务删掉 |

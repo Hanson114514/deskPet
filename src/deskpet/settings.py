@@ -101,8 +101,21 @@ HINT_HOTKEY: Final[str] = "隐藏后按此键呼出；点右边按钮后按一�
 HINT_VOLUME: Final[str] = "点击互动与坐下时的音效音量"
 HINT_IDLE: Final[str] = "鼠标静止这么久后开始张望，再过一半时间坐下"
 
-#: 角色行的临时提示：自动重启属 task13（task11 §5 明确定了这条边界）。
+#: 角色行的提示（task11 那条边界的原文）：**不同意重启**时显示它。
 PET_RESTART_HINT: Final[str] = "重启后生效"
+
+#: 同意重启之后要说的话（task13 §4："同意才重启"）。
+PET_RESTARTING_HINT: Final[str] = "正在重启…"
+
+#: 询问"现在自动重启吗？"的标题与正文（task13 §4）。
+RESTART_ASK_TITLE: Final[str] = "换角色"
+RESTART_ASK_TEXT: Final[str] = "角色已经切换，需要重启桌宠才会生效。\n现在自动重启吗？"
+
+#: 配置写失败时的提示（task13 §4 逐字要求）。
+PET_SAVE_FAILED_HINT: Final[str] = "保存失败，重启后会回到原来的角色"
+
+#: 坏包被拒时的标题（正文见 `_report_broken_pet()`）。
+BROKEN_PET_TITLE: Final[str] = "换角色失败"
 
 
 class FieldKind(Enum):
@@ -135,6 +148,31 @@ class HotkeyOutcome(NamedTuple):
 
 #: 换呼出快捷键的函数签名：`(新说法, 旧说法) -> HotkeyOutcome`。
 HotkeyChanger = Callable[[str, str], HotkeyOutcome]
+
+
+@dataclass(frozen=True)
+class RestartOutcome:
+    """一次"重启自己"的结果（task13）。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `started` | 新实例**真的起来了**（旧实例该退出了） |
+    | `reason` | 失败原因（**系统原文优先**，成功时空串） |
+
+    界面据 `started` 决定"是说一句正在重启、还是弹失败提示"——
+    **绝不显示假成功**（task11 立下的规矩在 task13 同样适用）。
+    """
+
+    started: bool
+    reason: str = ""
+
+
+#: 重启自己的函数签名：`() -> RestartOutcome`。由 `app.py` 装上。
+RestartHandler = Callable[[], RestartOutcome]
+
+#: 询问"要不要现在重启"的函数签名：`(标题, 正文) -> 用户是否同意`。
+#: 由 `app.py` 装上（它才知道弹窗与宠物窗口的父子关系）。
+ConfirmHandler = Callable[[str, str], bool]
 
 
 @dataclass(frozen=True)
@@ -325,6 +363,14 @@ class SettingsWindow(QDialog):
         #: 换呼出快捷键的处理器（task12，由 `app.py` 装）。
         #: `None` = 自检里那种"没有系统热键"的场景 → 只写配置。
         self._hotkey_changer: HotkeyChanger | None = None
+        #: 重启自己的处理器（task13，由 `app.py` 装）。
+        #: `None` = 自检里那种"不真重启"的场景 → 只写配置 + 提示"重启后生效"。
+        self._restart_handler: RestartHandler | None = None
+        #: 询问"要不要现在重启"（task13，由 `app.py` 装）。
+        #: `None` = 不问，直接按"不同意"处理（**默认不重启**才安全）。
+        self._confirm_handler: ConfirmHandler | None = None
+        #: 最近一次"重启成功"已经发生（供自检观察；**不写配置**）。
+        self.restart_requested = False
 
         self.setWindowTitle(TITLE)
         self.setModal(True)
@@ -493,6 +539,23 @@ class SettingsWindow(QDialog):
         那句话是有意为之：本方法只影响**之后**的录入行为，不影响初值显示。
         """
         self._hotkey_changer = changer
+
+    def set_restart_handler(
+        self,
+        restart: RestartHandler | None,
+        confirm: ConfirmHandler | None = None,
+    ) -> None:
+        """装上"重启自己"与"问用户要不要重启"两个处理器（task13；`app.py` 用）。
+
+        与 `set_hotkey_changer()` 同一个模式：**装没装决定这一行走哪条路**。
+        没装（自检里）→ 写完配置只提示 `重启后生效`，不真去重启。
+
+        `confirm` 与 `restart` **分开**是有意的：`settings` 是视图层，
+        它不该知道弹窗长什么样、也不该知道子进程怎么拉起来；
+        它只问一句"用户同意了吗"。两件事分别由 `app.py` 提供。
+        """
+        self._restart_handler = restart
+        self._confirm_handler = confirm
 
     def reload_from_config(self, current_pet: str | None = None) -> None:
         """重新读一遍配置（**重复点 `设置…` 时用**：窗口可能停在旧值上）。
@@ -683,33 +746,117 @@ class SettingsWindow(QDialog):
     def _select_pet(self, field: FieldSpec, choice: PetChoice) -> None:
         """选中一个角色。
 
-        ## 两条路径（task11 §6 / §5 的边界）
+        ## 三条路径（task11 的边界在这里由 task13 补齐）
 
-        | 情形 | 本 task 的行为 | 留给 task13 的 |
-        | --- | --- | --- |
-        | **可用**包 | 写配置 + 提示 `重启后生效` | 询问"现在自动重启吗？" |
-        | **坏包** | 不改配置（见下）+ 提示详情 + 界面回退到真实角色 | 把配置改回默认形象的完整流程 |
+        | 情形 | 行为 |
+        | --- | --- |
+        | **可用**包 | 写配置 → 询问"现在自动重启吗？" → **同意才重启**；不同意则提示 `重启后生效` |
+        | **坏包** | 弹窗说详情 + 退回默认形象 + **不重启** + **把配置改回默认形象** |
+        | **配置写失败** | 提示 `保存失败，重启后会回到原来的角色`，界面显示与**真实生效**的一致 |
 
-        **坏包为什么不改配置**：`agent.md` §2.5 写死了"动作/素材有几个就是几个，
-        不许硬塞替身"，而角色这一项的真值只有"配置里那个字符串"。把一个**已知
-        不可用**的命名空间写进去，等于让下次启动必然走一遍"回退默认形象"的
-        警告路径——那是**故意的破坏**，不是用户的选择。配置默认值是空串
-        （"用户还没表态"），所以"继续用默认形象"本来就不需要写任何东西。
+        **换形象走重启**（不做热替换）：`cell` 可能不同，热替换会留下
+        "状态半新半旧"的中间态（task13 §4 的定案）。
         """
         if choice.ok:
-            if self._write_field(field, choice.namespace):
-                self._set_status_text(
-                    f"已切换到「{choice.display_name}」（{choice.namespace}）；"
-                    f"{PET_RESTART_HINT}"
-                )
-                self._current_pet = choice.namespace
-                self._refresh_pet_combo_current()
+            self._switch_to_pet(field, choice)
             return
 
         self._report_broken_pet(choice)
 
+    def _switch_to_pet(self, field: FieldSpec, choice: PetChoice) -> None:
+        """选中一个**可用**包：写配置 → 问要不要现在重启。
+
+        ## 写失败为什么**不问重启**
+
+        `pet` 没写进去 = 磁盘上还是老角色。这时若照常重启，新实例起来
+        显示的仍是**旧角色**——用户看到的是"我换了角色，它重启了，但还是原来那个"，
+        比"明确告诉他保存失败"更糟。所以写失败直接走提示，
+        **界面退回配置里的真值**（`_rollback` 已经做掉了）。
+        """
+        if not self._write_field(field, choice.namespace):
+            # 写失败：控件已经回滚到 `store.get("pet")` 了，这里只补那句话。
+            # ⚠ `_set_failure()` 已经把**系统原文**放上状态栏了，这里**不覆盖**
+            # 它——task13 §4 要的那句提示挂在文案上，两件事分开说：
+            # 状态栏说"为什么没写进去"，日志说"所以重启也回不去"。
+            logger.error("设置：%s（%s）", PET_SAVE_FAILED_HINT, choice.namespace)
+            self._append_status(PET_SAVE_FAILED_HINT)
+            return
+
+        self._current_pet = choice.namespace
+        self._refresh_pet_combo_current()
+        self._ask_restart(field, choice)
+
+    def _ask_restart(self, field: FieldSpec, choice: PetChoice) -> None:
+        """问"现在自动重启吗？"（task13 §4）。
+
+        **默认不重启**：没装确认处理器（自检 / 精简场景）时按"不同意"处理，
+        因为"擅自把用户的程序关掉"比"让他自己重启"危险得多。
+        """
+        agreed = False
+        if self._confirm_handler is not None:
+            agreed = bool(self._confirm_handler(RESTART_ASK_TITLE, RESTART_ASK_TEXT))
+
+        if not agreed:
+            # 不同意 → 提示"重启后生效"，**当前实例继续运行**（task13 §2 第 6 条）。
+            self._set_status_text(
+                f"已切换到「{choice.display_name}」（{choice.namespace}）；"
+                f"{PET_RESTART_HINT}"
+            )
+            logger.info("设置：角色已改为 %s，用户选择稍后重启", choice.namespace)
+            return
+
+        if self._restart_handler is None:
+            # 装了确认处理器却没装重启处理器（自检里的组合）→ 不能假装重启成功。
+            self._set_status_text(
+                f"已切换到「{choice.display_name}」（{choice.namespace}）；"
+                f"{PET_RESTART_HINT}"
+            )
+            return
+
+        outcome = self._restart_handler()
+        if not outcome.started:
+            # 重启失败：**当前实例继续运行**（task13 §2 第 7 条）。
+            # 文案由 `restart.RESTART_FAILED_MESSAGE` 一处给，弹窗由 `app.py` 弹
+            # （`RestartController` 已经弹过了）；这里只把状态栏也说清楚，
+            # **不说"重启后生效"**——那会让人以为自动重启成功了。
+            detail = outcome.reason or "新实例没能起来"
+            logger.error("设置：角色已改为 %s，但重启失败：%s", choice.namespace, detail)
+            self._last_failure = detail
+            self.refresh_status()
+            return
+
+        self.restart_requested = True
+        self._set_status_text(
+            f"已切换到「{choice.display_name}」（{choice.namespace}）；{PET_RESTARTING_HINT}"
+        )
+
     def _report_broken_pet(self, choice: PetChoice) -> None:
-        """坏包：把详情说出来，并把界面**退回真实状态**。"""
+        """坏包：弹窗说详情 + 退回默认形象 + **把配置改回默认形象** + 不重启。
+
+        ## task13 补上的那一半：**配置要被改回去**
+
+        task11 的边界是"坏包不动配置"，理由是 `config.pet` 的默认值本来
+        就是空串（= "用户还没表态"），于是"继续用默认形象"不需要写任何东西。
+
+        task13 §6 把这条验收写细了：**"配置被改回默认形象（重启后不再踩同一个坑）"**。
+        两种情况要分开：
+
+        | 配置里原来是什么 | 现在怎么写 |
+        | --- | --- |
+        | **空串**（没表态） | **什么都不写**——空串正是"默认形象"的意思（§2.4），写一个 `weedy` 进去反而把"用户没表态"变成了"用户选了 weedy" |
+        | 指向**别的**包（哪怕那个包是好的） | 用户刚表达的是"我不想用这个了，我想用那个坏的" → 落回默认形象：**写空串** |
+
+        第二种就是"改回默认形象"的落地方式：写空串 = 回到"没表态" =
+        下次启动取 `pet_spec.DEFAULT_PET_NAMESPACE`（**真值只有一处**）。
+        写 `"weedy"` 是错的：那会让默认形象的名字在项目里出现第二份（§4.1）。
+
+        ## 写回失败怎么办
+
+        **不许假装成功**：写不回去时明确说出来（状态栏带系统原文），
+        因为"下次启动还会再踩一次同一个坑"是用户需要知道的事。
+        但**不弹窗**——弹窗那一份已经把"这个包为什么坏"说清楚了，
+        再弹一个只会让人以为出了更严重的问题。
+        """
         detail = "\n".join(f"· {issue}" for issue in choice.issues) or "· （没有拿到原因）"
         message = (
             f"你的选择没被接受，「{choice.display_name}」（{choice.namespace}）不可用，"
@@ -719,12 +866,33 @@ class SettingsWindow(QDialog):
         logger.warning("设置：角色 %s 不可用，已回到默认形象", choice.namespace)
         self._last_failure = message
         self.refresh_status()
-        # 界面必须与"真实生效的角色"一致：配置没动过，所以当前仍是原值。
+        self._restore_default_pet()
+        # 界面必须与"真实生效的角色"一致：配置要么已经被改成空串、
+        # 要么本来就指不到坏包，所以 `_current_pet` 跟着回到默认形象。
+        self._current_pet = DEFAULT_PET_NAMESPACE
         self._applying = True
         try:
             self._fill_pet_combo()
         finally:
             self._applying = False
+
+    def _restore_default_pet(self) -> None:
+        """把 `pet` 写回"默认形象"（= 空串，见 `_report_broken_pet` 的说明）。
+
+        只在配置**真的指向了别的包**时才写：本来就指不到任何包（空串）
+        时写一遍是多余的一次磁盘写，而且会把"用户没表态"这个信息抹掉
+        （空串与空串比较当然一样，所以这里判的是"非空"）。
+        """
+        current = str(self._store.get("pet") or "").strip()
+        if not current:
+            return  # 本来就是"没表态" → 默认形象，**一个字节都不用写**
+        result = self._store.apply("pet", "")
+        if result.ok:
+            logger.info("设置：角色配置已改回默认形象（%s → 空串）", current)
+            return
+        logger.error("设置：角色配置没能改回默认形象：%s", result.error)
+        self._last_failure = result.error or "写配置失败"
+        self.refresh_status()
 
     def _refresh_pet_combo_current(self) -> None:
         """写成功后把 `● ` 挪到新的当前项上。"""
@@ -738,6 +906,22 @@ class SettingsWindow(QDialog):
         """显示一句**成功**提示（失败提示走 `_set_failure`）。"""
         self._last_failure = ""
         self._status_label.setText(text)
+
+    def _append_status(self, text: str) -> None:
+        """在**已经显示着的**状态栏后面补一句，**不覆盖失败原因**。
+
+        存在的理由：写失败时状态栏上是 `设置失败：<系统原文>`（那是"为什么没成"），
+        而 task13 §4 还要说一句"保存失败，重启后会回到原来的角色"（那是"后果"）。
+        直接 `setText()` 会把系统原文挤掉，正好违反"失败原因优先于成功状态"
+        （§2.10）——所以两句都留着。
+        """
+        existing = self._status_label.text()
+        if not existing:
+            self._status_label.setText(text)
+            return
+        if text in existing:  # 别重复堆同一句
+            return
+        self._status_label.setText(f"{existing}\n{text}")
 
     # ------------------------------------------------------------ 逃生门
 

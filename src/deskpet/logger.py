@@ -371,6 +371,31 @@ def show_message(title: str, message: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------ 重启时序留痕
+
+
+#: 重启交接的三个时刻（task13 §2 第 8 条 / §6 的验收要看日志里的这个时序）。
+RESTART_STAGE_WAIT: Final[str] = "等待"
+RESTART_STAGE_LOCK: Final[str] = "抢锁"
+RESTART_STAGE_RELEASE: Final[str] = "放锁"
+
+
+def log_restart_stage(stage: str, detail: str) -> None:
+    """把"重启交接"的一个时刻写进日志，**统一前缀**便于按行读时序。
+
+    为什么单独开一个函数：验收要求"日志里能看出这个时序"——
+    新进程**先等 `--restart-delay`（默认 1.2 秒）再抢锁**、旧进程**主动放锁**。
+    三处分别住在 `app._wait_before_lock()` / `single_instance.acquire()` /
+    `single_instance.release()` 里，前缀如果不统一，读日志的人得自己认三种措辞。
+
+    **写日志失败绝不抛异常**（agent.md §2.10）：日志层不该反过来影响重启。
+    """
+    try:
+        logging.getLogger("deskpet.restart").info("重启时序[%s]：%s", stage, detail)
+    except Exception:  # pragma: no cover - 日志层不该抛，但绝不冒这个险
+        pass
+
+
 # ------------------------------------------------------------------ 崩溃兜底
 
 

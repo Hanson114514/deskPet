@@ -44,6 +44,19 @@ WM_QUIT: Final[int] = 0x0012
 #: 系统级错误码：热键已被占用（文案见 task12 §4）。
 ERROR_HOTKEY_ALREADY_REGISTERED: Final[int] = 1409
 
+#: `CreateMutexW` 返回这个错误码 = **已经有一个同名互斥体存在**（task13 的单实例判据）。
+#: ⚠ 它**不是** `CreateMutexW` 的失败：句柄照样拿到了，只是不是我们创建的。
+#: 所以判据是"错误码 == 183 **且** 句柄非空"，两者缺一不可。
+ERROR_ALREADY_EXISTS: Final[int] = 183
+
+#: `WaitForSingleObject` 的返回值（单实例只用到"没等待"这一种）。
+WAIT_OBJECT_0: Final[int] = 0
+#: `WaitForSingleObject` 的超时返回值。**它不等于失败**——`CreateMutex` 拿到
+#: `WAIT_ABANDONED`（前面那个进程没能正常放锁就死了）时，锁其实已经归我们了。
+WAIT_ABANDONED: Final[int] = 0x80
+#: `WaitForSingleObject` 等待毫秒数：0 = 立刻返回（不当场阻塞启动）。
+WAIT_TIMEOUT: Final[int] = 0x102
+
 #: 热键编号（同一个进程内唯一即可）。
 HOTKEY_ID: Final[int] = 1
 
@@ -113,6 +126,22 @@ if IS_WINDOWS:  # pragma: no cover - 原型声明，Windows 上才跑
     _user32.PostThreadMessageW.restype = wintypes.BOOL
     _user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
     _user32.GetCursorPos.restype = wintypes.BOOL
+
+    # --- 命名互斥体（task13 的单实例机制，D6）
+    #
+    # ⚠ 返回值（`HANDLE`）**必须声明**：不声明时 ctypes 按 32 位 `int` 取，
+    # 64 位下句柄的高位会被截断，`ReleaseMutex` / `CloseHandle` 随后就会失败
+    # （与 §4.20 那批 `HWND` 截断是同一个坑）。
+    _kernel32.CreateMutexW.argtypes = [
+        wintypes.LPVOID,  # LPSECURITY_ATTRIBUTES（本项目不传）
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    _kernel32.CreateMutexW.restype = wintypes.HANDLE
+    _kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    _kernel32.ReleaseMutex.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 # ------------------------------------------------------------------ 封装
@@ -201,3 +230,48 @@ def get_cursor_pos() -> tuple[int, int] | None:
     if not _user32.GetCursorPos(ctypes.byref(point)):
         return None
     return (int(point.x), int(point.y))
+
+
+# ------------------------------------------------------------------ 命名互斥体
+
+
+def create_mutex(name: str) -> tuple[int, bool]:
+    """创建一个**命名互斥体**，返回 `(句柄, 是不是我们创建的)`。
+
+    判据是 `CreateMutexW` 的返回值 + `GetLastError()`，**两条缺一不可**：
+
+    | 返回值 | 错误码 | 含义 |
+    | --- | --- | --- |
+    | 非空 | `183`（`ERROR_ALREADY_EXISTS`） | 同名互斥体**已经存在** → 别人在跑 |
+    | 非空 | 其它 | 我们是第一个 → 抢到了 |
+    | 空 | 任意 | **创建失败**（调用方按"保护机制不可用"处理） |
+
+    ⚠ `ERROR_ALREADY_EXISTS` **不是失败**：句柄照样拿到了，照样要 `CloseHandle`。
+    把它写成"返回空"会让第二个实例拿不到句柄去关，句柄泄漏一次。
+
+    `ERROR_ALREADY_EXISTS` 与 `GetLastError()` 的关系见 `clear_last_error()` 的说明：
+    **必须在调用前清零**，否则成功时会读到上一次调用留下的陈旧错误码——
+    那会让"第一个实例"被误判成"已有实例"，桌宠直接起不来。
+    """
+    if _kernel32 is None:  # pragma: no cover - 非 Windows
+        return 0, False
+    clear_last_error()
+    handle = _kernel32.CreateMutexW(None, True, name)
+    already = get_last_error() == ERROR_ALREADY_EXISTS
+    return int(handle or 0), (bool(handle) and not already)
+
+
+def release_mutex(handle: int) -> bool:
+    """释放互斥体的**所有权**（不销毁它）。句柄仍然有效，可以再 `Wait`。"""
+    if _kernel32 is None or not handle:  # pragma: no cover - 非 Windows
+        return False
+    clear_last_error()
+    return bool(_kernel32.ReleaseMutex(handle))
+
+
+def close_handle(handle: int) -> bool:
+    """关掉一个内核句柄。**进程退出时系统也会回收**，但主动关掉才是对的。"""
+    if _kernel32 is None or not handle:  # pragma: no cover - 非 Windows
+        return False
+    clear_last_error()
+    return bool(_kernel32.CloseHandle(handle))

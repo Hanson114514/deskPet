@@ -650,7 +650,15 @@ def _window_sections() -> int:
             )
 
             # 选一个坏包 → 提示详情 + 退回默认形象 + 不重启 + 界面回真实状态。
-            section("8b. 选坏包：提示详情 + 退回默认形象 + 不写坏值进配置")
+            #
+            # ⚠ task13 推掉了 task11 划的这条边界（与 task12 推掉"呼出快捷键未实现"
+            # 同理）：task11 时"坏包不动配置"，task13 §6 明确要求
+            # **"配置被改回默认形象"**（否则下次启动必然再踩一次同一个坑）。
+            # 所以下面两条期望值按 task13 的行为改写：
+            # ① 配置从 `goodpet` 被改回**默认形象**（写空串 = 回到"没表态"，
+            #    真值在 `pet_spec.DEFAULT_PET_NAMESPACE`，不在这里抄一个 weedy）；
+            # ② 界面上的当前项因此变成**默认形象**那一项。
+            section("8b. 选坏包：提示详情 + 退回默认形象 + **配置改回默认形象**（task13）")
 
             index = next(
                 position
@@ -659,8 +667,8 @@ def _window_sections() -> int:
             )
             combo.setCurrentIndex(index)
             check(
-                "选坏包 → **不写进配置**（不让下次启动必然踩同一个坑）",
-                store.get("pet") == "goodpet",
+                "选坏包 → 配置**改回默认形象**（空串，不让下次启动再踩同一个坑）",
+                store.get("pet") == "",
                 f"pet={store.get('pet')!r}",
             )
             check(
@@ -674,10 +682,11 @@ def _window_sections() -> int:
                 "「brokepet」的问题" in window._status_label.text(),
                 repr(window._status_label.text()[-70:]),
             )
+            # 界面必须与"真实生效的角色"一致：配置已经是空串 → 当前项就该是默认形象。
             check(
-                "选坏包 → 界面**退回真实状态**（当前项仍是配置里那个）",
+                "选坏包 → 界面**退回真实状态**（当前项是默认形象，与配置一致）",
                 combo.currentText().startswith("● ")
-                and "goodpet" in combo.currentText(),
+                and st.DEFAULT_PET_NAMESPACE in combo.currentText(),
                 combo.currentText(),
             )
             window.close()

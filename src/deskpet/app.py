@@ -38,19 +38,21 @@ task02 起启动顺序**固定**为：
 
 import argparse
 import logging
+import math
 import signal
 import sys
+import time
 
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import PROGRAM_NAME, __version__
 from . import context_menu
 from . import geometry
 from . import hotkey as hotkey_mod
 from . import logger as log
-from . import paths, pet_loader, size
+from . import paths, pet_loader, restart as restart_mod, size, single_instance
 from .animation import UnknownActionError
 from .config import ConfigStore
 from .control_bar import RESERVED, ControlBar
@@ -59,10 +61,17 @@ from .errors import DataDirError
 from .idle_state import IdleStateMachine, normalize_idle_seconds
 from .mirror import MirrorState
 from .pet_loader import PetLoadError, list_reports, resolve_pet
-from .pet_spec import PetSpec
+from .pet_spec import DEFAULT_PET_NAMESPACE, PetSpec
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
-from .settings import HotkeyChanger, HotkeyOutcome, SettingsWindow
+from .settings import (
+    ConfirmHandler,
+    HotkeyChanger,
+    HotkeyOutcome,
+    RestartHandler,
+    RestartOutcome,
+    SettingsWindow,
+)
 from .sounds import SOUND_CHIME, SoundPlayer, normalize_volume
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
@@ -136,6 +145,61 @@ def _position_arg(text: str) -> tuple[int, int]:
     return parsed
 
 
+def _restart_delay_arg(text: str) -> float:
+    """`--restart-delay` 的解析器：**负数当场报错**。
+
+    与"档位越界 / 位置格式"同一种分法（§2.12 的精神）：命令行给的说法不合法
+    → `argparse` 报用法错误、非 0 退出。`0` 是**合法**的（"不等"），
+    自检用它来验"不等待时抢锁会怎样"；它只是不该由用户来敲。
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} 不是秒数") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"重启等待时间必须是非负的有限秒数，实际给了 {text!r}")
+    return value
+
+
+def _wait_before_lock(seconds: float) -> None:
+    """重启时新实例**先等一会儿再抢单实例锁**（task13 §4）。
+
+    ## 为什么必须等
+
+    旧实例的顺序是"拉起我们 → 放锁 → 关自己"。它拉起我们的那一刻，
+    **锁还占着**：我们若立刻去抢，会拿到 `ERROR_ALREADY_EXISTS`
+    并把自己判成"已有实例"然后退出——用户看到的就是
+    "点了重启，桌宠没了"（task13 §6 明写不许出现这一幕）。
+
+    所以交接是**两边一起兜住**的：旧进程主动放锁 + 新进程等这一会儿。
+    两边的时序都留痕（验收要能从日志里看出"先等、再抢"）。
+
+    ## ⚠ 为什么这里可以用 `time.sleep()`
+
+    这个等待发生在**建 `QApplication` 之前**、命令行也已经解析完，
+    此时进程里没有任何事件循环、没有定时器、没有窗口——
+    `QTimer` 在这里**根本没有事件循环可依附**（`app.exec()` 还没跑），
+    所以"用 `QTimer.singleShot` 优雅一点"是错的：那个定时器永远不会触发。
+
+    （对比 task10 的音频预热：那一处禁止 `sleep`，因为它在窗口 `show()` 之后、
+    事件循环**已经**在跑，阻塞的就是界面本身。两处的要求不冲突。）
+
+    时长的量级也支持这个选择：默认 1.2 秒，是**一次性**的启动等待，
+    不是每帧都发生的事。日志里能看到"等了多久"，验收据此判断时序。
+    """
+    started = time.monotonic()
+    _logger.info(
+        "重启：新实例先等 %.3f 秒再抢单实例锁（工作目录 %s）",
+        seconds,
+        restart_mod.current_directory(),
+    )
+    log.log_restart_stage(log.RESTART_STAGE_WAIT, f"新实例先等 {seconds:g} 秒再抢锁")
+    time.sleep(seconds)
+    elapsed = time.monotonic() - started
+    _logger.info("重启：等待结束（实际 %.3f 秒），现在开始抢单实例锁", elapsed)
+    log.log_restart_stage(log.RESTART_STAGE_WAIT, f"等待结束（实际 {elapsed:.3f} 秒），开始抢锁")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM_NAME,
@@ -199,6 +263,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="秒",
         help="启动后等待指定的秒数自动退出（自动验证用；正常使用不要给）",
+    )
+    parser.add_argument(
+        restart_mod.RESTART_DELAY_ARG,
+        type=_restart_delay_arg,
+        default=None,
+        metavar="秒",
+        help=(
+            "重启时由旧实例传给新实例：先等这么多秒再抢单实例锁"
+            f"（缺省 {restart_mod.RESTART_DELAY_DEFAULT:g} 秒；正常使用不要给）"
+        ),
     )
     return parser
 
@@ -773,12 +847,32 @@ class SettingsController:
         #: 换呼出快捷键的处理器（task12）。**每个新窗口都要重新装**：
         #: 关一次就释放实例，下次打开是一个全新的窗口（见 `open()`）。
         self._hotkey_changer: HotkeyChanger | None = None
+        #: 重启处理器与"要不要重启"的确认框（task13）。同样**每个新窗口都要重装**。
+        self._restart_handler: "RestartHandler | None" = None
+        self._confirm_handler: "ConfirmHandler | None" = None
 
     def set_hotkey_changer(self, changer: "HotkeyChanger | None") -> None:
         """由 `app.py` 装上"换热键"的函数（task12）。"""
         self._hotkey_changer = changer
         if self._dialog is not None:
             self._dialog.set_hotkey_changer(changer)
+
+    def set_restart_handler(
+        self,
+        restart: "RestartHandler | None",
+        confirm: "ConfirmHandler | None",
+    ) -> None:
+        """由 `app.py` 装上"重启自己"与"问用户要不要重启"（task13）。
+
+        ⚠ 与 `set_hotkey_changer()` 同一条教训（task12 §4）：**每个新窗口都要重装**。
+        这里是"记住处理器、开窗口时再装一遍"的同一模式；忘了重装的表现是
+        "第二次打开设置窗口换角色，它只写配置、静默地不重启"
+        ——又一种假成功。
+        """
+        self._restart_handler = restart
+        self._confirm_handler = confirm
+        if self._dialog is not None:
+            self._dialog.set_restart_handler(restart, confirm)
 
     @property
     def dialog(self) -> "SettingsWindow | None":
@@ -805,6 +899,10 @@ class SettingsController:
         # ——用户看到"设置成功"却按不出来，正是最典型的假成功。
         if self._hotkey_changer is not None:
             dialog.set_hotkey_changer(self._hotkey_changer)
+        # ⚠ 同理，**每个新窗口都要重新装重启处理器**（task13）：不装的话
+        # 第二、三次打开设置窗口换角色时**只会写配置、不会问也不会重启**。
+        if self._restart_handler is not None or self._confirm_handler is not None:
+            dialog.set_restart_handler(self._restart_handler, self._confirm_handler)
         dialog.finished.connect(self._on_finished)
         # 设置里改的值要**立刻**作用到运行时（音量已在 `store.config_changed`
         # 上接了；久置时间由状态机每次判定现读）。
@@ -836,6 +934,84 @@ class SettingsController:
         """
         configured = str(self._store.get("pet") or "").strip()
         return configured or pet_loader.DEFAULT_PET_NAMESPACE
+
+
+class RestartController:
+    """把**换角色**接到"重启自己"上（task13 的组装层，`app.py` 独有）。
+
+    ## 它要串起来的三件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | 问用户 | `confirm()`：一个**模态**询问框（`QMessageBox.question`），默认按钮是"否" |
+    | 真重启 | `restart()`：`restart.restart_self(handle)` → 成功才 `app.quit()` |
+    | 失败不退出 | `restart_self()` 返回假 → **弹窗** `重启失败，请手动关掉再启动一次`，当前实例继续跑 |
+
+    ## 为什么"关自己"必须是 `app.quit()` 而不是别的
+
+    `quit()` 让事件循环正常收尾 → `run()` 的 `finally` 那段把热键、音效设备、
+    控制栏、设置窗口一个个放掉。直接 `sys.exit()` / `os._exit()` 会跳过整段，
+    表现是"重启之后音频设备被占着、新实例没声音"（task10 §4 那条坑原样复现）。
+
+    ⚠ 顺序仍然是"**先拉起新实例、再关自己**"（task13 §4）：`restart_self()`
+    内部就是那个顺序，本控制器只负责在它返回真之后调 `quit()`。
+
+    ## 时序留痕（验收要看）
+
+    日志里必须能看出"旧实例放锁"与"新实例先等 1.2 秒再抢锁"这两件事，
+    所以三处各记一行：本控制器的 `重启：…`、`single_instance.release()` 的
+    `单实例锁已交接…`、新实例的 `重启：新实例先等 … 秒再抢单实例锁`。
+    """
+
+    def __init__(self, app: QApplication, instance: single_instance.SingleInstanceHandle) -> None:
+        self._app = app
+        self._instance = instance
+        #: 用户是不是已经同意过重启（自检观察用；**不写配置**）。
+        self.requested = False
+
+    def confirm(self, title: str, text: str) -> bool:
+        """问一句"现在自动重启吗？"，返回用户同不同意。
+
+        **默认按钮是"否"**：回车不该把用户的桌宠关掉。
+        弹不出来（理论上不会：走到这里时事件循环正在跑）时按**不同意**处理
+        ——宁可让用户自己重启，也不能擅自把程序关掉。
+        """
+        try:
+            answer = QMessageBox.question(
+                None,
+                title,
+                text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        except Exception as exc:  # pragma: no cover - 弹窗失败按不同意处理
+            _logger.warning("重启询问框没能弹出来（%s）：按不重启处理", exc)
+            return False
+        return answer == QMessageBox.StandardButton.Yes
+
+    def restart(self) -> "RestartOutcome":
+        """拉新实例 → 成功才 `quit()`；失败**弹窗 + 不退出**（task13 §2 第 7 条）。
+
+        返回结构化的 `RestartOutcome`（`settings` 用它决定状态栏说什么）：
+        `started=True` 时本进程**马上就要退出了**，状态栏那句话用户大概看不到，
+        但那不重要——重要的是**失败路径**上返回 `False` 让界面如实显示。
+        """
+        started = restart_mod.restart_self(self._instance)
+        if not started:
+            reason = "新实例没能起来（详情见日志）"
+            _logger.error("重启失败：%s", reason)
+            # 弹窗 + 日志（agent.md §2.10 第二类：用户明确要求的写操作失败）。
+            # 此刻事件循环正在跑、设置窗口可见，模态框是安全的。
+            log.show_message(PROGRAM_NAME, restart_mod.RESTART_FAILED_MESSAGE)
+            return RestartOutcome(False, reason)
+
+        self.requested = True
+        # **只排退出，不在这里关窗口**：让设置窗口这一层的事件处理先返回，
+        # 再让事件循环自己收尾（与 task12 "分两拍"同一个理由——
+        # 在"Qt 正在处理某个信号"的栈上直接关窗口会让窗口管理器重入）。
+        _logger.info("重启：新实例已接管，旧实例现在退出")
+        QTimer.singleShot(0, self._app.quit)
+        return RestartOutcome(True)
 
 
 def _install_sigint_handler(app: QApplication) -> QTimer | None:
@@ -967,9 +1143,51 @@ def _report_resolution_problems(issues: tuple, fell_back: bool, config_pet: str 
         _logger.warning("素材包问题：%s", issue)
     if fell_back:
         _logger.warning(
-            "配置里的素材包 %r 不可用，已回退到默认形象 %s"
-            "（本次**不写配置**：回写配置属 task11）",
+            "配置里的素材包 %r 不可用，已回退到默认形象 %s（本次会把配置写回默认形象）",
             config_pet,
+            pet_loader.DEFAULT_PET_NAMESPACE,
+        )
+
+
+def _persist_pet_fallback(store: ConfigStore, config_pet: str | None) -> None:
+    """配置里的角色不可用 → **把配置写回"默认形象"**（task13 §4 的"§3.16 顺带项"）。
+
+    ## 为什么必须写回
+
+    不写回的话磁盘上永远留着那个坏命名空间，于是**每次启动**都要再走一遍
+    "解析失败 → 回退默认形象 → 警告"——用户明明每次看到的都是默认形象，
+    配置里却写着别人的名字。task13 §6 的验收就是这一条：
+    "坏包 → 配置被改回默认形象（重启后不再踩同一个坑）"。
+
+    ## ⚠ 只在**真的启动**这条路径上写，只读查询绝不写
+
+    `--list-pets` / `--list-actions` 是只读查询（agent.md §2.10："读操作只读"），
+    它们也会解析素材包、也会撞上"配置里的包坏了"，但**一个字节都不许写**。
+    所以本函数由调用方在 `query_only=False` 时才会走到。
+
+    ## 写回的值是**空串**，不是 `"weedy"`
+
+    `config.pet` 的默认值是空串 = "用户还没表态"，而默认形象的真值只在
+    `pet_spec.DEFAULT_PET_NAMESPACE` 一处（§4.1）。写一个 `"weedy"` 进去
+    等于把默认形象的名字抄到第二个地方——哪天默认形象换人，配置文件里
+    会留着一个陈旧的、看起来像"用户主动选的"值。空串回到缺省路径才是对的。
+
+    ## 返回值与失败
+
+    写失败**只记日志、不阻断启动**：能跑起来比"配置干净"重要得多，
+    而且失败原因已经在日志里了（下次启动会再试一遍）。
+    """
+    if not config_pet:
+        return
+    result = store.apply("pet", "")
+    if result.ok:
+        _logger.info("配置里的角色 %r 不可用，已把配置改回默认形象（写为空串）", config_pet)
+    else:
+        _logger.error(
+            "配置里的角色 %r 不可用，但没能把配置改回默认形象：%s"
+            "（本次照常使用默认形象 %s）",
+            config_pet,
+            result.error,
             pet_loader.DEFAULT_PET_NAMESPACE,
         )
 
@@ -1017,6 +1235,10 @@ def _resolve_or_die(
     result = resolve_pet(None, config_pet)
     if result.spec is not None:
         _report_resolution_problems(result.issues, result.fell_back, config_pet)
+        if result.fell_back and not query_only:
+            # 配置里的包坏了 → 把配置写回默认形象（task13 §4 的顺带项）。
+            # ⚠ `query_only` 那条分支**一个字节都不写**：只读查询就是只读。
+            _persist_pet_fallback(store, config_pet)
         return result.spec
 
     detail = "\n".join(f"  - {issue}" for issue in result.issues) or "  - （没有拿到任何原因）"
@@ -1075,6 +1297,48 @@ def run(argv: list[str] | None = None) -> int:
         # **只读查询走完就返回**：下面才建 `QApplication`。
         return _run_list_actions(_resolve_or_die(cli_spec, store, query_only=True))
 
+    # ------------------------------------------------------------ 重启等待（task13）
+    #
+    # **新进程先等 `--restart-delay` 再抢单实例锁**（task13 §2 第 8 条 / §4）。
+    # 这个等待是"锁的交接"的一半（另一半是旧进程主动放锁）：
+    # 旧进程拉起我们之后还要跑完退出收尾，那段时间里锁还占着。
+    #
+    # ⚠ 位置在 `--list-*` **之后**：只读查询不该为一次重启等待 1.2 秒，
+    # 更不该被"已有实例"拒绝（task13 §6 第 2 条）。
+    #
+    # ⚠ 只有"真的是被重启拉起来的"才等：参数缺省时一秒都不等，
+    # 于是"双击启动"的日常路径不受影响。
+    if args.restart_delay is not None and args.restart_delay > 0:
+        _wait_before_lock(args.restart_delay)
+
+    # ------------------------------------------------------------ 单实例保护（task13）
+    #
+    # 位置在**只读查询之后、建窗口之前**（§13 + §16 的硬约束）。
+    #
+    # ⚠ `--list-sizes` 是特例：它必须晚于 `QApplication`（要读真实屏幕），
+    # 于是它在下面**更靠后**才返回。但它是**只读查询**，同样不许被单实例拒绝
+    # （task13 §2 第 2 条把三个 `--list-*` 并列写在一起）。
+    # 所以这里抢到锁之后**先在下面那条路径上放掉**——见 `_release_for_query()`。
+    #
+    # 抢不到（`None`）= 已经有实例在跑 → **安静退出、返回 0**：
+    # 不弹窗、不写错误日志（这是**正常**情况，用户双击了第二次而已）。
+    #
+    # ⚠ `--list-sizes` 是特例：它是**只读查询**，同样不许被单实例拒绝
+    # （task13 §2 第 2 条把三个 `--list-*` 并列写在一起），但它必须晚于
+    # `QApplication`（要读真实屏幕），所以**不能**像另外两个那样提前返回。
+    # 对策：这条路径**压根不抢锁**——锁的意思是"我要开一个宠物窗口"，
+    # 而它根本不开窗口。第一版写成"抢了再放"，实测第二个实例会先被
+    # `acquire()` 判成"已有实例"直接返回，那个 `release()` 永远走不到。
+    query_only_run = bool(args.list_sizes)
+
+    instance = (
+        single_instance.SingleInstanceHandle(held=False, available=False, name="(只读查询)")
+        if query_only_run
+        else single_instance.acquire()
+    )
+    if instance is None:
+        return _EXIT_OK
+
     raw_argv = list(sys.argv) if argv is None else [sys.argv[0], *argv]
     app = QApplication.instance()
     if app is None:
@@ -1091,6 +1355,9 @@ def run(argv: list[str] | None = None) -> int:
         # `--list-sizes` **必须晚于 `QApplication`**：屏幕自适应要读真实屏幕
         # （agent.md §4.9 "DPI 缩放需要窗口先起来"）。它也不能像 `--list-actions`
         # 那样在建 app 之前返回，否则"自适应档位"这一行没有屏幕可读。
+        #
+        # **它压根不抢单实例锁**（见上面 `query_only_run` 的说明）：
+        # 锁是"我打算开一个窗口"的意向声明，而这条路径只打印、不开窗口。
         return _run_list_sizes(pet.cell)
 
     # 起窗口之前先把动作名定死：起完窗口再报错就会留下一个关不掉的对话框
@@ -1107,6 +1374,10 @@ def run(argv: list[str] | None = None) -> int:
         error = UnknownActionError(pet.namespace, action, pet.action_order)
         _logger.error("%s", error)
         print(str(error), file=sys.stderr)
+        # 用法错误也要**把锁还回去**：本进程马上退出，进程消亡时系统本来也会
+        # 回收句柄；主动放掉是为了"退出与句柄回收之间没有那个窗口期"
+        # （放锁 = 释放所有权 + 关句柄，见 `single_instance`）。
+        instance.release()
         return _EXIT_PET_UNAVAILABLE
 
     level, level_source = _resolve_size_level(args.size_level, store, pet.cell)
@@ -1266,6 +1537,12 @@ def run(argv: list[str] | None = None) -> int:
     # 呼出快捷键那一行（task12）：界面**不碰** RegisterHotKey，
     # 它只问一句"这个组合能不能用"，注册与回滚都在 HotkeyController 里。
     settings_controller.set_hotkey_changer(hotkey_controller.change)
+    # 换角色那一行（task13）：界面**不碰** QProcess，也不自己弹询问框，
+    # 它只问"用户同意重启吗"与"帮我重启"。两件事都在 RestartController 里。
+    restart_controller = RestartController(app, instance)
+    settings_controller.set_restart_handler(
+        restart_controller.restart, restart_controller.confirm
+    )
 
     # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
     # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；
@@ -1299,8 +1576,8 @@ def run(argv: list[str] | None = None) -> int:
     try:
         code = app.exec()
     finally:
-        # 退出收尾。本阶段还没有单实例锁要放（task13），
-        # 收掉自己的心跳定时器、久置计时器、光标轮询、**全局热键**与音效设备。
+        # 退出收尾。收掉自己的心跳定时器、久置计时器、光标轮询、
+        # **全局热键**、单实例锁与音效设备。
         window.stop_animation()
         # ⚠ **热键必须彻底释放**（task12 §4）：不释放的表现是"组合被本进程占着"，
         # 退出后立刻重启，同一个组合注册不上（验收里专门盯这一条）。
@@ -1321,6 +1598,10 @@ def run(argv: list[str] | None = None) -> int:
         startup_chime_timer.stop()
         preload_timeout_timer.stop()
         sound_player.close()
+        # 单实例锁（task13）：走重启路径时它**已经在 `restart_self()` 里放掉了**
+        # （`release()` 幂等，这里再调一次没有副作用）；正常退出这条路
+        # 就靠这一句把锁还回去——不还的话"关掉桌宠再启动"会被告知"已有实例"。
+        instance.release()
         if heartbeat is not None:
             heartbeat.stop()
     _logger.info("%s 退出（退出码 %d）", PROGRAM_NAME, code)
