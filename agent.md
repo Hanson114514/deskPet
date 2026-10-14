@@ -1863,10 +1863,24 @@ task12 更新 task11 同理）。
 **其他待办（不阻塞主线）**：本阶段 14 个 task **已全部完成**（task01–14）。
 截屏 / 录屏若要新开任务，用 `tasks/task15.md` / `tasks/task16.md` 的编号
 （**当前不存在这两个文件**，且 D11 已定案本阶段不做）。
-打包阶段注意：`main.py` 顶层静态 import；
-**⚠ `tools/make_shortcut.ps1` 与 `tools/read_shortcut.ps1` 必须显式声明进打包数据**
-（漏掉的表现是"打包后开机自启永远显示不可用"，而**源码运行看不出来**，见 §2.22 末段）；
-出包脚本要自检关键文件，构建机留在 `data/` 的日志必须删掉再发。
+
+---
+
+### §6 打包与分发（已落地，2026-10）
+
+> 用户主动要求后做的（`requests.md` 红线："没有用户主动提出，完成步骤后不要自行打包"）。
+> 入口 `deskpet.spec`（PyInstaller **onedir**）、用户手册 `操作指引.md`、
+> 自检 `tools/check_dist.py` 与 `tools/check_dist_autostart.py`。
+
+| 项 | 定案 |
+| --- | --- |
+| 形态 | **onedir 便携版**（`dist/deskPet/`，约 503 MB）。目标机**不需要装 Python**。**不用 onefile**：`program_dir()` 会变成临时解包目录，`data/` 跟着乱跑 |
+| 打包数据落点 | ⚠ **两处不一样，别合并**：`assets/` 进 `_internal/`（= `resource_dir()`）；**`tools/*.ps1` 必须在 exe 同级**（= `program_dir()/tools`，`autostart.tools_dir()` 按它找） |
+| 为什么 ps1 走 COLLECT 后复制 | PyInstaller 6.x 的 onedir 把 `datas` 一并塞进 `_internal/`。**漏掉 exe 同级那份 = 打包后开机自启永远显示不可用**（§2.22） |
+| 入口 | `main.py`（顶层静态 import）；`console=False`（无控制台，输出全落 `data/deskpet.log`） |
+| 实测 | `tools/check_dist.py`（**39 项全过**：布局 / 真启动 / 只读查询 / rc=2 / 单实例 / 无残留）+ `check_dist_autostart.py`（**9 项全过**：冻结包里真建 `.lnk` 并读回目标）。日志实测 `pet=weedy … mask=on`、`音效 3/3`、`呼出快捷键 Ctrl+Alt+Shift+P` |
+| 清理 | `dist/`、`build/`、`*.spec` 已在 `.gitignore` 里（**`deskpet.spec` 本该被忽略，但它是交付物，按需 `git add -f`**） |
+
 版本控制：仓库已 `git init`（分支 `main`），`.gitignore` 已忽略
 `data/`、`__pycache__/`、`dist/`、`build/`、`*.spec`、虚拟环境目录；**每个 task 完成提交一次**
 （`feat(阶段): 描述`，提交信息写到仓库外的临时文件再引用）。

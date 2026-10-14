@@ -18,6 +18,9 @@ env/
 build/
 dist/
 *.spec
+# …但 `deskpet.spec` 是**手工维护的交付物**（不是 PyInstaller 自动生成的），
+# 要进版本控制：它是分发包的唯一构建配方（§6）。
+!deskpet.spec
 
 # 编辑器 / 系统
 .vscode/
