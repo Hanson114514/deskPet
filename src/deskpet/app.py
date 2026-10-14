@@ -24,8 +24,14 @@ task02 起启动顺序**固定**为：
 | `--list-pets` | 只读查询：列出全部素材包 + 校验结论 + 音效摘要，然后退出 |
 | `--list-actions` | 只读查询：列出动作名 / 帧数 / 解析后的帧率与**来源**，然后退出 |
 
-附录 A 的"参数解析位置约定"：`--position` / `--size-level` 属于尺寸与位置 task
-（task04 / task08），**不要**在这里提前实现。
+## task04 新增的命令行
+
+| 参数 | 语义 | 返回时机 |
+| --- | --- | --- |
+| `--size-level 1..10` | 指定尺寸档位；**越界当场报错退出**（不夹取） | — |
+| `--list-sizes` | 列出 10 级的倍数与像素尺寸 + 屏幕高度 + 自适应档位 | **`QApplication` 之后**（要读屏幕） |
+
+`--position` 属 task08，**不要**在这里提前实现。
 """
 
 import argparse
@@ -34,11 +40,12 @@ import signal
 import sys
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from . import PROGRAM_NAME, __version__
 from . import logger as log
-from . import paths, pet_loader
+from . import paths, pet_loader, size
 from .config import ConfigStore
 from .errors import DataDirError
 from .pet_loader import PetLoadError, list_reports, resolve_pet
@@ -60,6 +67,27 @@ _EXIT_OK = 0
 _EXIT_PET_UNAVAILABLE = 2
 
 _logger = logging.getLogger(__name__)
+
+
+def _size_level_arg(text: str) -> int:
+    """`--size-level` 的解析器：**越界当场报错**（不是夹取）。
+
+    两条规则不要混（task04 §4 硬规则 6）：
+
+    - **命令行**给的说法越界 → `argparse` 报用法错误、非 0 退出（本函数）；
+    - **配置/程序内部**的值越界 → `size.clamp_level()` 夹到 1..10。
+
+    命令行这边"夹取"是错的：用户敲了 11 却看到第 10 级，会以为自己看错了。
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} 不是整数") from None
+    if not size.is_valid_level(value):
+        raise argparse.ArgumentTypeError(
+            f"档位必须在 1..{size.LEVEL_COUNT} 之间，实际给了 {value}"
+        )
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -99,6 +127,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--list-actions",
         action="store_true",
         help="列出当前素材包的动作、帧数与帧率来源，然后退出",
+    )
+    parser.add_argument(
+        "--size-level",
+        type=_size_level_arg,
+        default=None,
+        metavar="1-10",
+        help=f"尺寸档位 1-{size.LEVEL_COUNT}（越界当场报错退出）",
+    )
+    parser.add_argument(
+        "--list-sizes",
+        action="store_true",
+        help="列出 10 个档位的倍数与像素尺寸、当前屏幕的自适应档位，然后退出",
     )
     parser.add_argument(
         "--exit-after",
@@ -158,6 +198,87 @@ def _run_list_actions(spec: PetSpec) -> int:
     return _EXIT_OK
 
 
+# ------------------------------------------------------------------ 尺寸档位
+
+#: 档位来源的显示文字（**启动信息里必须打印**，task04 §4）。
+LEVEL_SOURCE_CLI = "命令行指定"
+LEVEL_SOURCE_CONFIG = "沿用上次"
+LEVEL_SOURCE_SCREEN = "按屏幕自适应"
+
+
+def _screen_height() -> int:
+    """当前屏幕的**逻辑**高度（拿不到 → 0）。
+
+    **必须在 `QApplication` 起来之后才准**：屏幕自适应需要"真实屏幕 + DPI 缩放"
+    （agent.md §4.9），所以 `--list-sizes` 不能像 `--list-actions` 那样在
+    建 `QApplication` 之前返回。
+    """
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return 0
+    return int(screen.geometry().height())
+
+
+def _resolve_size_level(
+    cli_level: int | None,
+    store: ConfigStore,
+    cell: tuple[int, int],
+) -> tuple[int, str]:
+    """决定用哪一档，返回 `(档位, 来源文字)`。
+
+    **决定顺序（task04 §4 的硬约定）**：
+
+    1. **命令行** `--size-level`（给了就用，它已经在解析阶段验过范围）；
+    2. **上次保存的**——用 `store.has("size_level")` 判定，**不是**
+       "读到的值 ≠ 默认值"。用户主动把档位选在默认的第 6 级时 `has()` 为真，
+       来源必须显示"沿用上次"而不是"按屏幕自适应"（agent.md §2.4 规则 5）；
+    3. 都没有 → **按屏幕自适应**。
+
+    配置里的值越界（例如手改成了 99）走 `clamp_level()` 夹取 + 一条警告：
+    配置是"读取永不致命"的那一类（§2.10 第三类），不能因为它起不来。
+    """
+    if cli_level is not None:
+        return size.clamp_level(cli_level), LEVEL_SOURCE_CLI
+
+    if store.has("size_level"):
+        raw = store.get("size_level")
+        level = size.clamp_level(raw)
+        if level != raw:
+            _logger.warning("配置里的 size_level=%r 越界，已夹到第 %d 级", raw, level)
+        return level, LEVEL_SOURCE_CONFIG
+
+    return size.level_for_screen(_screen_height(), cell), LEVEL_SOURCE_SCREEN
+
+
+def _run_list_sizes(cell: tuple[int, int]) -> int:
+    """`--list-sizes`：只读查询，列出 10 个档位 + 当前屏幕的自适应档位。
+
+    **依赖 `cell`**（像素尺寸按帧的实际尺寸算），所以只能在**素材解出来之后**跑。
+    又因为它要读屏幕，必须在 **`QApplication` 建好之后**——
+    这也是它比 `--list-actions` 晚一步的原因。
+    """
+    height = _screen_height()
+    adaptive = size.level_for_screen(height, cell)
+
+    print(f"画布 cell：{cell[0]}×{cell[1]}")
+    print(f"当前屏幕逻辑高度：{height}")
+    print(f"自适应档位：第 {adaptive} 级（目标占比 {size.SCREEN_TARGET_RATIO:.2f}）")
+    print(f"档位（共 {size.LEVEL_COUNT} 级）：")
+    for level in range(1, size.LEVEL_COUNT + 1):
+        width, pixel_height = size.pixel_size(cell, level)
+        marks = []
+        if level == adaptive:
+            marks.append("自适应")
+        if level == size.DEFAULT_LEVEL:
+            marks.append("默认")
+        suffix = f"  ← {'、'.join(marks)}" if marks else ""
+        print(
+            f"    {level:>2}. ×{size.ratio_text(level)}  "
+            f"{width}×{pixel_height}{suffix}"
+        )
+    return _EXIT_OK
+
+
 # ------------------------------------------------------------------ 启动编排
 
 
@@ -181,26 +302,32 @@ def _install_sigint_handler(app: QApplication) -> QTimer | None:
     return heartbeat
 
 
-def _print_startup_line(window: PetWindow) -> None:
-    """记一行启动状态：素材包 + 动作 + 位置 + 尺寸 + 遮罩 + DPI 缩放。
+def _print_startup_line(window: PetWindow, level_source: str) -> None:
+    """记一行启动状态：素材包 + 动作 + 位置 + **档位/来源/像素尺寸** + 遮罩 + DPI 缩放。
 
     位置取自窗口的**权威位置**（不是回读窗口坐标）。
     写进日志（同时上控制台）；**不写盘**、不碰配置。
+
+    task04 起必须带上**档位 + 来源 + 像素尺寸**这三样：
+    "宠物怎么突然变小了"这类问题，只看这一行就能判断是"沿用上次"还是"自适应"变了。
     """
     position = window.base_position
-    size = window.size()
+    width, height = window.pixel_size
     # QWidget 没有 hasMask()，遮罩要问 mask()（空区域 = 没设遮罩）。
     mask_state = "on" if not window.mask().isEmpty() else "off"
     _logger.info(
-        "%s %s | pet=%s action=%s pos=(%d, %d) size=%dx%d mask=%s dpr=%.2f",
+        "%s %s | pet=%s action=%s pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s dpr=%.2f",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
         window.action,
         position.x(),
         position.y(),
-        size.width(),
-        size.height(),
+        window.level,
+        size.LEVEL_COUNT,
+        level_source,
+        width,
+        height,
         mask_state,
         window.devicePixelRatioF(),
     )
@@ -348,6 +475,12 @@ def run(argv: list[str] | None = None) -> int:
 
     pet = _resolve_or_die(cli_spec, store, query_only=False)
 
+    if args.list_sizes:
+        # `--list-sizes` **必须晚于 `QApplication`**：屏幕自适应要读真实屏幕
+        # （agent.md §4.9 "DPI 缩放需要窗口先起来"）。它也不能像 `--list-actions`
+        # 那样在建 app 之前返回，否则"自适应档位"这一行没有屏幕可读。
+        return _run_list_sizes(pet.cell)
+
     # 起窗口之前先把动作名定死：起完窗口再报错就会留下一个关不掉的对话框
     # （`show_fatal_error()` 是模态的、会阻塞事件循环，task03 实测踩到）。
     #
@@ -362,12 +495,14 @@ def run(argv: list[str] | None = None) -> int:
         print(message, file=sys.stderr)
         return _EXIT_PET_UNAVAILABLE
 
-    window = PetWindow(pet)
+    level, level_source = _resolve_size_level(args.size_level, store, pet.cell)
+
+    window = PetWindow(pet, level)
     window.show_action_frame(action, 0)
     window.showing_at_default_position()
     window.show()
 
-    _print_startup_line(window)
+    _print_startup_line(window, level_source)
 
     heartbeat = _install_sigint_handler(app)
 

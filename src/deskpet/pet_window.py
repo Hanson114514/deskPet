@@ -1,19 +1,22 @@
-"""宠物主窗口：无边框 / 置顶 / 透明背景 / 可拖动。
+"""宠物主窗口：无边框 / 置顶 / 透明背景 / 可拖动 / **按档位缩放**。
 
 task01 交付了**最小可运行骨架**（占位图形 + 拖 + 退出）；task03 起窗口显示
-**真实素材的第一帧**，占位模块 `placeholder.py` 已随之删除。
+**真实素材的第一帧**，占位模块 `placeholder.py` 已随之删除；
+task04 起窗口尺寸由**尺寸档位**决定（10 级、屏幕自适应、右下角锚点）。
 
-动画（task05）、尺寸档位与缩放（task04）、控制栏（task09）都不在这里。
-本 task 的窗口尺寸**就是素材的 `cell`**（不缩放、不选档位）。
+动画（task05）、控制栏（task09）都不在这里。
 
-**两条硬约定**（agent.md §2.8 / §4.6）：
+**三条硬约定**：
 
-1. **位置用自己记的基准算，绝不回读窗口实时坐标**。
+1. **位置用自己记的基准算，绝不回读窗口实时坐标**（agent.md §4.6）。
    权威位置是 ``PetWindow._base_pos``，只有 ``move_to()`` 会写它。
    回读 ``self.pos()`` / ``self.geometry()`` 会拿到**异步生效的旧值**，
    表现就是"拖动只走一小截"。
 2. **两种坐标不可混用**：位移看 ``event.globalPosition()``（屏幕坐标），
    命中判定看 ``event.position()``（窗口内坐标）。
+3. **切档顺序：先重建该档的帧，再改窗口尺寸**（`迁移清单.md` §4 第 5 条）。
+   反了会短暂留白或裁边——本文件的 `set_size_level()` 是唯一改档入口，
+   顺序写在那一处，别在别处再拼一遍。
 """
 
 
@@ -31,16 +34,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from . import PROGRAM_NAME, pet_loader
+from . import PROGRAM_NAME, size
 from .pet_spec import PetSpec
+from .rendering import FrameRenderer
 
-#: 默认落点距屏幕右下角的留白（逻辑单位）。附录 C：默认落点边距 24 逻辑单位。
-DEFAULT_MARGIN = 24
-
-#: 没有素材时窗口退化的边长（逻辑单位）。正常路径用不到它 ——
-#: 本 task 起"连默认素材包都不可用"是**启动期致命**（agent.md §2.10 第一类），
-#: 不会带着一张空窗口跑起来。
-FALLBACK_SIZE = 250
+#: 默认落点距屏幕右下角的留白（逻辑单位）。**真值在 `size.DEFAULT_MARGIN`**，
+#: 这里只做引用（同一个约定不要在两处各写一个 24）。
+DEFAULT_MARGIN = size.DEFAULT_MARGIN
 
 #: 本 task 显示的动作（动画播放属 task05，这里只取第一帧）。
 DEFAULT_ACTION = "idle"
@@ -96,12 +96,17 @@ def region_for_image(image: QImage | None) -> QRegion | None:
 
 
 class PetWindow(QWidget):
-    """宠物主窗口（task03：显示真实素材的静态第一帧）。"""
+    """宠物主窗口（task04：按尺寸档位显示缩放后的静态第一帧）。"""
 
-    def __init__(self, pet: PetSpec, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        pet: PetSpec,
+        level: int | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
 
-        #: 当前显示的素材包（task03 只支持"一个包的一个动作的第一帧"）。
+        #: 当前显示的素材包。
         self.pet = pet
         #: 权威位置（左上角，屏幕逻辑坐标）。**只由 move_to() 写**。
         self._base_pos = QPoint(0, 0)
@@ -112,13 +117,20 @@ class PetWindow(QWidget):
         self._dragging = False
         self._quit_shortcuts: list[QShortcut] = []
 
-        #: 当前显示的帧（带 alpha 的 QImage；任务05 起会被逐帧替换）。
+        #: 当前显示的帧（**已缩放**，窗口尺寸就是它的尺寸）。
         self._frame_image = QImage()
         #: 本 task 显示的动作名（回退之后的实际名字，可能不是 "idle"）。
         self._action = _pick_action(pet, DEFAULT_ACTION)
+        #: 当前帧序号（task05 会逐帧推进；本 task 一直是 0）。
+        self._frame_index = 0
+
+        #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位（task06 还要加镜像）。
+        self._renderer = FrameRenderer(pet, self._device_pixel_ratio())
+        #: 当前档位。`None` 表示还没定（构造时要么给 level、要么自适应）。
+        self._level = 0
 
         self._setup_window()
-        self.show_action_frame(self._action, 0)
+        self._apply_level(self._resolve_initial_level(level))
         self._install_quit_shortcuts()
 
     # ------------------------------------------------------------ 装配
@@ -128,6 +140,31 @@ class PetWindow(QWidget):
         screen = self.screen() or QGuiApplication.primaryScreen()
         ratio = screen.devicePixelRatio() if screen is not None else 1.0
         return float(ratio) if ratio else 1.0
+
+    def _screen_height(self) -> int:
+        """当前屏幕的**逻辑**高度（拿不到 → 0，由 size 模块退回默认档位）。
+
+        Qt 的 `geometry()` 给的就是逻辑值，直接交给 `size.level_for_screen()`；
+        **不要**再乘一遍 `devicePixelRatio()`（乘了就是缩放两次，agent.md §4.9）。
+        """
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 0
+        return int(screen.geometry().height())
+
+    def _screen_area(self) -> tuple[int, int, int, int]:
+        """屏幕矩形的 `(x, y, w, h)`（逻辑单位）；拿不到 → 全 0。"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return (0, 0, 0, 0)
+        area = screen.geometry()
+        return (area.x(), area.y(), area.width(), area.height())
+
+    def _resolve_initial_level(self, level: int | None) -> int:
+        """构造期的档位：给了就用（夹取），没给就**按屏幕自适应**。"""
+        if level is None:
+            return size.level_for_screen(self._screen_height(), self.pet.cell)
+        return size.clamp_level(level)
 
     def _setup_window(self) -> None:
         # 无边框 + 始终置顶 + 不进任务栏（Qt.Tool）。
@@ -141,8 +178,6 @@ class PetWindow(QWidget):
         # 这里显式打开它，Esc / Ctrl+Q / --exit-after 才真能干净退出。
         self.setAttribute(Qt.WA_QuitOnClose, True)
         self.setWindowTitle(PROGRAM_NAME)
-        # 窗口尺寸就是素材的 cell（本 task 不缩放、不选档位）。
-        self.setFixedSize(self.pet.cell[0], self.pet.cell[1])
 
     def _install_quit_shortcuts(self) -> None:
         """Esc 与 Ctrl+Q 退出。窗口拿到焦点时生效。"""
@@ -151,6 +186,75 @@ class PetWindow(QWidget):
             shortcut.setContext(Qt.WindowShortcut)
             shortcut.activated.connect(self.close)
             self._quit_shortcuts.append(shortcut)
+
+    # ------------------------------------------------------------ 档位与尺寸
+
+    @property
+    def level(self) -> int:
+        """当前尺寸档位（1..10）。"""
+        return self._level
+
+    @property
+    def pixel_size(self) -> tuple[int, int]:
+        """当前档位下的内容像素尺寸（= 窗口尺寸）。"""
+        return size.pixel_size(self.pet.cell, self._level)
+
+    @property
+    def size_level(self) -> int:
+        """`level` 的别名（说"档位"时两种叫法都有人用，统一指同一个值）。"""
+        return self._level
+
+    def _apply_level(self, level: int) -> None:
+        """**切档的唯一入口**：先把该档的帧渲染好，再改窗口尺寸、再重设遮罩。
+
+        ## 顺序硬约束（`迁移清单.md` §4 第 5 条）
+
+        1. **先取该档的帧**（`FrameRenderer.frame()`，会按需缩放 + 进缓存）；
+        2. 再 `setFixedSize()` 改窗口尺寸；
+        3. 最后 `update()` 重绘 + `apply_mask()` 重算区域。
+
+        反过来的话，窗口先变小/变大而帧还没换，中间会露出**空白或裁边**。
+
+        **首次调用**（构造期）时窗口还没有位置，只定尺寸、不动位置；
+        后续切档一律走 `set_size_level()` 的锚点保护。
+        """
+        self._level = size.clamp_level(level)
+
+        pixmap = self._renderer.frame(self._action, self._frame_index, self._level)
+        if not pixmap.isNull():
+            # 缓存里的 QPixmap 是**共享**的，转成 QImage 时 Qt 会做一次深拷贝，
+            # 于是 `_frame_image` 与缓存互不影响（后续要画/要算遮罩）。
+            self._frame_image = pixmap.toImage()
+
+        width, height = self.pixel_size
+        self.setFixedSize(width, height)
+        # 换档 = 衍生数据失效（agent.md §4.7）：遮罩必须按**新尺寸的帧**重算。
+        self.apply_mask(self._frame_image)
+        self.update()
+
+    def set_size_level(self, level: int) -> None:
+        """换档，并保持**右下角锚点不动**（向"左上"方向长大）。
+
+        锚点在切档**之前**从 `_base_pos` + 当前尺寸算出来，切完档再按新尺寸
+        反推左上角，最后夹到屏幕内——**夹取发生在写进权威位置之前**
+        （agent.md §4.5）。整个过程只经由 `move_to()` 写位置。
+        """
+        target = size.clamp_level(level)
+        if target == self._level:
+            return
+
+        anchor = size.anchor_of(
+            self._base_pos.x(), self._base_pos.y(), *self.pixel_size
+        )
+        self._apply_level(target)
+        left, top = anchor.top_left_for(*self.pixel_size)
+        self._move_clamped(left, top)
+
+    def _move_clamped(self, left: int, top: int) -> None:
+        """夹到屏幕内再写权威位置（越界值不进 `_base_pos`，agent.md §4.5）。"""
+        width, height = self.pixel_size
+        x, y = size.clamp_position(left, top, width, height, self._screen_area())
+        self.move_to(x, y)
 
     # ------------------------------------------------------------ 显示
 
@@ -161,25 +265,30 @@ class PetWindow(QWidget):
 
     @property
     def frame_image(self) -> QImage:
-        """当前显示的帧（只读；空图 = 没有图可画）。"""
+        """当前显示的帧（**已缩放**；只读，空图 = 没有图可画）。"""
         return self._frame_image
 
     def show_action_frame(self, action: str, index: int) -> bool:
-        """显示 ``action`` 的第 ``index`` 帧，并按它的 alpha 重设窗口遮罩。
+        """显示 ``action`` 的第 ``index`` 帧（按当前档位缩放），并重设窗口遮罩。
 
         返回**是否真的换上了新帧**。取不到图（动作不存在 / 帧号越界 /
         文件读不出来）时**保留原来的画面**并返回 ``False``——绝不把已经
         画好的东西擦掉，也绝不抛异常（agent.md §2.8 的降级约定）。
+
+        **不改窗口尺寸**：尺寸只由档位决定（`set_size_level()`）。
+        帧的实际像素尺寸与 `cell` 不一致时（只是个警告，§2.5），
+        渲染层按**真实图**的尺寸缩放，所以窗口尺寸仍以 `cell` 的档位换算为准。
         """
-        image = pet_loader.load_frame_image(self.pet, action, index)
-        if image.isNull():
+        pixmap = self._renderer.frame(action, index, self._level)
+        if pixmap.isNull():
             return False
 
-        self._frame_image = image
+        self._frame_index = int(index)
         self._action = action
+        self._frame_image = pixmap.toImage()
         # 换帧之后**衍生数据必须失效重算**（agent.md §4.7）：遮罩是上一帧的形状
         # 就会出现"人物变了但可点区域没变"。
-        self.apply_mask(image)
+        self.apply_mask(self._frame_image)
         self.update()
         return True
 
@@ -193,7 +302,9 @@ class PetWindow(QWidget):
     def move_to(self, x: int, y: int) -> None:
         """把窗口移到屏幕逻辑坐标 ``(x, y)``，并更新权威位置。
 
-        本 task **不做夹取**（越界位置不许写进权威位置那条约定属 task04 / task08）。
+        **本函数不夹取**：它接受调用方算好的最终位置（`_move_clamped()` 已经夹过）。
+        夹取属"摆放策略"而不是"搬运"——放在这里会让"拖到边缘被夹住"与
+        "换档后重算锚点"两种意图混在一起，说不清是谁夹的。
         """
         self._base_pos = QPoint(int(x), int(y))
         self.move(self._base_pos)
@@ -202,18 +313,19 @@ class PetWindow(QWidget):
         """首次显示：贴屏幕右下角，右下各留 ``DEFAULT_MARGIN`` 逻辑单位。
 
         用**整块屏幕**的 ``geometry()``（而不是排除任务栏的 ``availableGeometry()``），
-        因为附录 C 的"默认落点边距 24 逻辑单位"是从**屏幕边缘**量起的，
-        旧实现（``dotPet``）用的也是整屏高度。
+        因为"边距 24 逻辑单位"是从**屏幕边缘**量起的，旧实现（``dotPet``）用的也是整屏高度。
+        后果：底部有任务栏时宠物会压在任务栏上沿约 24 逻辑单位（agent.md §4.10）；
+        task09 的控制栏预留会把它再抬起来，**到那时再决定要不要改**。
         """
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        if screen is None:
+        area = self._screen_area()
+        if area[2] <= 0 or area[3] <= 0:  # 拿不到屏幕信息
             self.move_to(0, 0)
             return
 
-        area = screen.geometry()
-        self.move_to(
-            area.x() + area.width() - self.width() - DEFAULT_MARGIN,
-            area.y() + area.height() - self.height() - DEFAULT_MARGIN,
+        width, height = self.pixel_size
+        self._move_clamped(
+            area[0] + area[2] - width - DEFAULT_MARGIN,
+            area[1] + area[3] - height - DEFAULT_MARGIN,
         )
 
     def drag_by(self, dx: int, dy: int) -> None:
@@ -248,7 +360,9 @@ class PetWindow(QWidget):
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         try:
-            # 帧图未标注 DPR（见 pet_loader.load_frame_image），按原尺寸摆放。
+            # `_frame_image` 是**按当前档位缩放后**的图，尺寸与窗口一致，按 (0, 0) 摆放。
+            # 它未标注 DPR（见 pet_loader.load_frame_image / rendering 的说明），
+            # 所以这里也**不要**自己乘 devicePixelRatio —— 那是缩放两次（agent.md §4.9）。
             painter.drawImage(0, 0, self._frame_image)
         finally:
             painter.end()

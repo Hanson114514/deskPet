@@ -23,6 +23,8 @@ from typing import Any, Final, Mapping
 
 from PySide6.QtCore import QObject, Signal
 
+from . import size
+
 logger = logging.getLogger(__name__)
 
 #: `mirror` 只允许这三个状态名（= 动作名，不另造一套状态词汇）。
@@ -34,10 +36,9 @@ logger = logging.getLogger(__name__)
 #: **不是**错误——用户没主动选过休息的镜像时本来就没有这个键。
 MIRROR_STATES: Final[tuple[str, ...]] = ("idle", "waiting", "rest")
 
-#: 默认尺寸档位（第 6 级，附录 C）。
-#: **task04 会改成"引用 `size.DEFAULT_LEVEL`"**——真值只许存在一处，
-#: 在那之前这里就是那唯一一处，不要在别处再写一个 6。
-DEFAULT_SIZE_LEVEL: int = 6
+#: 默认尺寸档位。**真值只在 `size.DEFAULT_LEVEL` 一处**（agent.md §2.4 / §4.1：
+#: "默认值与真值：分散就会分叉"）——task04 起这里只做**引用**，不许再写一个 6。
+DEFAULT_SIZE_LEVEL: int = size.DEFAULT_LEVEL
 
 
 def _build_defaults() -> dict[str, Any]:
