@@ -41,7 +41,7 @@ import logging
 import signal
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, QRect, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
@@ -51,6 +51,7 @@ from . import logger as log
 from . import paths, pet_loader, size
 from .animation import UnknownActionError
 from .config import ConfigStore
+from .control_bar import RESERVED, ControlBar
 from .cursor_watch import CursorWatch
 from .errors import DataDirError
 from .idle_state import IdleStateMachine, normalize_idle_seconds
@@ -353,6 +354,189 @@ def _run_list_sizes(cell: tuple[int, int]) -> int:
 # ------------------------------------------------------------------ 启动编排
 
 
+class ControlBarController:
+    """把**控制栏**接到**宠物窗口**上（task09 的"组装"那一层，`app.py` 独有）。
+
+    ## 它要串起来的四件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | 跟随拖动 | 拖动**按增量平移**（`drag_started` 记下宠物位置，`position_changed` 里算差值） |
+    | 缩放中按钮不动 | 打开时抬宠物底边（`reserve_bottom(RESERVED)`），切档只做右下角锚点保护 |
+    | 关闭回位 | 收起栏 + 把宠物放回贴屏幕底边（边距归零） |
+    | 幂等 | **只持有同一个 `ControlBar` 实例**，重复打开就是"已经开着，什么都不做" |
+
+    ## 增量跟随为什么不"重算锚点"
+
+    `place_relative_to()` 是**打开时**用一次。拖动过程中若每动一下就重算一次，
+    拖到屏幕边缘时宠物的实际位置会被夹取，而控制栏按"宠物右边 + 间距"重算
+    就会与理论值错开 → **越跟越偏、来回拖会抖**（task09 §4 明写禁止）。
+    增量平移的口径是"宠物动了多少，栏就动多少"，天然不累积误差。
+
+    增量从 `position_changed` 的**当前权威位置**里算（不是回读窗口坐标，
+    agent.md §4.6）：记下上一次同步时的宠物位置，每来一次算一次差值即可。
+    """
+
+    def __init__(self, window: PetWindow) -> None:
+        self.window = window
+        self.bar: ControlBar | None = None
+        #: 上一次同步时宠物的权威位置（增量跟随的基准）。
+        self._synced_pet_pos: QPoint | None = None
+        #: **正在换档**：换档也会让 `position_changed` 发出来（右下角锚点不动
+        #: → 左上角必然变），但那**不是用户拖动**，控制栏必须一动不动
+        #: （task09 §6"本 task 最关键的一条"）。这个标志就是用来把两者分开的。
+        self._stepping = False
+
+    # ------------------------------------------------------------ 开关
+
+    @property
+    def visible(self) -> bool:
+        """控制栏当前是不是开着（**幂等的判据**）。"""
+        return self.bar is not None and self.bar.isVisible()
+
+    def toggle(self) -> None:
+        """`调整大小…` 的动作：开着就关掉，没开就打开（幂等）。"""
+        if self.visible:
+            self.close()
+        else:
+            self.open()
+
+    def open(self) -> None:
+        """打开控制栏：抬宠物 → 摆位置 → 显示 → 同步档位。
+
+        顺序有意义：
+
+        1. **先抬宠物**（`reserve_bottom`）：控制栏贴的是宠物**底边**，
+           底边必须在算控制栏位置**之前**就定下来，否则第一次会摆在旧底边上；
+        2. 再按**抬好之后**的宠物矩形摆控制栏（`place_relative_to`）；
+        3. `show()` 之后**再摆一次**：`Qt.Tool` 窗口在 `show()` 之前
+           `width()` / `height()` 可能是未定型的（布局还没算过），
+           第一次 `place_relative_to` 可能用了错的栏尺寸。
+        """
+        if self.visible:
+            return  # 幂等：已经开着就返回**同一个**栏，不叠第二个。
+
+        if self.bar is None:
+            self.bar = ControlBar()
+            self.bar.level_up.connect(self._on_level_up)
+            self.bar.level_down.connect(self._on_level_down)
+            self.bar.closed.connect(self.close)
+            self.bar.set_level(self.window.level)
+
+        self.window.reserve_bottom(RESERVED)
+        self.bar.set_level(self.window.level)
+        self.bar.place_relative_to(self._pet_rect(), self.bar.screen_rect())
+        self.bar.show()
+        self.bar.raise_()
+        self.bar.place_relative_to(self._pet_rect(), self.bar.screen_rect())
+        self._synced_pet_pos = QPoint(self.window.base_position)
+
+    def close(self) -> None:
+        """关闭控制栏：收起栏 + 把宠物**放回原本贴屏幕底边的位置**（边距归零）。
+
+        `reserve_bottom(0)` 只在"预留机制还生效"时才会动宠物——用户已经
+        拖动过（或位置本来就是命令行/配置给的）时机制已失效，于是宠物
+        **保持用户拖到的位置**，不会被这里拽回右下角（task08 §4 用户位置优先）。
+        """
+        if self.bar is not None:
+            self.bar.hide()
+        self.window.reserve_bottom(0)
+        self._synced_pet_pos = None
+
+    # ------------------------------------------------------------ 档位
+
+    def _on_level_up(self) -> None:
+        self._step(+1)
+
+    def _on_level_down(self) -> None:
+        self._step(-1)
+
+    def _step(self, delta: int) -> None:
+        """换一档：**到边界什么都没发生**（不切档、不写配置、不播动画）。
+
+        写配置是"换档"的后果而不是"点了按钮"的后果（task09 §4：
+        "`−`/`+` 到边界返回'没有变化'时**不写**"）——`PetWindow.set_size_level()`
+        在档位没变时会直接返回，连锚点保护都不会做。
+
+        ## 为什么要 `_stepping` 标志
+
+        `set_size_level()` 会改宠物的左上角（右下角锚点不动），于是
+        `position_changed` **照样发出来**。若跟随逻辑照单全收，控制栏就会
+        按那个增量平移——**表现是"点 `+` 时栏跟着斜着跑，用户得追着鼠标点"**，
+        正好违反本 task 最关键的那条验收。
+
+        真平台自检当场抓到了它（栏从 `2306,1372` 一路漂到 `1974,891`）。
+        对策：换档期间**挂起**跟随，换完档再重新同步基准位置。
+        """
+        target = self.window.level + int(delta)
+        if not size.is_valid_level(target):
+            return  # 到边界：按钮本来就灰着，这里再兜一层（防御）
+        self._stepping = True
+        try:
+            self.window.set_size_level(target)
+        finally:
+            self._stepping = False
+        self.sync()
+        # 换档后宠物左上角会变（右下角锚点不动）→ 重设跟随基准。
+        # **不是**"把栏挪回去"：栏本来就该待在原地（底边与右边都没动）。
+        self._synced_pet_pos = QPoint(self.window.base_position)
+
+    def sync(self) -> None:
+        """把档位刷进控制栏（**只改文字与禁用态，不挪位置**）。
+
+        "不挪位置"是"缩放中按钮不动"的另一半：换档时宠物按右下角锚点长大，
+        **底边与右边不动**，而控制栏贴的就是底边、对齐的就是右边，
+        所以这里**只刷文字**。若这里顺手 `place_relative_to()` 一次，
+        第 10 级的宠物会比屏幕还高，控制栏就会跳走。
+        """
+        if self.bar is None:
+            return
+        self.bar.set_level(self.window.level)
+
+    # ------------------------------------------------------------ 跟随
+
+    def sync_follow(self) -> None:
+        """宠物位置变了：按**增量**平移控制栏（`position_changed` 的槽）。
+
+        **不用轮询**（task09 §5 明写禁止）：位置变化一定有信号，
+        轮询既费 CPU 又会有"追不上"的滞后感。
+
+        ⚠ **换档期间直接返回**：换档也会让 `position_changed` 发出来
+        （右下角锚点不动 → 左上角必然变），但那不是用户拖动，
+        控制栏必须一动不动（见 `_step` 的说明）。
+        """
+        if self._stepping:
+            return
+        if not self.visible or self.bar is None:
+            self._synced_pet_pos = QPoint(self.window.base_position)
+            return
+
+        current = self.window.base_position
+        if self._synced_pet_pos is None:
+            self._synced_pet_pos = QPoint(current)
+            return
+        delta = current - self._synced_pet_pos
+        self._synced_pet_pos = QPoint(current)
+        self.bar.follow(delta.x(), delta.y())
+
+    # ------------------------------------------------------------ 几何
+
+    def _pet_rect(self) -> QRect:
+        """宠物当前的屏幕矩形。
+
+        尺寸取自 `PetWindow.pixel_size`（**权威**），不回读 `geometry()`
+        ——切档刚发生时窗口坐标还是异步的旧值（agent.md §4.6）。
+        """
+        width, height = self.window.pixel_size
+        pos = self.window.base_position
+        return QRect(pos.x(), pos.y(), width, height)
+
+    def reposition(self) -> None:
+        """重新按宠物摆一次控制栏（窗口刚 `show()` 完、屏幕变了时用）。"""
+        if self.visible and self.bar is not None:
+            self.bar.place_relative_to(self._pet_rect(), self.bar.screen_rect())
+
+
 def _install_sigint_handler(app: QApplication) -> QTimer | None:
     """把 SIGINT（Ctrl+C）转成"退出请求"，并返回心跳定时器。
 
@@ -608,13 +792,35 @@ def run(argv: list[str] | None = None) -> int:
     window.play_action(action)
     if position is None:
         window.showing_at_default_position()
+        # 缺省落点 → **底部预留机制生效**（task09 §4）：打开控制栏时把宠物
+        # 抬起来，关闭时放回贴屏幕底边。
+        window.set_reserved(True)
     else:
         # `user_positioned=True`：这个位置是用户自己的意思（命令行或上次落脚点），
-        # 于是缩放不会把它弹回右下角缺省落点（task08 §4 硬规则）。
+        # 于是缩放不会把它弹回右下角缺省落点（task08 §4 硬规则），
+        # 底部预留机制也不生效（task09 §4）。
         window.show_at(position[0], position[1], user_positioned=True)
     window.show()
 
     _print_startup_line(window, level_source, position_source)
+
+    # ------------------------------------------------------------ 尺寸控制栏（task09）
+    #
+    # 组装放在**窗口 show() 之后**：控制栏要读宠物的权威位置与自己所在屏幕，
+    # 两者都要窗口先起来才准（agent.md §4.9 "DPI 缩放需要窗口先起来"）。
+    bar_controller = ControlBarController(window)
+    # `调整大小…` 的动作 = 开关控制栏 **+ 重置静置计时**（task09 §4 "菜单项"）。
+    # 重置的理由：用户刚跟界面交互过，接着就张望会显得"没在听"。
+    # 用 `IdleStateMachine.on_mouse_moved()` 而不是直接改内部字段——
+    # "怎么算一次交互"的真值只有一个（§2.15）。
+    def _toggle_resize() -> None:
+        idle_state.on_mouse_moved()
+        bar_controller.toggle()
+
+    window.set_resize_handler(_toggle_resize)
+    # 跟随：位置变化信号驱动**增量平移**，绝不轮询（task09 §5）。
+    window.position_changed.connect(lambda _pos: bar_controller.sync_follow())
+    bar_controller.reposition()
 
     heartbeat = _install_sigint_handler(app)
 
@@ -640,6 +846,9 @@ def run(argv: list[str] | None = None) -> int:
         # 只收掉自己的心跳定时器、久置计时器与光标轮询
         # （音效 / 热键 / 单实例锁属 task10 / task12 / task13）。
         window.stop_animation()
+        # 控制栏是**独立顶层窗口**：不显式收起的话它会比宠物活得久
+        # （`Qt.Tool` 不计入"最后一个主窗口"，agent.md §4.9）。
+        bar_controller.close()
         idle_timer.stop()
         # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条）。

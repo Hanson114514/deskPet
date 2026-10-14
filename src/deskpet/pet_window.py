@@ -72,7 +72,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from typing import Final
+from typing import Callable, Final
 
 from . import PROGRAM_NAME, geometry, hit_test, size
 from . import context_menu
@@ -242,6 +242,23 @@ class PetWindow(QWidget):
         #: `None` = 没有配置可写（自检里常见），此时只记 DEBUG 日志、不报错。
         self._config = config
 
+        #: `调整大小…` 的处理函数（task09）：`app.py` 装进来，负责开关控制栏。
+        #: `None` = 本窗口没有控制栏（自检里常见）→ 菜单项**灰掉**，
+        #: 而不是给用户一个点了没反应的项（§2.10：绝不显示假成功）。
+        self._resize_handler: Callable[[], None] | None = None
+
+        #: **底部预留边距**（task09 的"缩放中按钮不动"机制）：窗口底边距屏幕底边的
+        #: 逻辑单位数。`0` = 贴屏幕底边（缺省落点的样子）；`RESERVED` = 抬起来给
+        #: 控制栏腾地方。**它只在"没被用户显式指定位置"时生效**（见 `_reserved`）。
+        self._bottom_margin = 0
+        #: **已经施加在权威位置上的**预留量。与 `_bottom_margin` 分开是必须的：
+        #: 权威位置里已经含了上一次抬升，重算基准底边时得先把它还回去
+        #: （否则每次调用都会再抬一次，见 `_reapply_bottom_margin`）。
+        self._applied_margin = 0
+        #: 预留机制**是否生效**。用户拖动过 / 命令行或配置给了位置 → `False`：
+        #: 位置是用户自己的意思，程序不许按"贴屏幕底边"那套去抬它（task09 §4）。
+        self._reserved = False
+
         #: 当前显示的帧（**已缩放、已按需镜像**，窗口尺寸就是它的尺寸）。
         self._frame_image = QImage()
         #: 当前动作名（**权威来源是 `self._animation.action`**，这里保留一份是为了
@@ -399,6 +416,10 @@ class PetWindow(QWidget):
         锚点在切档**之前**从 `_base_pos` + 当前尺寸算出来，切完档再按新尺寸
         反推左上角，最后夹到屏幕内——**夹取发生在写进权威位置之前**
         （agent.md §4.5）。整个过程只经由 `move_to()` 写位置。
+
+        **换档会写配置**（task09 §4）：档位写 `size_level`，位置写 `position`。
+        两条都**只在真的换档时**发生——档位没变时上面那句 `return` 已经拦掉了，
+        所以"`−`/`+` 点到边界"不会碰磁盘（§6 有一条验收专门盯这个）。
         """
         target = size.clamp_level(level)
         if target == self._level:
@@ -414,6 +435,25 @@ class PetWindow(QWidget):
         # 与松手一样写一次配置（**不逐帧写**，task08 §4 硬规则）。
         # 用户拖动过之后位置就以他的为准，**绝不重新算右下角缺省落点**。
         self._persist_position(self.base_position)
+        # 档位也写回去（重启后仍是这个档位，task09 §2 第 11 条）。
+        self._persist_level()
+
+    def _persist_level(self) -> None:
+        """把当前档位写进配置 `size_level`（**只在换档时调一次**）。
+
+        写失败按 §2.10 第二类处理：记 `ERROR` 并把系统原因原样带出来——
+        换档是用户明确要求的操作，没记住就必须让他知道。
+        `ConfigStore.set()` 自己**不抛异常**（返回 `False`），所以这里不会炸。
+
+        没有 `ConfigStore` 时（自检里常见）只记 `DEBUG`：那种情况下
+        "记不住档位"是测试的设定，不是产品故障。
+        """
+        if self._config is None:
+            logger.debug("没有配置 store，跳过档位持久化：level=%d", self._level)
+            return
+        if not self._config.set("size_level", int(self._level)):
+            reason = self._config.last_error("size_level") or "未知原因"
+            logger.error("记住尺寸档位失败（第 %d 级）：%s", self._level, reason)
 
     def _move_clamped(self, left: int, top: int) -> None:
         """夹到屏幕内再写权威位置（越界值不进 `_base_pos`，agent.md §4.5）。"""
@@ -642,6 +682,103 @@ class PetWindow(QWidget):
         x, y = geometry.default_position(width, height, self._screen_area())
         self.move_to(x, y)
 
+    # ------------------------------------------------------------ 底部预留（task09）
+
+    def set_resize_handler(self, handler: Callable[[], None] | None) -> None:
+        """装上 `调整大小…` 的处理函数（`app.py` 用；`None` 卸下 → 菜单项重新灰掉）。"""
+        self._resize_handler = handler
+
+    def set_reserved(self, on: bool) -> None:
+        """打开 / 关闭"底部预留机制"（task09 §4："用户显式指定位置时不生效"）。
+
+        `app.py` 只在**走缺省落点**时打开它；命令行 `--position`、配置里的
+        上次落脚点、以及用户拖动过，都会把它关掉——那三种情况下位置是
+        用户自己的意思，程序不许按"贴屏幕底边"那套去抬它。
+        """
+        self._reserved = bool(on)
+        if not self._reserved:
+            # 关掉机制时把已经抬起来的宠物**放回去**（边距归零）。
+            self._reset_bottom_margin()
+
+    @property
+    def bottom_margin(self) -> int:
+        """当前底部预留边距（逻辑单位）；`0` = 贴屏幕底边。"""
+        return self._bottom_margin
+
+    @property
+    def reserved(self) -> bool:
+        """底部预留机制是否生效。
+
+        判据是"位置**不是**用户自己的意思"：`app.py` 走缺省落点时置真，
+        走命令行 `--position` / 配置里的位置 / 用户拖动过时置假
+        （task09 §4："用户显式指定位置时，底部边距机制**不生效**"）。
+        """
+        return self._reserved
+
+    def reserve_bottom(self, margin: int) -> None:
+        """打开 / 收起**底部预留**：把宠物整体上移（或放回）指定的逻辑单位数。
+
+        ## 这是"缩放中按钮不动"的实现本体
+
+        控制栏贴的是宠物的**底边**。切档时宠物按**右下角锚点不动**长大
+        （§2.12：脚底与右边不动），所以只要**底边固定**，控制栏就一动不动。
+        打开控制栏时把底边抬起来给控制栏腾地方，此后切档不会再改这个底边——
+        用户从第 1 级连点到第 10 级，**鼠标不用移动**就能一直点到 `+`
+        （task09 §6 最关键的一条）。
+
+        ## 为什么不重算缺省落点
+
+        `showing_at_default_position()` 算的是"贴屏幕右下角的**左上角**"，
+        直接调它在切档后会把整块重新贴一遍右边缘，底边照样会动
+        （第 10 级的 1000 px 高窗口在 1440 的屏幕上根本放不下），
+        所以这里**只改纵向**：右边与底边都按锚点保持。
+
+        ``margin`` 由调用方给（`app.py` 传 `control_bar.RESERVED`）——
+        **真值只允许在 `control_bar.py` 定义一处**（task09 §4），
+        本模块不写第二份常量，免得两处迟早对不上。
+
+        用户显式指定过位置（`reserved` 为假）时**什么都不做**：位置由用户决定。
+        """
+        margin = max(0, int(margin))
+        if not self._reserved:
+            return
+        if margin == self._bottom_margin:
+            return
+        self._bottom_margin = margin
+        self._reapply_bottom_margin()
+
+    def _reapply_bottom_margin(self) -> None:
+        """按当前**底边**重算左上角（只动纵向，右边与底边都不变）。
+
+        ## 基准底边必须"先减掉已经抬起来的那部分"
+
+        权威位置里**已经含**了当前的预留量，所以"基准底边"是
+        `当前位置的底边 + 旧的边距`（把那一次抬升还回去）。
+        直接拿当前位置当基准，每次调用都会再抬一次——
+        第 2 次就把宠物抬到屏幕外了（实测：776 → 724 → 672 …）。
+        这条**必须幂等**：打开控制栏与切档都会调它。
+
+        **不用 `showing_at_default_position()`**：那个算的是"贴屏幕右下角的
+        左上角"，会把整块重新贴一遍右边缘；而这里只按**纵向**调整，
+        右边与底边都保持（用户拖过的位置也不会被拽回缺省落点）。
+        """
+        width, height = self.pixel_size
+        area = self._screen_area()
+        base_bottom = self._base_pos.y() + height + self._applied_margin
+        target_top = base_bottom - self._bottom_margin - height
+        x, y = size.clamp_position(
+            self._base_pos.x(), target_top, width, height, area
+        )
+        self._applied_margin = self._bottom_margin
+        self.move_to(x, y)
+
+    def _reset_bottom_margin(self) -> None:
+        """把已经抬起来的宠物放回去（边距归零），并清掉"已施加"的记账。"""
+        if self._bottom_margin == 0 and self._applied_margin == 0:
+            return
+        self._bottom_margin = 0
+        self._reapply_bottom_margin()
+
     def show_at(self, x: int, y: int, *, user_positioned: bool = False) -> None:
         """把窗口摆到 ``(x, y)``，**夹取后**再写权威位置（agent.md §4.5）。
 
@@ -653,6 +790,8 @@ class PetWindow(QWidget):
         self._move_clamped(int(x), int(y))
         if user_positioned:
             self._user_positioned = True
+            # 位置是用户自己的意思 → 底部预留机制不生效（task09 §4）。
+            self.set_reserved(False)
 
     def drag_by(self, dx: int, dy: int) -> None:
         """按**按下时记下的基准位置 + 位移**摆放窗口（**夹取后**才写权威位置）。
@@ -729,6 +868,10 @@ class PetWindow(QWidget):
             self.play_action(IDLE_ACTION)
 
         self._user_positioned = True
+        # 用户拖动过 → 位置由他决定，底部预留机制从此不生效（task09 §4）。
+        # ⚠ 这**不是**"把宠物放回贴屏幕底边"——控制栏关闭时才回位（`app.py`），
+        # 那时机制已失效，于是保持用户拖到的位置（"用户位置优先"，task08 §4）。
+        self.set_reserved(False)
         position = self.base_position
         self.drag_controller.finish(position)
         self.set_action_suspended(False)
@@ -835,6 +978,10 @@ class PetWindow(QWidget):
 
         `mirror_on` 只在适用范围内才有意义，所以这里把它与 `can_mirror`
         一起给出去——适用范围外两者分别是"假"与"不可点"。
+
+        `resize_available` **task09 起恒为真**：`调整大小…` 已经接线
+        （`set_resize_handler()` 装了处理器才为真——没装时仍然灰掉，
+        这样"自检里没接控制栏"的窗口不会给用户一个点了没反应的菜单项）。
         """
         action = self._animation.render_action
         can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
@@ -844,6 +991,7 @@ class PetWindow(QWidget):
             mirror_on=can_mirror and self.mirrored,
             can_mirror=can_mirror,
             can_rest=self.can_rest(),
+            resize_available=self._resize_handler is not None,
         )
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
@@ -881,9 +1029,14 @@ class PetWindow(QWidget):
             self.toggle_mirror()
         elif item_id == context_menu.ID_ACTION:
             self.toggle_rest()
+        elif item_id == context_menu.ID_RESIZE:
+            # task09：`调整大小…` 交给 `app.py` 装的处理器（开关控制栏 + 重置静置计时）。
+            # 没装（自检）时菜单项本来就是灰的，到不了这里；真到了也什么都不做。
+            if self._resize_handler is not None:
+                self._resize_handler()
         elif item_id == context_menu.ID_QUIT:
             self.close()
-        # resize / settings / visibility 本 task 一律是禁用的，
+        # settings / visibility 本 task 一律是禁用的，
         # 能点到它们说明禁用没生效——那种情况什么都不做，绝不"顺手实现"。
 
     def toggle_mirror(self) -> bool:

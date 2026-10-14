@@ -125,6 +125,21 @@ def ratio_text(level: int) -> str:
     return f"{ratio_of(level):.2f}"
 
 
+def level_text(level: int, total: int = LEVEL_COUNT) -> str:
+    """控制栏上的档位文字：`{倍数:.2f}x（{档位}/{总数}）`，例如 `1.00x（6/10）`。
+
+    **格式的真值只在这里一处**（task09 §4 行为契约）：控制栏、自检、将来的
+    设置窗口都调它，谁都不许再拼一遍——否则"字数变了、栏宽跟着变"这种
+    问题会分散到好几处去改。
+
+    括号用**全角**（`（` / `）`），与 task09 §2 的示例逐字符一致。
+
+    档位与总数都夹到合法范围：这是个**展示函数**，越界输入不该让它抛异常
+    （`level=0` 会打出 `0.25x（0/10）` 那种读不通的东西）。
+    """
+    return f"{ratio_of(level):.2f}x（{clamp_level(level)}/{int(total)}）"
+
+
 def pixel_size(cell: tuple[int, int], level: int) -> tuple[int, int]:
     """帧实际尺寸 `cell` × 该级倍数，**向下取整**。
 
