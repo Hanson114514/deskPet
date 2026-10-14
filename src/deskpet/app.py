@@ -14,22 +14,22 @@ task02 起启动顺序**固定**为：
 
 （顺序上"先建数据目录、再装文件日志"是必须的：日志文件本身就住在 `data/` 里。）
 
-## 本 task（task03）新增的命令行
-
-| 参数 | 语义 |
-| --- | --- |
-| `--pet <命名空间>` | 指定素材包（**命令行显式指定 → 坏包如实报错退出**） |
-| `--sprite <命名空间或目录>` | 同一件事的另一种说法，与 `--pet` 走**同一条**解析规则 |
-| `--action <动作>` | 显示哪个动作的**第一帧**（动画播放属 task05） |
-| `--list-pets` | 只读查询：列出全部素材包 + 校验结论 + 音效摘要，然后退出 |
-| `--list-actions` | 只读查询：列出动作名 / 帧数 / 解析后的帧率与**来源**，然后退出 |
-
-## task04 新增的命令行
+## 命令行
 
 | 参数 | 语义 | 返回时机 |
 | --- | --- | --- |
+| `--pet <命名空间>` | 指定素材包（**命令行显式指定 → 坏包如实报错退出**） | — |
+| `--sprite <命名空间或目录>` | 同一件事的另一种说法，与 `--pet` 走**同一条**解析规则 | — |
+| `--action <动作>` | **播放**哪个动作（缺省 `idle`；坏动作报错并列出可用动作） | — |
+| `--list-pets` | 只读查询：列出全部素材包 + 校验结论 + 音效摘要，然后退出 | **最早**（连 `data/` 都不需要） |
+| `--list-actions` | 只读查询：列出动作名 / 帧数 / 解析后的帧率与**来源**，然后退出 | **`QApplication` 之前** |
 | `--size-level 1..10` | 指定尺寸档位；**越界当场报错退出**（不夹取） | — |
 | `--list-sizes` | 列出 10 级的倍数与像素尺寸 + 屏幕高度 + 自适应档位 | **`QApplication` 之后**（要读屏幕） |
+
+**`--fps` 已删除，不得复活**（agent.md §0：帧率由素材的 `asset.json` 决定）。
+
+`--list-actions` 的帧率来源（`asset.json` / 遗留兜底 / 默认 12）由 `pet_spec` 解析；
+启动行同样必须打印**动作 + 每帧毫秒 + 帧率来源**（task05 §4）。
 
 `--position` 属 task08，**不要**在这里提前实现。
 """
@@ -46,11 +46,13 @@ from PySide6.QtWidgets import QApplication
 from . import PROGRAM_NAME, __version__
 from . import logger as log
 from . import paths, pet_loader, size
+from .animation import UnknownActionError
 from .config import ConfigStore
 from .errors import DataDirError
 from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
 from .pet_window import PetWindow
+from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
 #: Qt 的事件循环不会自己回到解释器，没有这个心跳时 Ctrl+C 不会及时生效。
@@ -116,7 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--action",
         default=DEFAULT_ACTION,
         metavar="动作",
-        help=f"显示哪个动作的第一帧（缺省 {DEFAULT_ACTION}）",
+        help=f"播放哪个动作（缺省 {DEFAULT_ACTION}；坏动作会列出可用动作）",
     )
     parser.add_argument(
         "--list-pets",
@@ -303,24 +305,37 @@ def _install_sigint_handler(app: QApplication) -> QTimer | None:
 
 
 def _print_startup_line(window: PetWindow, level_source: str) -> None:
-    """记一行启动状态：素材包 + 动作 + 位置 + **档位/来源/像素尺寸** + 遮罩 + DPI 缩放。
+    """记一行启动状态：素材包 + 动作 + 帧率来源 + 位置 + 档位/来源/像素尺寸 + 遮罩 + DPI。
 
     位置取自窗口的**权威位置**（不是回读窗口坐标）。
     写进日志（同时上控制台）；**不写盘**、不碰配置。
 
     task04 起必须带上**档位 + 来源 + 像素尺寸**这三样：
     "宠物怎么突然变小了"这类问题，只看这一行就能判断是"沿用上次"还是"自适应"变了。
+
+    task05 起必须带上**动作 + 每帧毫秒 + 帧率来源**：
+    "怎么变快了/变慢了"只有这一行能一眼看出是 `asset.json` 改的、
+    还是掉到了遗留兜底表 / 默认 12（task05 §4）。
     """
     position = window.base_position
     width, height = window.pixel_size
     # QWidget 没有 hasMask()，遮罩要问 mask()（空区域 = 没设遮罩）。
     mask_state = "on" if not window.mask().isEmpty() else "off"
+    animation = window.animation
+    action = window.pet.action(animation.render_action)
+    source = action.fps_source.label if action is not None else "（未知）"
     _logger.info(
-        "%s %s | pet=%s action=%s pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s dpr=%.2f",
+        "%s %s | pet=%s action=%s %s mode=%s frames=%d frame_ms=%.4f fps_source=%s "
+        "pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s dpr=%.2f",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
-        window.action,
+        animation.action,
+        animation.render_action,
+        animation.mode.value,
+        animation.frame_count,
+        animation.frame_ms,
+        source,
         position.x(),
         position.y(),
         window.level,
@@ -487,18 +502,20 @@ def run(argv: list[str] | None = None) -> int:
     # 这里**不用弹窗**、直接上 stderr + 非 0 退出：`--action` 是命令行给的说法，
     # 与 `--pet` 给坏名字是同一类**用法错误**，用户就坐在终端前面。
     # （启动期致命那两处仍然弹窗：那里用户可能是双击启动的，没有终端可看。）
+    #
+    # 可用动作列表由 `animation.UnknownActionError` 统一带出来（**真值只有一处**），
+    # 这里先问一下素材、省得白建一个窗口再拆掉。
     action = str(args.action).strip() or DEFAULT_ACTION
     if not pet.has_action(action):
-        available = "、".join(pet.action_order) or "（一个都没有）"
-        message = f"素材包 {pet.namespace} 里没有动作 {action!r}；可用动作：{available}"
-        _logger.error("%s", message)
-        print(message, file=sys.stderr)
+        error = UnknownActionError(pet.namespace, action, pet.action_order)
+        _logger.error("%s", error)
+        print(str(error), file=sys.stderr)
         return _EXIT_PET_UNAVAILABLE
 
     level, level_source = _resolve_size_level(args.size_level, store, pet.cell)
 
     window = PetWindow(pet, level)
-    window.show_action_frame(action, 0)
+    window.play_action(action)
     window.showing_at_default_position()
     window.show()
 
@@ -513,7 +530,8 @@ def run(argv: list[str] | None = None) -> int:
         code = app.exec()
     finally:
         # 退出收尾。本阶段没有热键 / 音效设备 / 单实例锁要放，
-        # 只收掉自己的心跳定时器（那些属 task10 / task12 / task13）。
+        # 只收掉自己的心跳定时器与动画定时器（那些属 task10 / task12 / task13）。
+        window.stop_animation()
         if heartbeat is not None:
             heartbeat.stop()
     _logger.info("%s 退出（退出码 %d）", PROGRAM_NAME, code)

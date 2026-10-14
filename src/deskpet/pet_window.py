@@ -1,10 +1,10 @@
-"""宠物主窗口：无边框 / 置顶 / 透明背景 / 可拖动 / **按档位缩放**。
+"""宠物主窗口：无边框 / 置顶 / 透明背景 / 可拖动 / 按档位缩放 / **按素材帧率播放动画**。
 
 task01 交付了**最小可运行骨架**（占位图形 + 拖 + 退出）；task03 起窗口显示
 **真实素材的第一帧**，占位模块 `placeholder.py` 已随之删除；
-task04 起窗口尺寸由**尺寸档位**决定（10 级、屏幕自适应、右下角锚点）。
-
-动画（task05）、控制栏（task09）都不在这里。
+task04 起窗口尺寸由**尺寸档位**决定（10 级、屏幕自适应、右下角锚点）；
+task05 起窗口**持续播放动画**——帧推进由 `animation.Animation` 决定，
+本文件只负责"什么时候问下一帧、把哪一帧画出来"。
 
 **三条硬约定**：
 
@@ -17,10 +17,20 @@ task04 起窗口尺寸由**尺寸档位**决定（10 级、屏幕自适应、右
 3. **切档顺序：先重建该档的帧，再改窗口尺寸**（`迁移清单.md` §4 第 5 条）。
    反了会短暂留白或裁边——本文件的 `set_size_level()` 是唯一改档入口，
    顺序写在那一处，别在别处再拼一遍。
+
+## 动画怎么驱动（task05 §4 的调度约定）
+
+**单次 `QTimer` + 每帧重排**（``AnimationDriver``）：每一帧结束后按
+`Animation.advance()` 的返回值 `start(next_ms)` 重排下一次，**不是**固定 16 ms 空转。
+`advance()` 返回 `None`（定格 / 一次性动作停在末帧 / 片段播完）→ **不 `start()`**，
+定时器就此停住、画面不再重绘。
+
+**"不排下一次"就是这么表达的**：定时器的 `isActive()` 就是"还在播吗"。
+不需要额外的布尔开关——多一个开关就多一处能对不上的状态。
 """
 
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QElapsedTimer, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBitmap,
     QGuiApplication,
@@ -34,7 +44,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from typing import Final
+
 from . import PROGRAM_NAME, size
+from .animation import MAX_DT_MS, Animation
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
 
@@ -95,8 +108,93 @@ def region_for_image(image: QImage | None) -> QRegion | None:
         return None
 
 
+class AnimationDriver(QObject):
+    """把 `Animation` 挂到 `QTimer` 上：**每帧结束后按返回值重排下一次**。
+
+    这是 task05 §4"调度"那一节的全部实现，规则只有四条：
+
+    1. `singleShot` 定时器，每次回调只推进**一帧**，然后按 `advance()` 的返回值
+       `start(next_ms)` 重排——**不是**固定间隔空转；
+    2. `advance()` 返回 `None` → **不 `start()`**（定格 / 一次性动作停在末帧 /
+       片段播完都走这一条），定时器自己停住；
+    3. 间隔夹在 `[MIN_INTERVAL_MS, MAX_INTERVAL_MS]`：下限防忙等，
+       上限保证退出 / 信号被及时处理（agent.md §4.9）；
+    4. `dt` 用 `QElapsedTimer` 实测，交给 `Animation.advance(dt)`，
+       由它在内部夹到 `MAX_DT_MS`（休眠唤醒后不跳帧）。
+
+    **`QTimer` 不保证准点**，所以这里不写"每 83 ms 加一帧"这种假设：
+    `start(next_ms)` 的语义是"至少过这么久再叫我"，抖动不会被放大
+    （agent.md §4.9 第一条）。
+    """
+
+    #: 调度间隔下限（毫秒）：防忙等（task05 §4）。
+    MIN_INTERVAL_MS: Final[int] = 4
+    #: 调度间隔上限（毫秒）：保证退出 / 信号被及时处理。
+    MAX_INTERVAL_MS: Final[int] = 250
+
+    #: 需要显示某一帧（**帧号可能与上一帧相同**，由调用方自己判要不要重绘）。
+    frame_due = Signal()
+
+    def __init__(self, animation: Animation, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.animation = animation
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        # ⚠ **必须用 `Qt.PreciseTimer`**：Windows 的默认定时器精度是 15.6 ms，
+        # `Qt.CoarseTimer`（Qt 的默认值）会把 33 ms 的请求**向上取整到 46.8 ms**，
+        # 于是"30 fps 的素材放出来只有 21 fps"——实测 2 秒只换了 43 帧（应 60 帧）。
+        # `PreciseTimer` 实测 33.8 ms/帧，与素材的 33.3 ms 只差半毫秒。
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.timeout.connect(self._on_timeout)
+        #: 上一次推进的时刻（算 `dt` 用）。**只在 `_on_timeout` 里读**。
+        self._clock = QElapsedTimer()
+        #: 已推进的帧数（自检与诊断用；不代表"换了几张不同的图"）。
+        self.advanced_count = 0
+
+    # ------------------------------------------------------------ 对外
+
+    def start(self) -> None:
+        """开始播放：先立刻显示当前帧，再按 `frame_ms` 排下一次。"""
+        self._clock.start()
+        self.frame_due.emit()
+        self._schedule(self.animation.frame_ms)
+
+    def stop(self) -> None:
+        """停表（**不改动画状态**：定格与"播完了"是两件事，见 `PetWindow.hold`）。"""
+        self._timer.stop()
+
+    @property
+    def running(self) -> bool:
+        """是否还在排下一次换帧（**定格时为 `False`**）。"""
+        return self._timer.isActive()
+
+    @property
+    def interval_ms(self) -> int:
+        """当前排定的间隔（毫秒）；没在跑时为 `-1`。"""
+        return self._timer.interval() if self._timer.isActive() else -1
+
+    # ------------------------------------------------------------ 内部
+
+    def _on_timeout(self) -> None:
+        """一帧的回调：**先算 dt → 推进 → 显示 → 再排下一次**。"""
+        elapsed = float(self._clock.restart())
+        next_ms = self.animation.advance(elapsed)
+        self.advanced_count += 1
+        self.frame_due.emit()
+        if next_ms is None:
+            # 定格 / 播完 → **不排下一次**。定时器就此停住，画面不再重绘。
+            return
+        self._schedule(next_ms)
+
+    def _schedule(self, next_ms: float) -> None:
+        """按 `next_ms` 排下一次；夹到本类声明的上下限之内。"""
+        interval = int(round(float(next_ms)))
+        interval = max(self.MIN_INTERVAL_MS, min(self.MAX_INTERVAL_MS, interval))
+        self._timer.start(interval)
+
+
 class PetWindow(QWidget):
-    """宠物主窗口（task04：按尺寸档位显示缩放后的静态第一帧）。"""
+    """宠物主窗口（task05：按素材帧率持续播放当前动作）。"""
 
     def __init__(
         self,
@@ -119,15 +217,23 @@ class PetWindow(QWidget):
 
         #: 当前显示的帧（**已缩放**，窗口尺寸就是它的尺寸）。
         self._frame_image = QImage()
-        #: 本 task 显示的动作名（回退之后的实际名字，可能不是 "idle"）。
+        #: 当前动作名（**权威来源是 `self._animation.action`**，这里保留一份是为了
+        #: 让"窗口显示的是哪个动作"在窗口自己身上问得到）。
         self._action = _pick_action(pet, DEFAULT_ACTION)
-        #: 当前帧序号（task05 会逐帧推进；本 task 一直是 0）。
+        #: 当前帧序号（**权威来源是 `self._animation.index`**）。
         self._frame_index = 0
 
         #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位（task06 还要加镜像）。
         self._renderer = FrameRenderer(pet, self._device_pixel_ratio())
         #: 当前档位。`None` 表示还没定（构造时要么给 level、要么自适应）。
         self._level = 0
+
+        #: 帧推进器（纯逻辑）+ 驱动它的定时器（本文件唯一的调度点）。
+        self._animation = Animation(pet, self._action)
+        self._driver = AnimationDriver(self._animation, self)
+        self._driver.frame_due.connect(self._on_frame_due)
+        #: 已经显示过的帧号（**用来跳过无变化的重绘**，见 `_on_frame_due`）。
+        self._shown_index: int | None = None
 
         self._setup_window()
         self._apply_level(self._resolve_initial_level(level))
@@ -220,11 +326,19 @@ class PetWindow(QWidget):
         """
         self._level = size.clamp_level(level)
 
-        pixmap = self._renderer.frame(self._action, self._frame_index, self._level)
+        # **按动画当前那一帧**重新渲染（不是 `self._frame_index` 快照）：
+        # 动画正在播时帧号一直在动，切档必须跟上动画的当前帧，
+        # 否则会出现"换了档但画面停在旧帧"。
+        pixmap = self._renderer.frame(
+            self._animation.render_action, self._animation.index, self._level
+        )
         if not pixmap.isNull():
             # 缓存里的 QPixmap 是**共享**的，转成 QImage 时 Qt 会做一次深拷贝，
             # 于是 `_frame_image` 与缓存互不影响（后续要画/要算遮罩）。
             self._frame_image = pixmap.toImage()
+            self._frame_index = self._animation.index
+            self._action = self._animation.render_action
+            self._shown_index = self._animation.index
 
         width, height = self.pixel_size
         self.setFixedSize(width, height)
@@ -260,8 +374,18 @@ class PetWindow(QWidget):
 
     @property
     def action(self) -> str:
-        """当前显示的动作名（回退之后的实际值）。"""
-        return self._action
+        """当前显示的动作名（**与动画一致**，回退之后的实际值）。"""
+        return self._animation.action
+
+    @property
+    def frame_index(self) -> int:
+        """当前显示的帧序号（与动画一致）。"""
+        return self._frame_index
+
+    @property
+    def animation(self) -> Animation:
+        """帧推进器（只读；**切换动作请用 `play_action()`**，它会同步驱动与画面）。"""
+        return self._animation
 
     @property
     def frame_image(self) -> QImage:
@@ -291,6 +415,75 @@ class PetWindow(QWidget):
         self.apply_mask(self._frame_image)
         self.update()
         return True
+
+    # ------------------------------------------------------------ 动画
+
+    def play_action(
+        self,
+        action: str,
+        *,
+        fps_override: float | None = None,
+        auto_start: bool = True,
+    ) -> None:
+        """把窗口切到 ``action`` 并开始播放（**换动作的唯一入口**）。
+
+        动作不存在 → `animation.UnknownActionError`（**带可用动作列表**），
+        由调用方（`app.py`）决定怎么报错——本函数不吞异常，
+        因为"用户敲了一个不存在的动作"必须如实说出来（task05 §2 第 4 条）。
+
+        ``fps_override`` 只用于调试，**不写回配置**（task05 §4）。
+        ``auto_start=False`` 时只摆好第一帧不排定时器（自检用）。
+        """
+        self._animation.set_action(action)
+        if fps_override is not None:
+            self._animation.set_fps_override(fps_override)
+
+        self._action = self._animation.action
+        self._shown_index = None
+        # 先把第一帧放上去，再开表：开表后 `frame_due` 会立刻来一次，
+        # 那一次会因为"帧号没变"而跳过重绘（`_on_frame_due`）。
+        self.show_action_frame(self._animation.render_action, self._animation.index)
+        if auto_start:
+            self._driver.start()
+        else:
+            self._driver.stop()
+
+    def stop_animation(self) -> None:
+        """停表但**保留当前画面**（定格是另一回事，见 `hold_frame()`）。"""
+        self._driver.stop()
+
+    def hold_frame(self, index: int) -> None:
+        """定格在第 ``index`` 帧；**画面完全不动，也不再排下一次换帧**。
+
+        越界帧号 → `animation.FrameIndexError`（**报错而不是画空白**）。
+        """
+        self._animation.hold(index)
+        self._driver.stop()
+        self.show_action_frame(self._animation.render_action, self._animation.index)
+
+    def release_hold(self) -> None:
+        """解除定格并继续播放。"""
+        self._animation.release_hold()
+        self._driver.start()
+
+    def _on_frame_due(self) -> None:
+        """`AnimationDriver` 说"该显示这一帧了"。
+
+        **帧号没变就不重绘**：单帧动作与"区间只有一帧"的片段会让推进原地不动，
+        这时每 33 ms 重画同一张图纯属浪费（还白白偏高 CPU）。
+        遮罩同理——同一帧的形状没必要重算（agent.md §2.8"同动作同档位内复用"）。
+        """
+        index = self._animation.index
+        render_action = self._animation.render_action
+        if index == self._shown_index and render_action == self._action:
+            return
+        if self.show_action_frame(render_action, index):
+            self._shown_index = index
+        else:
+            # 这一帧读不出来（文件坏了 / 被删了）：**保留上一张画面**并停表，
+            # 免得每 33 ms 重试一次同样的读盘失败（§2.10 第三类：退化 + 记日志）。
+            self._shown_index = None
+            self._driver.stop()
 
     # ------------------------------------------------------------ 位置
 
