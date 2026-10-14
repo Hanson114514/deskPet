@@ -48,7 +48,9 @@ from . import logger as log
 from . import paths, pet_loader, size
 from .animation import UnknownActionError
 from .config import ConfigStore
+from .cursor_watch import CursorWatch
 from .errors import DataDirError
+from .idle_state import IdleStateMachine, normalize_idle_seconds
 from .mirror import MirrorState
 from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
@@ -58,6 +60,11 @@ from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收�
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
 #: Qt 的事件循环不会自己回到解释器，没有这个心跳时 Ctrl+C 不会及时生效。
 _SIGNAL_HEARTBEAT_MS = 200
+
+#: 久置状态机的 tick 间隔（毫秒）。计时本身是**状态机 + 定时器**（agent.md §4.8），
+#: 不是"每个动画帧减一次"——后者在窗口隐藏、精灵停帧之后就永久停住了。
+#: 250 ms 的粒度对"20 秒后张望"这件事足够（误差至多一个 tick）。
+IDLE_TICK_MS = 250
 
 #: `--action` 的默认值。**它是"首选"而不是"必须有"**：素材里没有 `idle` 时
 #: 按 `action_order` 的第一个动作退化（见 `pet_window._pick_action`）。
@@ -521,7 +528,15 @@ def run(argv: list[str] | None = None) -> int:
     # 读操作只读——不会因为"打开程序"就把 mirror 写回配置。
     mirror = MirrorState(store)
 
-    window = PetWindow(pet, level, mirror=mirror)
+    # 久置状态机（task07）：`idle_seconds` 通过**回调现读**，不在构造时快照——
+    # 于是程序内改配置（`set()` / `reload()`，将来 task11 那类"改完立刻生效"）不用重建状态机。
+    # ⚠ 但**只改磁盘上的 `config.json` 不会生效**：`ConfigStore` 是内存快照，
+    # 那种改法要重启（task07 §6 第 2 条也是按"重启后生效"写的）。
+    # 读出来的值由 `normalize_idle_seconds()` 兜底 + 夹下限（配置是"读取永不致命"
+    # 的那一类，绝不能让静置行为因为它失效）。
+    idle_state = IdleStateMachine(lambda: normalize_idle_seconds(store.get("idle_seconds")))
+
+    window = PetWindow(pet, level, mirror=mirror, idle_state=idle_state)
     window.play_action(action)
     window.showing_at_default_position()
     window.show()
@@ -530,6 +545,18 @@ def run(argv: list[str] | None = None) -> int:
 
     heartbeat = _install_sigint_handler(app)
 
+    # 光标轮询 → 状态机 → 动作切换，这条链路的三个环节分别住在
+    # `cursor_watch`（怎么知道动了）/ `idle_state`（该不该切）/
+    # `pet_window`（切到哪个动作）里。**计时不挂在动画帧回调上**（agent.md §4.8）。
+    cursor_watch = CursorWatch()
+    cursor_watch.moved.connect(idle_state.on_mouse_moved)
+    cursor_watch.start()
+
+    idle_timer = QTimer()
+    idle_timer.setInterval(IDLE_TICK_MS)
+    idle_timer.timeout.connect(idle_state.on_tick)
+    idle_timer.start()
+
     if args.exit_after is not None and args.exit_after >= 0:
         QTimer.singleShot(int(args.exit_after * 1000), window.close)
 
@@ -537,8 +564,13 @@ def run(argv: list[str] | None = None) -> int:
         code = app.exec()
     finally:
         # 退出收尾。本阶段没有热键 / 音效设备 / 单实例锁要放，
-        # 只收掉自己的心跳定时器与动画定时器（那些属 task10 / task12 / task13）。
+        # 只收掉自己的心跳定时器、久置计时器与光标轮询
+        # （音效 / 热键 / 单实例锁属 task10 / task12 / task13）。
         window.stop_animation()
+        idle_timer.stop()
+        # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
+        # 留着会让"退出后还有残留"（task07 §6 最后一条）。
+        cursor_watch.stop()
         if heartbeat is not None:
             heartbeat.stop()
     _logger.info("%s 退出（退出码 %d）", PROGRAM_NAME, code)

@@ -62,6 +62,7 @@ from . import PROGRAM_NAME, size
 from . import context_menu
 from .animation import MAX_DT_MS, Animation
 from .context_menu import MenuState
+from .idle_state import IdleStateMachine
 from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
@@ -77,6 +78,10 @@ DEFAULT_ACTION = "idle"
 #: 动作名用 2025 定案的下划线写法（`sit` 已作废，**不做别名**，agent.md §0）。
 REST_ACTION = "rest"
 REST_STANDUP_ACTION = DEFAULT_ACTION
+
+#: 久置状态机各阶段对应的动作名。**真值是 `idle_state.Stage.value` 本身**
+#: （阶段名与动作名同形就是为此），这里只做一次显式核对，不另立一张表。
+IDLE_ACTION = DEFAULT_ACTION
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
@@ -222,6 +227,7 @@ class PetWindow(QWidget):
         level: int | None = None,
         parent: QWidget | None = None,
         mirror: MirrorState | None = None,
+        idle_state: IdleStateMachine | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -249,9 +255,17 @@ class PetWindow(QWidget):
         #: 当前帧序号（**权威来源是 `self._animation.index`**）。
         self._frame_index = 0
         #: "手动坐下休息"（右键菜单点出来的休息）。
-        #: ⚠ 它与自动的久置状态机（task07）**不是一回事**：那个要计时、会自动切回，
-        #: 这个只是一次手动动作切换，不做任何计时（task06 §5 明确划界）。
+        #: ⚠ 它的**权威来源是 `self._idle` 状态机的 `manual` 开关**（task07 接线后）；
+        #: 本字段只是"没有状态机时"（自检里 `idle_state=None`）的退化副本，
+        #: 两者由 `manual_rest` 属性统一读出，不要把判断写在这个字段上。
         self._manual_rest = False
+
+        #: 久置状态机（task07）。**没有配置/没有定时器时可以是 `None`**
+        #: ——窗口本身不负责"什么时候 tick"，那由 `app.py` 的 `QTimer` 驱动；
+        #: 这里只做两件事：把输入转成状态机的输入、按 `stage_changed` 切动作。
+        self._idle: IdleStateMachine | None = idle_state
+        if self._idle is not None:
+            self._idle.stage_changed.connect(self._on_stage_changed)
 
         #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位**与镜像**（task06 已补齐）。
         self._renderer = FrameRenderer(pet, self._device_pixel_ratio())
@@ -630,8 +644,63 @@ class PetWindow(QWidget):
 
     @property
     def manual_rest(self) -> bool:
-        """当前是不是"手动坐下休息"（右键菜单点出来的那次）。"""
+        """当前是不是"手动坐下休息"（右键菜单点出来的那次）。
+
+        **权威来源是久置状态机的 `manual` 开关**（task07）：菜单文字与
+        "自动计时该不该管它"都由它决定。没有状态机时退回本类自己的退化字段。
+        """
+        if self._idle is not None:
+            return self._idle.manual
         return self._manual_rest
+
+    @property
+    def idle_state(self) -> IdleStateMachine | None:
+        """久置状态机（只读；没有接线时是 `None`）。**计时不在这里推进**。"""
+        return self._idle
+
+    def _on_stage_changed(self, old: object, new: object) -> None:
+        """久置阶段变了：切到**同名动作**（`idle` / `waiting` / `rest`）。
+
+        阶段名与动作名同形（`idle_state.Stage.value`），所以映射就是 `str(new)`，
+        **不另立一张映射表**——两张表迟早会对不上。
+
+        素材里没有这个动作时**什么都不做**（"缺动作就不切"，agent.md §2.5：
+        不许为找不到的动作硬塞替身）；被挂起时也不可能收到本信号
+        （状态机自己在挂起期间不发 `stage_changed`，见例外的第 ② 条）。
+        """
+        action = str(getattr(new, "value", new))
+        if not self.pet.has_action(action):
+            return
+        self.play_action(action)
+
+    def exit_manual_rest(self) -> bool:
+        """退出 `manual`（主动坐姿）并站起来；返回是否真的退出了。
+
+        退出方式有三条（task07 §4）：**再次点菜单 / 双击宠物 / 拖动**。
+        task08 接线拖动，本类先把入口暴露出来。
+        """
+        if self._idle is None:
+            if not self._manual_rest:
+                return False
+            self._manual_rest = False
+            if self.pet.has_action(REST_STANDUP_ACTION):
+                self.play_action(REST_STANDUP_ACTION)
+            return True
+        return self._idle.exit_manual()
+
+    def set_action_suspended(self, suspended: bool) -> None:
+        """把**动作控制权**交给外部（拖动中）或收回。
+
+        例外的第 ② 条（task07 §4）：挂起期间计时**归零但不切动作**，
+        由拖动逻辑按方向播跑动。**本 task 只暴露接口**，接线在 task08。
+        """
+        if self._idle is not None:
+            self._idle.set_suspended(suspended)
+
+    def on_mouse_moved(self) -> None:
+        """把"鼠标动了"转成状态机的输入（由 `app.py` 的光标轮询驱动）。"""
+        if self._idle is not None:
+            self._idle.on_mouse_moved()
 
     def can_rest(self) -> bool:
         """素材里有没有 `rest`（"缺动作就不切"，agent.md §2.5）。"""
@@ -647,7 +716,7 @@ class PetWindow(QWidget):
         can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
         return MenuState(
             action=action,
-            manual_rest=self._manual_rest,
+            manual_rest=self.manual_rest,
             mirror_on=can_mirror and self.mirrored,
             can_mirror=can_mirror,
             can_rest=self.can_rest(),
@@ -707,26 +776,32 @@ class PetWindow(QWidget):
     def toggle_rest(self) -> None:
         """`坐下休息` ↔ `站起来`（**同一个菜单项**，id 恒为 `action`）。
 
-        只做**一次手动动作切换**，不做任何计时——"久置自动张望/坐下"是 task07
-        的状态机，两者别混（task06 §5 明确划界）。
+        task07 起它接的是**状态机的 `manual` 模式**：点一次进入主动坐姿
+        （计时停摆、鼠标怎么动都不影响它），再点一次站起来回 `auto`。
+        菜单文字由 `MenuState.manual_rest` 现算，所以切完不用手工改文字。
 
         素材里没有 `rest` 时**什么都不做**（"缺动作就不切"，
         agent.md §2.5：不许为找不到的动作硬塞替身）。
         """
-        if self._manual_rest:
-            target = REST_STANDUP_ACTION
-            if not self.pet.has_action(target):
-                return
-            self._manual_rest = False
-        else:
-            target = REST_ACTION
-            if not self.pet.has_action(target):
-                return
-            self._manual_rest = True
+        if not self.can_rest():
+            return
 
-        # 切动作会重建帧与遮罩（走 `play_action` → `show_action_frame`）。
-        # 镜像不必在这里处理：新动作自己那份记忆由 `mirrored` 现算。
-        self.play_action(target)
+        if self._idle is not None:
+            # 状态机知情：进入/退出 `manual` 由它同时**重置静置计时**
+            # （否则"站起来"之后可能立刻又被自动计时拽回休息）。
+            if self._idle.manual:
+                self._idle.exit_manual()
+            else:
+                self._idle.enter_manual()
+            return
+
+        # 没有状态机（自检）时的退化路径：只做一次手动动作切换。
+        if self._manual_rest:
+            self._manual_rest = False
+            self.play_action(REST_STANDUP_ACTION)
+        else:
+            self._manual_rest = True
+            self.play_action(REST_ACTION)
 
     # ------------------------------------------------------------ 遮罩
 
@@ -781,6 +856,17 @@ class PetWindow(QWidget):
             self._press_global = None
             self.unsetCursor()
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """双击宠物：**退出 `manual` 坐姿**（task07 §2 第 6 条）。
+
+        本 task **不做**"双击挥手"那个手势（属 task10），只做这一件事：
+        用户双击的意思是"别一直坐着了"，于是站起来回 `auto` 模式。
+        不在 `manual` 里时**什么都不做**——不抢 task10 的手势。
+        """
+        if event.button() == Qt.LeftButton and self.manual_rest:
+            self.exit_manual_rest()
+        super().mouseDoubleClickEvent(event)
 
 
 def _pick_action(pet: PetSpec, preferred: str) -> str:
