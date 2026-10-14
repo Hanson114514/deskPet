@@ -15,9 +15,10 @@
 | **透明** | 素材是**透明背景 PNG**（用户重做素材提供），运行时**没有色键步骤** | 旧实现的 `#FF00FF` 色键、色键吸附容差 6、RGB 烘焙、"必须不带 alpha"全部**作废** |
 | **点击穿透** | **`setMask(QRegion)`**，按当前帧不透明像素生成窗口区域 | 区域外是真穿透；代价是**边缘锯齿**（已知、接受）；**`hitmask.json` 不再需要** |
 | **项目命名** | 统一为 **`deskPet`**（仓库/项目名）+ **`deskpet`**（Python 包名/模块前缀） | 日志名 `deskpet.log`、自启项 `deskpet.lnk`/`deskpet.cmd`、配置目录 `data/` |
-| **动作名** | `idle` / `running-left` / `running-right` / `jumping` / **`waiting`** / `sit` | 旧名 `review` **作废**；`rest` 从未使用。镜像状态名与动作名同形 |
-| **帧率** | 由素材 `asset.json` 的 `actions.<动作>.fps` 决定；缺失 → 遗留兜底表 → **12** | **用户自己给三个包补 `fps`**；`--fps` 已删除 |
-| **镜像翻转** | 右键菜单**一条** `镜像翻转`，只翻转当前状态，按状态分别记忆写入 `config.mirror` | 适用范围只有 `idle` / `waiting` / `sit` |
+| **动作名** | `idle` / `running_left` / `running_right` / `waiting` / **`rest`** / **`waving`**（**下划线**写法，**2025 用户定案**） | 旧名 `review` **作废**（→ `waiting`）；`sit` **作废**（→ `rest`）；`jumping` **作废**（→ `waving`，交互动作）。镜像状态名与动作名同形 |
+| **默认形象** | **`weedy`**（2025 用户定案：`phoebe` 不再重做，"最多当成补充包用户导入"） | 真值只在 `pet_spec.DEFAULT_PET_NAMESPACE` 一处 |
+| **帧率** | 由素材 `asset.json` 的 `actions.<动作>.fps` 决定；缺失 → 遗留兜底表 → **12** | **两个自带包已经全部写了 `fps: 30.0`**，遗留表实际不会被触发；`--fps` 已删除 |
+| **镜像翻转** | 右键菜单**一条** `镜像翻转`，只翻转当前状态，按状态分别记忆写入 `config.mirror` | 适用范围只有 `idle` / `waiting` / **`rest`** |
 | **截屏 / 录屏** | **本阶段不做**（迁移清单里没有此需求） | 不占 task 编号 |
 
 ---
@@ -63,9 +64,9 @@ C:\projects\deskPet\
 | `logger.py` | 基础 | 日志装配、启动分隔行、崩溃兜底（只依赖标准库） |
 | `errors.py` | 基础 | 项目异常基类 |
 | `config.py` | 基础 | 配置默认值表 + `Config` + `ConfigStore`（原子读写 / 类型校验 / `has()`） |
-| `nsrules.py` | 数据 | 命名空间白名单校验 |
-| `pet_spec.py` | 数据 | `PetSpec` / `ActionSpec` + **帧率解析**（唯一实现） |
-| `pet_loader.py` | 数据 | 两根扫描、`asset.json` 解析、**一次性列全校验** |
+| `nsrules.py` | 数据 | 命名空间白名单校验（长度 / 禁用字符 / 首尾空白 / 结尾点） |
+| `pet_spec.py` | 数据 | `PetSpec` / `ActionSpec` + **帧率解析**（唯一实现）；规范动作集与默认形象的真值 |
+| `pet_loader.py` | 数据 | 两根扫描、`asset.json` 解析、**一次性列全校验**、统一解析"一个说法"、`load_frame_image()` |
 | `size.py` | 数据 | 10 级档位（精确有理数）、像素换算、屏幕自适应、夹取 |
 | `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转） |
 | `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 |
@@ -86,7 +87,6 @@ C:\projects\deskPet\
 | `settings.py` | 视图 | 设置窗口（字段描述表驱动） |
 | `keycapture.py` | 视图 | 快捷键录入控件 |
 | `app.py` | 装配 | `QApplication` 引导、命令行解析、启动编排、信号接线、退出收尾 |
-| `placeholder.py` | 临时 | task01 的占位图形，task03 之后应删除 |
 
 ---
 
@@ -129,7 +129,7 @@ C:\projects\deskPet\
 | `action_changed(action)` | 动画/控制器 | 当前动作已经换成 `action` |
 | `frame_advanced(next_ms)` | 动画 | 前进了一帧；**`next_ms` 是距下一帧的毫秒数（`None` = 定格，不排下一次）** |
 | `sequence_done()` | 动画 | 片段序列播完 |
-| `stage_changed(old, new)` | 久置状态机 | 姿势阶段变化（`idle` / `waiting` / `sit`） |
+| `stage_changed(old, new)` | 久置状态机 | 姿势阶段变化（`idle` / `waiting` / `rest`） |
 | `timer_reset()` | 久置状态机 | **只归零计时，不切动作**（两个例外的表达） |
 | `position_changed(pos)` | 宠物窗口 | 窗口位置变了（拖动结束/夹取后） |
 | `size_level_changed(level)` | 尺寸控制器 | 档位变了 |
@@ -176,7 +176,7 @@ C:\projects\deskPet\
 | `idle_seconds` | int | `20` | 久置时间（秒）。界面量程 5–300；**判定时读**，下限夹到 1 |
 | `size_level` | int | 第 6 级 | 上次用的**档位**（1–10）。存档位不存像素；默认值**引用 `size.DEFAULT_LEVEL`**（task02 期间的真值是 `config.DEFAULT_SIZE_LEVEL`，task04 改成引用尺寸模块） |
 | `position` | str | `""` | 上次拖动到的左上角，格式 `"x,y"`（物理像素）；空串 = 贴右下角。**用字符串**与命令行说法一致 |
-| `mirror` | object | `{}` | **按状态记忆的镜像翻转**：`{"idle": true, "sit": false}`；只允许 `idle` / `waiting` / `sit` 三个键；值必须是 bool |
+| `mirror` | object | `{}` | **按状态记忆的镜像翻转**：`{"idle": true, "rest": false}`；只允许 `idle` / `waiting` / `rest` 三个键；值必须是 bool |
 
 **通用规则（逐条遵守）**：
 
@@ -216,14 +216,14 @@ C:\projects\deskPet\
 
 ```json
 {
-  "name": "菲比",
-  "description": "金发紫瞳的Q版菲比，陪你思考、等待和完成工作。",
-  "cell": [250, 250],
+  "name": "温蒂",
+  "description": "温蒂：待机、挥手、左右走动、张望与休息。",
+  "cell": [500, 500],
   "actions": {
-    "idle": {"frames": ["idle_00.png", "idle_01.png"], "fps": 8.0},
-    "sit":  {"frames": ["sit_00.png", "sit_01.png"], "fps": 8.25}
+    "idle": {"frames": ["idle_00.png", "idle_01.png"], "fps": 30.0},
+    "rest": {"frames": ["rest_00.png", "rest_01.png"], "fps": 30.0}
   },
-  "sounds": {"sit": "phoebe_chubby_0.mp3", "chime": null}
+  "sounds": {"rest": "phoebe_chubby_0.mp3", "chime": null}
 }
 ```
 
@@ -231,25 +231,31 @@ C:\projects\deskPet\
 | --- | --- | --- | --- |
 | `name` | 否 | str | 展示名。缺失/空白 → 退回命名空间（**不显示"未命名"**） |
 | `description` | 否 | str | 一句话说明；非字符串 → 空串 |
-| `cell` | **是** | `[数, 数]`（**数组不是对象**） | 两个**正数**；布尔不算；必须等于帧文件实际像素尺寸 |
+| `cell` | **是** | `[数, 数]`（**数组不是对象**） | 两个**正数**；布尔不算；必须等于帧文件实际像素尺寸。**实际核对只对"第一个动作的第一帧"做一次，且只算警告**（`pet_loader._frame_issues`）：对不上时画面照样能出，不值得让整个包不可用 |
 | `actions` | **是** | 对象 | 动作名 → `{"frames": [...], "fps": 数}` |
-| `actions.<动作>.frames` | **是** | 数组 | 帧文件名（相对 `frames/`）；**顺序即播放顺序**；一律写全，不猜规律 |
-| `actions.<动作>.fps` | 否 | 数（**可为小数**） | 该动作每秒帧数。**缺失/非法 → 走帧率优先级**（见 §2.7）。注意：**每帧毫秒在动画层会被 `float` 化** |
-| `sounds` | 否 | 对象 | 逻辑名 → 文件名或 `null`。**只认声明**，没有兜底表 |
+| `actions.<动作>.frames` | **是** | 数组 | 帧文件名（相对 `frames/`）；**顺序即播放顺序**；一律写全，不猜规律。空数组 / 非字符串项算**问题**（不是"跳过就算"） |
+| `actions.<动作>.fps` | 否 | 数（**可为小数**） | 该动作每秒帧数。**缺失/非法 → 走帧率优先级**（见 §2.7）。**解析在加载层一次算清**，对外只给 `frame_ms = 1000.0 / fps`（浮点） |
+| `sounds` | 否 | 对象 | 逻辑名 → 文件名或 `null`。**只认声明**，没有兜底表。`null` 记为 `""`（"声明了但没有文件"）；非字符串值丢弃 + 一条警告（**不是**致命问题） |
 
-- **读取用 `utf-8-sig`**（容 BOM）；**写用无 BOM 的 `utf-8`**。
+- **读取用 `utf-8-sig`**（容 BOM）；**写用无 BOM 的 `utf-8`**。task03 实测：带 BOM 的索引能正常解析。
 - `asset.json` 是"人写一半、工具写一半"：切帧工具会**整个重写**它，
   但必须先把它认得的人写键（`name` / `description` / `sounds` / **各动作的 `fps`**）原样搬过去。
 - 动作名以素材 `actions` 的键为准，**素材里有几个就是几个**：不补、不改名、不造别名，
-  代码侧**不许**为找不到的动作硬塞替身（缺 `jumping` 就不跳，按可恢复路径退化）。
-- 当前自带素材（`assets/weedy`、`assets/weedy_sightseer`）的实际键是
-  `idle` / `waving` / `running_left` / `running_right` / `waiting` / `rest`
-  （`weedy_sightseer` 另有 `温蒂-倾听-基建-Special-x1`）；抽帧工具见 §4.12。
-- **⚠ 与 §0 的规范动作集不一致**（用户 2025 决定：**就按素材文件名走**）：这里是
-  **下划线**写法 `running_left` / `running_right`，休息叫 `rest`，
-  且**没有 `jumping`**；而 §0 与 `迁移清单.md` D12 写的是
-  `running-left` / `running-right` / `sit` / `jumping`。`review` 依旧作废。
-  两套说法的取舍见 §5 的 **D14**（**task03 之前必须定案**）。
+  代码侧**不许**为找不到的动作硬塞替身（缺 `waving` 就不挥手，按可恢复路径退化）。
+- **当前实际素材状态（2025-10 task03 实测，后面几个 task 的验收基线）**：
+
+  | 包 | 命名空间 | 展示名 | 动作数 | 音效 | `cell` | alpha |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 温蒂 | `weedy` | 温蒂 | **6**（`idle`/`rest`/`running_left`/`running_right`/`waiting`/`waving`） | 无 | `[500, 500]` | 1 位（只有 0/255） |
+  | 温蒂（倾听） | `weedy_sightseer` | 温蒂（倾听） | **7**（多 `温蒂-倾听-基建-Special-x1`，600 帧） | 无 | `[500, 500]` | 1 位 |
+
+  `assets/phoebe/` **不存在**（2025 用户定案：不再重做；要的话当用户补充包导入）。
+  抽帧工具见 §4.12。
+- **规范动作集已经统一**（2025 用户定案，见 §5 的 **D14**）：
+  编程侧与素材侧都用**下划线**写法 `running_left` / `running_right`，
+  休息叫 `rest`、交互动作叫 `waving`；`review` / `sit` / `jumping` **全部作废**。
+  §0 与 `迁移清单.md` D12 的旧写法（`running-left` / `sit` / `jumping`）只保留在
+  **遗留兜底帧率表**里（它按旧键名查表，与现行素材名不再相交，因此实际不会被触发）。
 
 ### 2.6 线程通信约定
 
@@ -283,7 +289,17 @@ C:\projects\deskPet\
 | 真值只一处 | 遗留表与 `DEFAULT_FPS` **各只允许定义一处**，其它模块引用它 |
 | 坏 `fps` | 非数字 / `bool` / `<= 0` / NaN → 丢弃 + 一条警告，**按"没有 fps"继续走下一层**，绝不抛异常 |
 | 命令行 | **`--fps` 已删除，不得复活** |
-| 遗留表何时删 | 三个自带包补上 `fps` 之后即可整体删除（属"改素材"，需用户同意） |
+| 遗留表何时删 | 用户补完 `fps` 之后即可整体删除（**D9**）。**当前两个包已经全部写了 `fps: 30.0`，遗留表实际一次都不会被触发**——它现在只剩"用户把 `fps` 删掉时观感不变"这一层意义 |
+
+**task03 已落地的实现**（后面只做消费，不要另起一套）：
+
+- 唯一实现是 `pet_spec.resolve_frame_rate(action, raw_fps) -> (fps, FrameRateSource)`
+  与 `pet_spec.frame_ms_for(action, raw_fps) -> (fps, frame_ms, source)`；
+  坏值判定收在 `pet_spec.normalize_fps()` 一处（`bool` / 非数字 / `<= 0` / NaN / ±inf 全挡）。
+- `LEGACY_ACTION_FPS` 与 `DEFAULT_FPS` 各只有一处定义（`pet_spec.py`），
+  模块级断言守着"遗留表键集合没被改过"。
+- `ActionSpec` 对外暴露 `frame_ms` / `fps` / `fps_source` / `frame_count`；
+  `--list-actions` 打印的就是这三样（外加帧数）。
 
 ### 2.8 透明、命中判定与镜像的约定
 
@@ -303,7 +319,7 @@ C:\projects\deskPet\
 | 已知代价 | `QRegion` 是**二值、无抗锯齿**的 → **边缘会有锯齿**。这是本方案明确的取舍，**不要求本阶段解决**；观察到的现象与严重程度要写进本文件 §4.9 |
 | 坐标 | 掩码与判定用**窗口内的物理像素**（`event.position()`）；位移用**全局坐标**（`event.globalPosition()`）；**两者不可混用** |
 | 降级（**永不抛异常**） | 帧图为空 / 区域算不出来 / 帧号越界 / 动作不存在 → **退化为不设遮罩（整帧可点）**，绝不抛异常 |
-| 镜像 | **只作用于 `idle` / `waiting` / `sit`**（待机 + 休息两类状态）；**水平镜像，在渲染层做**；不改素材 |
+| 镜像 | **只作用于 `idle` / `waiting` / `rest`**（待机 + 休息两类状态）；**水平镜像，在渲染层做**；不改素材 |
 | 镜像记忆 | **按状态分别记忆**，写进 `config.json` 的 `mirror`；下次切回该状态**沿用上次** |
 | 镜像与缓存 | 帧缓存键 = `(动作, 帧序号, 档位, 镜像)` —— **漏掉镜像 = "翻转后拿到未翻转的图"** |
 | 镜像与锚点 | 水平翻转折点对称，**不影响**锚点与档位（"右下角锚点不动"仍成立） |
@@ -318,6 +334,18 @@ C:\projects\deskPet\
   **没有 alpha 通道 = 整块不透明**（返回整幅区域）；带 `devicePixelRatio` 的图**先折回逻辑尺寸**再生成区域
   （否则能点到的范围比看到的大一圈，高 DPI 下必现）。
 - 消费者是 `PetWindow.apply_mask(image)`，返回"是否真的设上了遮罩"；区域为空 → `clearMask()`。
+
+**task03 接入真实素材后的实测（2560×1440 / 100%）**：
+
+- 窗口尺寸 = 素材 `cell` = **500×500**（task03 不缩放、不选档位），落点 `(2036, 916)`，
+  距右边缘与下边缘仍各 24 逻辑单位；
+- **遮罩是真的按素材 alpha 生成的**：`mask=on`；`WindowFromPoint` 在人物中心返回**本进程窗口**、
+  在窗口四角返回**别的窗口/桌面** → 区域外仍然是真穿透（判据同 task01）；
+- **没有引入任何色键步骤**：`load_frame_image()` 只做"读 PNG → 转
+  `Format_ARGB32_Premultiplied`"，全仓库搜不到 `FF00FF` / `hitmask`；
+- 抓屏比对：窗口内四角颜色与窗口外桌面**完全相同**（`(21,21,23)`），
+  说明那块真的没被画上东西（**不能用 alpha 判断透明度**：`QScreen.grabWindow(0)`
+  抓的是合成后的屏幕，每个像素 alpha 都是 255 —— 见 §4.9 新增的那条）。
 
 ### 2.9 命名空间白名单（素材包目录名）
 
@@ -482,6 +510,9 @@ C:\projects\deskPet\
 | **`Qt.Tool` 窗口不会让事件循环退出** | Qt **不为 `Qt.Tool` 设 `WA_QuitOnClose`**（实测为 `False`），而 `Qt.Tool` 也不计入"最后一个主窗口" → `close()` 之后 `app.exec()` **不返回**、进程留在后台（"Esc 退不掉"）。**必须**显式 `setAttribute(Qt.WA_QuitOnClose, True)`。task01 实测 |
 | **`QWidget` 没有 `hasMask()`** | 遮罩要问 `mask()`：`window.mask().isEmpty()` 才是"没设遮罩"。写 `hasMask()` 会 `AttributeError`（task01 实际踩到，启动即崩） |
 | **offscreen 平台插件不支持 `setMask`** | 用 `QT_QPA_PLATFORM=offscreen` 跑自检时，插件会直接打印 `This plugin does not support setting window masks`，"遮罩生效"**测不出来**。**点击穿透必须在真平台上验证**；可自动化的事实是 Win32 `WindowFromPoint`——真机返回**另一个窗口**才算真穿透（task01 用它拿到了结论） |
+| **`QScreen.grabWindow(0)` 的 alpha 永远是 255** | 它抓的是**合成后**的屏幕，桌面本身不透明，所以"截图里窗口四角 alpha=0"这条**测不出透明**（task03 第一版自检就栽在这里，看到"4/4 个角 alpha=255"误以为没抠底）。**验证透明只有两条路**：① 颜色比对——窗口内空白区与窗口外桌面**同色**；② `WindowFromPoint` 判穿透。想直接看 alpha，只能读**帧图本身**（`load_frame_image()` 的返回值），不要经抓屏 |
+| **`show_fatal_error()` 是模态的，会阻塞事件循环** | 它内部 `dialog.exec()`。所以在**已经建了 `QApplication`** 之后调用它，进程会停在那里等用户点确定——命令行自动化跑不下去，`--exit-after` 也救不了（timer 根本没机会触发）。**规矩**：只读查询（`--list-pets` / `--list-actions`）与命令行给错值（`--pet` / `--action` 指向不存在的东西）**都放在建 `QApplication` 之前**，用 stderr + 非 0 退出码收场；弹窗只留给"用户可能是双击启动、没有终端可看"的**启动期致命**（`data/` 建不出来、连默认形象都不可用） |
+| **PNG 尺寸不能读在偏移 8** | PNG 是"签名(8) + chunk 长度(4) + chunk 类型(4) + 宽(4) + 高(4)"，所以**宽度在偏移 16**。读在 8 会拿到 chunk 长度（13）。task03 实际踩到：`cell` 一致性检查报出荒唐的 `13 × 1229472850`。判据：先验 `header[12:16] == b"IHDR"`，再读 16/20 |
 
 ### 4.10 与框架无关、容易忽视的系统级事实
 
@@ -519,11 +550,13 @@ C:\projects\deskPet\
 
 ### 4.12 素材与构图的固有特性（不是 bug，别去"修"）
 
-- `jumping` 的人物被素材画成约 **74.5%** 大小，双击跳跃进出各有约 26% 的尺寸变化。
-  **这是素材固有特性，不在运行时缩放对齐。**
+- `waving`（**旧名 `jumping`**，2025 用户定案改名并定位为**交互动作**）的人物被素材画成约
+  **74.5%** 大小，进出各有约 26% 的尺寸变化。
+  **这是素材固有特性，不在运行时缩放对齐**（原来是双击跳跃，task10 起是双击挥手/交互）。
 - 量尺度**不能只用一个特征**（低头时帽檐转折会突变）。
 - 图集里名为 `running` 的动作实际是**坐姿摆手**，不是跑动。
-- `sit` 是躺姿，宽高比约 1.7。
+- 休息动作（**2025 用户定案改名为 `rest`**，旧名 `sit`）是**躺姿**，人物宽高比约 1.7；
+  但**画布仍是 500×500**（"躺"的是人物，不是画布）。
 - **自带素材是抽帧产物**：`raw/<命名空间>/*.gif` →（`tools/extract_gif_frames.py`）→
   `assets/<命名空间>/{asset.json, frames/<动作>_<序号>.png}`。动作名 = GIF 文件名，
   帧文件名 = `<动作>_<序号>.png`（帧数 <100 用 2 位序号，<1000 用 3 位）。
@@ -533,9 +566,14 @@ C:\projects\deskPet\
   人物在画布里的位置/大小**由素材自己决定**，不做运行时对齐。
 - **源 GIF 的透明是 1 位 alpha（只有 0 / 255）**，所以抽出的 PNG **边缘天生没有抗锯齿**
   （放大看是台阶）。这不是素材坏了，**不要**在运行时写容差去"补"。
+  **task03 实测确认**：`idle` / `rest` / `waving` 第一帧的 alpha 分布只有 `{0: 233147, 255: 16853}`
+  两档、**半透明像素 0 个**、洋红像素 0 个、最外一圈不透明像素 0 个 →
+  **素材 alpha 是干净的**（"人物边缘没有彩色残边/毛刺"这条验收成立，无需反馈修素材）。
   后果：task03 验收里"人物边缘没有一圈彩色残边或毛刺"这一条要分开看——
   **颜色干净**（没有洋红/底色残边）依旧必须成立，**阶梯状硬边是预期的**；
   `setMask(QRegion)` 的二值锯齿（§4.9）在它之上再叠一层，观感要一起记。
+- **实测尺寸不等于 `cell`**：抽取脚本输出的 PNG 是 **500×500**，与 `cell` 一致
+  （task03 的 `cell` 一致性检查报干净）。这条以前没核过，现在有机器判据盯着。
 - **帧率**：GIF 的帧间隔是 30 / 40 ms 交替（2:1），平均 33.333 ms → **30 fps**；
   所以两个包的 `asset.json` 给**每个动作**都写了 `fps: 30.0`
   （即帧率来源全部是 `asset.json`，**遗留兜底表在这两个包上不会被触发**）。
@@ -589,6 +627,24 @@ C:\projects\deskPet\
   `time.strftime(...)` 拿来比对会偶发假失败 → 断言**格式**（正则），不断言时刻。
 - **`Get-Content` 看 UTF-8 日志会显示成乱码**（PowerShell 按 ANSI 解码），
   那是**显示**问题，不是日志坏了：用 `Path.read_text(encoding="utf-8")` 或 `ascii()` 复核。
+
+### 4.15 task03 查清的"入口与路径"边界（**不是 bug，别再改一遍**）
+
+- **`python -m deskpet` 在 `-m` 下的"程序目录"就是 `src/`**，不是仓库根。
+  包在 `src/deskpet`，`-m` 从 `__main__.py` 一路向上、停在"不再处于包内"为止，
+  得到 `src`——**这正是 task02 定下的规则，task03 没有改它**。
+  推论：`-m` 下 `resource_dir()` 也是 `src`，于是 `<程序目录>/assets` = `src/assets`
+  **不存在**，`python -m deskpet` 会明确报"连默认形象都不可用"并 `rc=2`；
+  `data/` 也会落在 `src/data` 而不是仓库根。
+  **本阶段支持的入口是 `python run.py` 与 `python main.py`**（两者都把仓库根当程序
+  目录，素材与 `data/` 都在正确位置）。task01 说的"三者行为一致"只对到
+  `app.run()` 这一层，**不对到"资源目录"**——这一条到 task03 接入真实素材才显形。
+  **不要**为了 `-m` 往路径规则里塞"往上找 `assets/`"这类项目专属启发式：
+  那会让"程序目录"从可推理的定义退化成猜谜。
+- 排查这条时踩到的**方法**教训：往 `paths.py` 里加 `DESKPET_DEBUG_PATHS` 那种临时开关
+  **要记得连 `import os` 一起加**（`paths.py` 原本不 import `os`，我加的第一版直接
+  `NameError`）；而且**别把调试行打到 stderr 再重定向**——进程会在文件还能被读之前
+  退出（这里反复出现"读文件读不到"），**写进文件再读**才可靠（与 §4.3 同一条教训）。
 
 ### 4.14 环境与工具类
 
@@ -661,33 +717,121 @@ C:\projects\deskPet\
 **素材准备（2025，独立于 task 编号，已完成）**：
 `raw/weedy`、`raw/weedy_sightseer` 两组 GIF 已抽帧进 `assets/`，索引已写好。
 新增构建期工具 `tools/extract_gif_frames.py`（可重跑）。
-**`assets/phoebe/` 目前是空目录**——`phoebe` 素材还没进来，
-所以 task03 的"三个包"验收基线暂时缺一个（见下面"其他待办"）。
+**`assets/phoebe/` 不存在**（连空目录都没有）——2025 用户定案：**`phoebe` 不再重做**，
+默认形象改为 **`weedy`**；将来要的话当**用户补充包**导入即可。
+
+**task03 已完成（2025）——"素材加载与一次列全校验：画出真实的温蒂"**
+
+交付：新增 `src/deskpet/{nsrules,pet_spec,pet_loader}.py`；
+`app.py`（命令行扩到 `--pet` / `--sprite` / `--action` / `--list-pets` / `--list-actions`）、
+`pet_window.py`（显示真实第一帧、尺寸取素材 `cell`）、`config.py`（`mirror` 的 `sit` → `rest`）；
+**删除** `placeholder.py`（task01 的占位图形，按 §1.2 的约定该删了）。
+
+实测结论（`python run.py`，2560×1440 / 100%）：
+
+- 窗口 **500×500**（= 素材 `cell`）、落点 `(2036, 916)`、`mask=on`；
+- 显示的是 `assets/weedy` 的 **`idle` 第 0 帧**（真实温蒂，不再是占位方块）——
+  截图存 `docs/task03_pet_weedy.png`；
+- **真透明 + 真穿透**：`WindowFromPoint` 人物中心 → 本进程窗口，窗口四角 → 别的窗口/桌面；
+  窗口内空白区颜色 `(21,21,23)` 与窗口外桌面**完全相同**；
+- **没有色键**：帧加载只做"读 PNG → `Format_ARGB32_Premultiplied`"，全仓库搜不到
+  `FF00FF` / `hitmask`（源码级搜索已过）；
+- 素材 alpha **干净**：只有 0/255 两档、无半透明、无洋红、最外一圈全透明
+  （详见 §4.12 的新增条目）→ **不需要反馈用户修素材**。
+
+`--list-pets` 真实输出（两个包）：
+
+```
+找到 2 个素材包：
+  · weedy
+      展示名：温蒂
+      来源：bundled
+      校验：可用（6 个动作）
+      音效：无音效
+  · weedy_sightseer
+      展示名：温蒂（倾听）
+      来源：bundled
+      校验：可用（7 个动作）
+      音效：无音效
+```
+
+`--list-actions`（默认 `weedy`）真实输出：
+
+```
+素材包：weedy（温蒂，来源 bundled）
+  画布 cell：500×500
+  动作数：6
+  动作（按索引里的顺序）：
+    · idle：90 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+    · rest：90 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+    · running_left：34 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+    · running_right：34 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+    · waiting：240 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+    · waving：30 帧，30 fps（每帧 33.3333 ms，来源：asset.json）
+  音效：无音效
+```
+
+**帧率来源分布**：**两个包、全部 13 个动作都是 `asset.json`（30.0 fps）**，
+**遗留兜底层一次都没有被触发**，`DEFAULT_FPS` 也没有。`weedy_sightseer` 额外多一个动作
+`温蒂-倾听-基建-Special-x1`（600 帧 / 30 fps）。
+
+**验收口径**：task03 §6 的 15 条逐条跑过（三个临时自检脚本，共 **约 130 项断言**，
+跑完即删——本阶段仍不建 `tests/`，避免和后续 task 抢地方）。其中：
+
+- 命名空间白名单：合法/非法各 6+19 例；
+- 帧率优先级：`3` / `30.0` / `8.25` 走 asset；`0` / `-1` / `"快"` / `true` / `null` /
+  `NaN` / `±inf` / `[]` 全部回退且不崩；`frame_ms` 确认是浮点不取整；
+- **一次列全**：把 `cell` 删掉 + `idle.fps` 改坏 + `idle` 首帧名指到不存在的文件 +
+  `rest.frames` 清空 + `sounds` 放个数字 → **一次列出 3 条问题**（坏 fps 与坏 sounds
+  只进警告，不进问题列表），`PetLoadError` 把 3 条**全部**带出来；
+- 缺一张帧文件 → **只报 1 条**（不重复刷屏）、补回去就干净；
+- `asset.json` 存成 **UTF-8 with BOM** → 仍能正常解析；
+- `--pet ""` / `--pet ../weedy` / `--pet "a/b"` → 命名非法 + `rc=2`、不崩；
+- `--pet 不存在的包` → `rc=2`，错误信息**列出已找到的包**；
+- 配置里写坏包名 → 启动**不中断**、回退 `weedy`、日志有警告，
+  **`config.json` 的哈希前后不变**（本次不写配置，回写属 task11）；
+- 三个包全坏 → `resolve_pet` 返回问题而不是静默空窗口。
+
+**本 task 新踩到并已写进 §4.9 / §4.12 的坑**（后面 task 别再踩一次）：
+
+1. `QScreen.grabWindow(0)` 的 alpha 恒为 255 → **不能用它测透明**，要用颜色比对 + `WindowFromPoint`；
+2. `show_fatal_error()` 是**模态**的 → 只读查询与命令行报错必须赶在 `QApplication` **之前**用
+   stderr + 退出码收场，否则进程卡在对话框上（`--exit-after` 也救不了）；
+3. **PNG 宽度在偏移 16 不是 8**（8 是 chunk 长度）→ `cell` 一致性检查曾报出 `13 × 1229472850`；
+4. **`_source_for()` 两边都要 `resolve()`**，否则用户包会被误判成自带包（探针实测）。
+
+**已知偏差（与 task 卡的出入，已回改 task 卡）**：`迁移清单.md` §2 / D12 与 task03/task05
+里写的 `running-left` / `sit` / `jumping` 已按用户定案改为 `running_left` / `rest` / `waving`；
+**遗留兜底帧率表仍按旧键名（连字符）定义**（值原样取自迁移清单），
+它与现行素材名不相交、因此不会被触发。
 
 | task | 标题 | 状态 |
 | --- | --- | --- |
 | task01 | 跑起来：透明置顶的宠物窗口（占位素材） | ✅ **已完成**（见上） |
 | task02 | 路径、配置与日志：能记住一句话，也能说清昨天发生了什么 | ✅ **已完成**（见上） |
-| task03 | 素材加载与一次列全校验：画出真实的菲比 | ⬜ 未开始 |
+| task03 | 素材加载与一次列全校验：画出真实的（温蒂）第一帧 | ✅ **已完成**（见上） |
 | task04 | 尺寸档位与缩放：10 级都能变、贴边不跑出屏幕 | ⬜ 未开始 |
 | task05 | 动起来：按素材帧率播放，循环 / 往返 / 一次性 | ⬜ 未开始 |
 | task06 | 右键菜单：换动作、休息/站起来、镜像翻转（按状态记忆） | ⬜ 未开始 |
 | task07 | 久置行为：鼠标一停就张望，再等一会儿坐下 | ⬜ 未开始 |
 | task08 | 拖动与命中：只有按在人物身上才起拖，松手记住位置 | ⬜ 未开始 |
 | task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ⬜ 未开始 |
-| task10 | 音效与双击手势：坐下有声音，双击会跳 | ⬜ 未开始 |
+| task10 | 音效与双击手势：坐下有声音，双击会挥手 | ⬜ 未开始 |
 | task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ⬜ 未开始 |
 | task12 | 全局热键：藏起来还能叫回来 | ⬜ 未开始 |
 | task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ 未开始 |
 | task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ 未开始 |
 
 **已完成**：task01（透明置顶窗口可拖可退，`setMask` 真穿透已实测）、
-task02（路径 / 配置 / 日志三块地基；`data/` 已进 `.gitignore`，本 task 未改 `.gitignore`
-——它从 task01 起就已经忽略 `data/`）。
-**尚未开始**：task03 起。
+task02（路径 / 配置 / 日志三块地基；`data/` 已进 `.gitignore`）、
+task03（素材加载层 + 一次列全校验 + 真实第一帧，真透明与真穿透实测）。
+**尚未开始**：task04 起。
 
-**下一步**：`tasks/task03.md`（素材加载与一次列全校验）。
-到 **task03** 之前仍要先解决 **D14（动作命名以哪套为准）** 和 **`phoebe` 素材是否就位**。
+**下一步**：`tasks/task04.md`（尺寸档位与缩放）。
+**注意**：到 task04 时必须先解决 **D3（缩放算法）**，并且把
+`config.DEFAULT_SIZE_LEVEL` 改成引用 `size.DEFAULT_LEVEL`（§4.1"默认值只允许一处"）。
+task04 还要注意：窗口尺寸现在来自素材 `cell`（500×500），引入档位后**必须**重算遮罩
+（`setMask` 的区域是按当前显示的帧生成的，缩放后不重算就会"看到的是新的、能点的是旧的"）。
 
 **待决策（写代码前必须定案；同步 `迁移清单.md` 附录 D）**：
 
@@ -695,29 +839,31 @@ task02（路径 / 配置 / 日志三块地基；`data/` 已进 `.gitignore`，�
 | --- | --- | --- | --- |
 | D1 | 透明方案 | task01 之前 | ✅ **已定案：素材重做为透明背景 PNG**（不做色键转换、不重烘 RGB 帧） |
 | D2 | 点击穿透 | task01 之前 | ✅ **已定案：`setMask(QRegion)`**（接受边缘锯齿这一代价） |
-| D3 | 缩放算法：`SmoothTransformation` / 三倍最近邻 | task04 之前 | ⬜ 未定（两种各看一眼再定） |
+| D3 | 缩放算法：`SmoothTransformation` / 三倍最近邻 | task04 之前 | ⬜ **仍未定**（两种各看一眼再定）——**task04 前必须问用户** |
 | D4 | 音频后端：`QMediaPlayer`（可播 mp3）/ `QSoundEffect`（只支持 wav） | task10 之前 | ⬜ 未定（建议 `QMediaPlayer`） |
 | D5 | 全局热键路线：原生消息过滤器 / 子线程+队列+定时器 | task12 之前 | ⬜ 未定 |
 | D6 | 单实例机制：`QLocalServer` / 命名互斥体 | task13 之前 | ⬜ 未定 |
-| D7 | 三个自带素材包补 `fps` | 任意 | ✅ **已定案：用户自己在 `asset.json` 里补**（实现侧只需保证解析优先级正确） |
+| D7 | 三个自带素材包补 `fps` | 任意 | ✅ **已定案并已落实**：用户已在 `asset.json` 里补好（**两个包、13 个动作全是 `30.0`**） |
 | D8 | `hitmask.json` 是否继续支持 | task03 之前 | ✅ **已定案：不再需要**（`setMask` 直接按 alpha 生成区域）；**读取与降级一律不做** |
-| D9 | 遗留兜底表何时删除 | 用户补完 `fps` 之后 | ⬜ 未定（补完后可作为独立的清理任务删除） |
+| D9 | 遗留兜底表何时删除 | 用户补完 `fps` 之后 | ⬜ 未定——**`fps` 已经补完，条件已满足**，可以随时作为一次独立清理任务删掉（`pet_spec.LEGACY_ACTION_FPS`） |
 | D10 | 项目命名统一 | task01 之前 | ✅ **已定案：统一为 `deskPet`**（包名 `deskpet`） |
 | D11 | 是否需要"截屏 / 录屏"功能 | task14 之后 | ✅ **已定案：本阶段不做**（迁移清单里没有此需求；将来要做再新开任务） |
-| D14 | **动作命名以哪套为准**：§0/D12 的规范集（`running-left` / `running-right` / `sit` / `jumping`）还是自带素材的实际键（`running_left` / `running_right` / `rest` / `waving`，**无 `jumping`**） | **task03 之前** | ⚠ **未定案**。用户 2025 已表态"**就按素材文件名对应，不用管动作对不对**"，所以 `asset.json` 按素材键写；但**代码侧的查找键**（拖动找 `running-*`、久置找 `sit`、双击找 `jumping`）还没定。**task03 之前问用户**：是代码跟随素材（键名走 `running_left`/`rest`，没有 `jumping` 就退化），还是让用户改素材文件名以对齐规范集 |
+| D12 | **动作名** | task03 之前 | ✅ **已定案（2025 用户）**：`idle` / `running_left` / `running_right` / `waiting` / `rest` / `waving`；`review` / `sit` / `jumping` **全部作废**、**不许做别名映射**。**编程侧与素材侧统一**（`迁移清单.md` 附录 D 已同步） |
+| D14 | **`--fps`** | task03 之前 | ✅ **已定案：已删除，不得复活**（帧率由素材决定） |
+
+> **编号提示**：`agent.md` 早期把"动作命名以哪套为准"误标成 D14，而 `迁移清单.md`
+> 的 D14 是"`--fps` 已删除"。**以 `迁移清单.md` 的编号为准**：动作命名就是 **D12**，
+> 本文件已按此改正，不要再造一个 D14 指动作命名。
 
 **下一阶段（本阶段 14 个 task 完成后，等用户另行提出）**：截屏 / 录屏若要做，
 按 `tasks/task15.md`、`tasks/task16.md` 的编号新开任务卡（**当前不存在这两个文件**）。
 
 **其他待办（不阻塞主线）**：
 
-- 素材：~~用户正在把素材重做成透明背景 PNG~~ **已就位两个包**（`assets/weedy`、
-  `assets/weedy_sightseer`，透明背景 PNG + `asset.json`，见"素材准备"）。
-  **仍缺 `phoebe`**：`assets/phoebe/` 是空目录，没有 `asset.json`、没有 `frames/`。
-  **task03 开始前**要确认 `phoebe` 是否要就位——task03 的验收里"默认形象 `phoebe`"
-  "三个包"都依赖它；如果用户就是不打算给 `phoebe`，**要先把默认形象的真值改掉再开 task03**
-  （默认形象名在 `pet_spec.py` 里只允许有一处）。
-  另：`assets/` 目录名就是命名空间，现在是 `phoebe`（不是别处的 `phoebe-2`）。
+- 素材：**已就位两个包**（`assets/weedy`、`assets/weedy_sightseer`，透明背景 PNG +
+  `asset.json` + 每个动作都带 `fps: 30.0`，见"素材准备"）。
+  **`phoebe` 不再存在也不需要**：2025 用户定案"后面也不会再做，最多当成补充包用户导入"，
+  默认形象已改为 `weedy`（真值在 `pet_spec.DEFAULT_PET_NAMESPACE`，**只此一处**）。
 - 打包阶段：`main.py` 顶层静态 import；`.ps1` 必须显式声明进打包数据；
   出包脚本要自检关键文件，构建机留在 `data/` 的日志必须删掉再发。
 - 版本控制：仓库已 `git init`（分支 `main`），`.gitignore` 已忽略 `data/`、`__pycache__/`、

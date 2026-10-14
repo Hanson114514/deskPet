@@ -87,7 +87,7 @@ data/config.json            data/deskpet.log            data/deskpet.log.1（滚
   | `idle_seconds` | int | `20` | 是 |
   | `size_level` | int | `6` | 是（**必须引用尺寸模块的默认档常量**，本 task 先写字面量并在 task04 改为引用） |
   | `position` | str | `""` | 是（格式 `"x,y"`；本 task 可先不用窗口位置，只保证读写） |
-  | `mirror` | dict | `{}` | 是（状态名 → 布尔；只允许 `idle`/`waiting`/`sit` 三个键） |
+  | `mirror` | dict | `{}` | 是（状态名 → 布尔；只允许 `idle`/`waiting`/`rest` 三个键。**2025 定案**：休息动作由 `sit` 改名为 `rest`） |
 
 - `Config` —— **不可变或显式受控**的数据对象，字段即上表键。
 - `ConfigStore(path)`：

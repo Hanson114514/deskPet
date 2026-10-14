@@ -1,8 +1,10 @@
 """宠物主窗口：无边框 / 置顶 / 透明背景 / 可拖动。
 
-task01 只交付**最小可运行骨架**：能看见、能拖、能退出。
-动画（task05）、配置（task02）、菜单（task06）、尺寸档位（task04）、
-命中判定的真实素材（task03 / task08）都不在这里。
+task01 交付了**最小可运行骨架**（占位图形 + 拖 + 退出）；task03 起窗口显示
+**真实素材的第一帧**，占位模块 `placeholder.py` 已随之删除。
+
+动画（task05）、尺寸档位与缩放（task04）、控制栏（task09）都不在这里。
+本 task 的窗口尺寸**就是素材的 `cell`**（不缩放、不选档位）。
 
 **两条硬约定**（agent.md §2.8 / §4.6）：
 
@@ -29,20 +31,27 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from . import PROGRAM_NAME, placeholder
+from . import PROGRAM_NAME, pet_loader
+from .pet_spec import PetSpec
 
 #: 默认落点距屏幕右下角的留白（逻辑单位）。附录 C：默认落点边距 24 逻辑单位。
 DEFAULT_MARGIN = 24
 
-#: 窗口边长（逻辑单位）。本 task 固定一个尺寸；10 级档位是 task04 的事。
-WINDOW_SIZE = placeholder.CANVAS_SIZE
+#: 没有素材时窗口退化的边长（逻辑单位）。正常路径用不到它 ——
+#: 本 task 起"连默认素材包都不可用"是**启动期致命**（agent.md §2.10 第一类），
+#: 不会带着一张空窗口跑起来。
+FALLBACK_SIZE = 250
+
+#: 本 task 显示的动作（动画播放属 task05，这里只取第一帧）。
+DEFAULT_ACTION = "idle"
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
     """按 ``image`` 的**不透明像素**生成一个窗口区域。
 
     **区域生成的唯一入口**（agent.md §2.8：把"取哪一帧"与"怎么生成"分开）。
-    task03 / task08 换成真实素材时，只需要改这一处。
+    task08 接上"取哪一帧 + 镜像"时，把本函数搬到 `hit_test.py` 即可，
+    **不要写第二份**。
 
     返回 ``None`` 表示"**算不出来**"，调用方必须退化成**不设遮罩**（整帧可点）：
 
@@ -82,17 +91,18 @@ def region_for_image(image: QImage | None) -> QRegion | None:
             return None
         return QRegion(QBitmap.fromImage(alpha_mask))
     except Exception:
-        # 降级路径不许再抛异常。task01 还没有日志层（属 task02），
-        # 所以这里只退化、不记日志；task02 起应补一条 WARNING。
+        # 降级路径不许再抛异常（"算不出来就整帧可点"）。
         return None
 
 
 class PetWindow(QWidget):
-    """宠物主窗口（task01：占位图形版）。"""
+    """宠物主窗口（task03：显示真实素材的静态第一帧）。"""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, pet: PetSpec, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
+        #: 当前显示的素材包（task03 只支持"一个包的一个动作的第一帧"）。
+        self.pet = pet
         #: 权威位置（左上角，屏幕逻辑坐标）。**只由 move_to() 写**。
         self._base_pos = QPoint(0, 0)
         #: 一次拖动的基准位置（按下那一刻的 _base_pos）。
@@ -102,12 +112,13 @@ class PetWindow(QWidget):
         self._dragging = False
         self._quit_shortcuts: list[QShortcut] = []
 
-        self._placeholder_image = placeholder.build_placeholder_image(
-            WINDOW_SIZE, self._device_pixel_ratio()
-        )
+        #: 当前显示的帧（带 alpha 的 QImage；任务05 起会被逐帧替换）。
+        self._frame_image = QImage()
+        #: 本 task 显示的动作名（回退之后的实际名字，可能不是 "idle"）。
+        self._action = _pick_action(pet, DEFAULT_ACTION)
 
         self._setup_window()
-        self.apply_mask(self._placeholder_image)
+        self.show_action_frame(self._action, 0)
         self._install_quit_shortcuts()
 
     # ------------------------------------------------------------ 装配
@@ -130,7 +141,8 @@ class PetWindow(QWidget):
         # 这里显式打开它，Esc / Ctrl+Q / --exit-after 才真能干净退出。
         self.setAttribute(Qt.WA_QuitOnClose, True)
         self.setWindowTitle(PROGRAM_NAME)
-        self.setFixedSize(WINDOW_SIZE, WINDOW_SIZE)
+        # 窗口尺寸就是素材的 cell（本 task 不缩放、不选档位）。
+        self.setFixedSize(self.pet.cell[0], self.pet.cell[1])
 
     def _install_quit_shortcuts(self) -> None:
         """Esc 与 Ctrl+Q 退出。窗口拿到焦点时生效。"""
@@ -139,6 +151,37 @@ class PetWindow(QWidget):
             shortcut.setContext(Qt.WindowShortcut)
             shortcut.activated.connect(self.close)
             self._quit_shortcuts.append(shortcut)
+
+    # ------------------------------------------------------------ 显示
+
+    @property
+    def action(self) -> str:
+        """当前显示的动作名（回退之后的实际值）。"""
+        return self._action
+
+    @property
+    def frame_image(self) -> QImage:
+        """当前显示的帧（只读；空图 = 没有图可画）。"""
+        return self._frame_image
+
+    def show_action_frame(self, action: str, index: int) -> bool:
+        """显示 ``action`` 的第 ``index`` 帧，并按它的 alpha 重设窗口遮罩。
+
+        返回**是否真的换上了新帧**。取不到图（动作不存在 / 帧号越界 /
+        文件读不出来）时**保留原来的画面**并返回 ``False``——绝不把已经
+        画好的东西擦掉，也绝不抛异常（agent.md §2.8 的降级约定）。
+        """
+        image = pet_loader.load_frame_image(self.pet, action, index)
+        if image.isNull():
+            return False
+
+        self._frame_image = image
+        self._action = action
+        # 换帧之后**衍生数据必须失效重算**（agent.md §4.7）：遮罩是上一帧的形状
+        # 就会出现"人物变了但可点区域没变"。
+        self.apply_mask(image)
+        self.update()
+        return True
 
     # ------------------------------------------------------------ 位置
 
@@ -205,8 +248,8 @@ class PetWindow(QWidget):
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         try:
-            # QImage 已标注 DPR，drawImage(point, image) 会按逻辑尺寸摆放。
-            painter.drawImage(0, 0, self._placeholder_image)
+            # 帧图未标注 DPR（见 pet_loader.load_frame_image），按原尺寸摆放。
+            painter.drawImage(0, 0, self._frame_image)
         finally:
             painter.end()
 
@@ -236,3 +279,17 @@ class PetWindow(QWidget):
             self._press_global = None
             self.unsetCursor()
         super().mouseReleaseEvent(event)
+
+
+def _pick_action(pet: PetSpec, preferred: str) -> str:
+    """挑一个**素材里真实存在**的动作来显示第一帧。
+
+    素材里**有几个动作就是几个**（agent.md §2.5）：不补、不改名、不造别名。
+    首选 ``preferred``；它不在就按 `action_order` 取第一个；
+    连一个动作都没有时返回 ``preferred``（`load_frame_image` 会退化返回空图）。
+    """
+    if pet.has_action(preferred):
+        return preferred
+    if pet.action_order:
+        return pet.action_order[0]
+    return preferred

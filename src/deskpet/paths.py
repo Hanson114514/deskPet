@@ -79,11 +79,11 @@ def _frozen_executable_dir() -> Path | None:
 
 
 def _module_entry_dir() -> Path | None:
-    """`python -m deskpet` 时，从包目录上溯到 `src/`（**仓库根不是它**）。
+    """`python -m deskpet` 时，从包目录上溯到 **`sys.path` 上的那一级**（包根）。
 
     `python -m` 的 `sys.argv[0]` 是 `<...>/src/deskpet/__main__.py`，直接取 `parent`
     会得到 `src/deskpet`——数据目录就跑到源码包里去了。所以这里从 `__main__.py`
-    所在的包目录**一路向上**，直到不在包目录下为止。
+    所在的包目录**一路向上**，直到"当前目录是包根"为止。
 
     **判据有两条，缺一不可**：
 
@@ -96,6 +96,18 @@ def _module_entry_dir() -> Path | None:
     为什么第一条不能换成"`spec.submodule_search_locations` 非空"：
     `python -m 包名` 时 `__main__` 的 spec 是 `包名.__main__`（`__main__` 本身
     不是包），`submodule_search_locations` 是**空**的——用它判会漏掉最常见的写法。
+
+    **停在哪一级**：本项目的包在 `src/deskpet`，所以 `-m` 下答案是 **`src`**
+    （上溯到"不再处于包内"为止）。这与 task02 定下的规则一致，**没有改过**。
+
+    > **已知边界（task03 查清并记录，不是 bug）**：`-m` 下 `program_dir()` 与
+    > `resource_dir()` 都是 `src`，而自带素材在**仓库根**的 `assets/`
+    > （仓库根不在 `sys.path` 上，无从推断）。所以 `python -m deskpet`
+    > **找不到素材**，会明确报"连默认形象都不可用"。
+    > 本阶段支持的入口是 `python run.py` 与 `python main.py`（两者都把仓库根
+    > 当程序目录）。**不要**为了 `-m` 往路径规则里塞"往上找 `assets/`"这种
+    > 项目专属启发式——那会让"程序目录"的定义变得不可推理。
+    > 详见 agent.md §4.13。
     """
     main_module = sys.modules.get("__main__")
     spec = getattr(main_module, "__spec__", None)

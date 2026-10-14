@@ -27,7 +27,12 @@ logger = logging.getLogger(__name__)
 
 #: `mirror` 只允许这三个状态名（= 动作名，不另造一套状态词汇）。
 #: 适用范围见 agent.md §0/§2.8：只有 待机 / 张望 / 休息 可镜像。
-MIRROR_STATES: Final[tuple[str, ...]] = ("idle", "waiting", "sit")
+#:
+#: 2025 用户定案（agent.md §5 的 D14）：休息动作从 `sit` **统一改名为 `rest`**
+#: （编程侧与素材侧一起改），所以这里跟着改成 `rest`。配置文件里旧的 `sit` 键
+#: 会作为"适用范围外的键"被过滤掉 + 一条警告（见 `normalize_mirror`），
+#: **不是**错误——用户没主动选过休息的镜像时本来就没有这个键。
+MIRROR_STATES: Final[tuple[str, ...]] = ("idle", "waiting", "rest")
 
 #: 默认尺寸档位（第 6 级，附录 C）。
 #: **task04 会改成"引用 `size.DEFAULT_LEVEL`"**——真值只许存在一处，

@@ -70,10 +70,14 @@ _crash_handler_installed = False
 def _stdlib_program_dir() -> Path:
     """崩溃兜底自己那份"程序目录"规则（**只依赖标准库**）。
 
-    与 `paths.program_dir()` 同形：冻结时是 exe 目录；`python -m` 时是包目录的
-    上一级；否则是入口脚本目录。正常启动**永远走 `paths.py`**；这里只是
-    "包已经 import 不进来"时的备胎，所以它必须自己把 `-m` 这种情况也处理掉
-    （否则 `python -m deskpet` 下会给出 `src/deskpet`，与 `paths.py` 漂移）。
+    与 `paths.program_dir()` 同形：冻结时是 exe 目录；`python -m` 时是**包根**
+    （本项目即 `src/`）；否则是入口脚本目录。正常启动**永远走 `paths.py`**；
+    这里只是"包已经 import 不进来"时的备胎，所以它必须自己把 `-m` 这种情况也
+    处理掉（否则 `python -m deskpet` 下会给出 `src/deskpet`，与 `paths.py` 漂移）。
+
+    > 两份规则的一致性由 `_assert_paths_consistent()` 守着。task03 在 `-m` 上
+    > 排查过一个"数据目录跑到 `src/` 下面"的现象：那**不是**本函数的错，
+    > 而是 `-m` 下包根确实是 `src/`（见 `paths._module_entry_dir()` 的边界说明）。
     """
     if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
         executable = getattr(sys, "executable", "") or ""
@@ -81,7 +85,7 @@ def _stdlib_program_dir() -> Path:
             return Path(executable).resolve().parent
 
     # `python -m 包名`：`__main__.__file__` 是 `<包目录>/__main__.py`，
-    # 程序目录要的是**包目录的上一级**（一路走到不在包内为止）。
+    # 程序目录要的是**包根**（一路走到不在包内为止）。
     main_module = sys.modules.get("__main__")
     spec = getattr(main_module, "__spec__", None)
     main_file = getattr(main_module, "__file__", None)

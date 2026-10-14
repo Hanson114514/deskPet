@@ -22,7 +22,7 @@
 
 1. 在**人物身上**按住左键拖动 → 窗口跟手移动；在**透明区域**按住拖动 →
    **不拖宠物**（鼠标事件穿透到下面的窗口/桌面）；
-2. 拖动过程中宠物播放 `running-left` / `running-right`（**按水平位移方向**决定，
+2. 拖动过程中宠物播放 `running_left` / `running_right`（**按水平位移方向**决定，
    没有速度阈值，慢速拖动不会来回闪）；
 3. 松手后回 `idle`，并且 **`data/config.json` 的 `position` 被写成落脚点**（`"x,y"`）；
 4. 重启程序 → 宠物**出现在上次拖动后的位置**（不再贴右下角），启动信息里来源显示"沿用上次"；
@@ -75,7 +75,7 @@ src/deskpet/idle_state.py    接线 task07 留的"动作控制权挂起"接口�
 | `begin(local_pos, global_pos, window_pos)` | 按下；**只有 `hit_test` 通过才进入拖动** |
 | `update(global_pos) -> (new_pos, action_or_None)` | 用**自己记的基准位置**算位移；返回新位置与"该播哪个动作" |
 | `finish() -> QPoint` | 松手；返回最终位置（调用方负责夹取 + 写配置） |
-| `direction_action(dx, last) -> str` | **纯函数**：只看 `dx` 的**符号**，**不设速度阈值**；纯竖直移动沿用 `last`；没有方向依据时以 `running-right` 起跑 |
+| `direction_action(dx, last) -> str` | **纯函数**：只看 `dx` 的**符号**，**不设速度阈值**；纯竖直移动沿用 `last`；没有方向依据时以 `running_right` 起跑 |
 | `drag_started` / `drag_finished(pos)` 信号 | 开始/结束拖动（供控制栏增量跟随、静置逻辑挂起/恢复使用） |
 
 **硬规则**：
@@ -126,7 +126,7 @@ src/deskpet/idle_state.py    接线 task07 留的"动作控制权挂起"接口�
 - [ ] 在**透明区域**按下拖动 → 宠物**不动**；该点击**穿透**到下面的窗口/桌面
       （用一个记事本窗口垫在宠物下面验证：点透明处应激活/移动记事本）
 - [ ] 拖动中**不出现**"只走一小截"的现象（没有回读窗口坐标）
-- [ ] 向右拖 → 播 `running-right`；向左拖 → 播 `running-left`；
+- [ ] 向右拖 → 播 `running_right`；向左拖 → 播 `running_left`；
       **慢速拖动不来回闪**（没有速度阈值）
 - [ ] 纯竖直拖动 → 沿用上次方向（不闪、不乱跳）
 - [ ] 松手 → 回 `idle`；`data/config.json` 里 `position` 变成落脚点（形如 `"1200,600"`）
