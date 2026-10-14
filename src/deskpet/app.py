@@ -25,13 +25,15 @@ task02 起启动顺序**固定**为：
 | `--list-actions` | 只读查询：列出动作名 / 帧数 / 解析后的帧率与**来源**，然后退出 | **`QApplication` 之前** |
 | `--size-level 1..10` | 指定尺寸档位；**越界当场报错退出**（不夹取） | — |
 | `--list-sizes` | 列出 10 级的倍数与像素尺寸 + 屏幕高度 + 自适应档位 | **`QApplication` 之后**（要读屏幕） |
+| `--position x,y` | 指定左上角位置（屏幕逻辑坐标）；**格式不对当场报错退出** | — |
 
 **`--fps` 已删除，不得复活**（agent.md §0：帧率由素材的 `asset.json` 决定）。
 
 `--list-actions` 的帧率来源（`asset.json` / 遗留兜底 / 默认 12）由 `pet_spec` 解析；
 启动行同样必须打印**动作 + 每帧毫秒 + 帧率来源**（task05 §4）。
 
-`--position` 属 task08，**不要**在这里提前实现。
+`--position` 的决定顺序（task08 §4）：**命令行 > 上次保存的 > 缺省贴右下角**。
+命令行给了坏值 → `argparse` 报错退出；**配置里**的坏值 → 忽略 + 一行日志（两条别混）。
 """
 
 import argparse
@@ -44,6 +46,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from . import PROGRAM_NAME, __version__
+from . import geometry
 from . import logger as log
 from . import paths, pet_loader, size
 from .animation import UnknownActionError
@@ -100,6 +103,26 @@ def _size_level_arg(text: str) -> int:
     return value
 
 
+def _position_arg(text: str) -> tuple[int, int]:
+    """`--position` 的解析器：**格式不对当场报错**（不是忽略）。
+
+    与"档位越界"的两套规则是同一种分法（agent.md §2.12 的精神）：
+
+    - **命令行**给的说法不合法 → `argparse` 报用法错误、非 0 退出（本函数）；
+    - **配置文件**里的坏值 → 忽略 + 一行日志，回到缺省落点
+      （配置是"读取永不致命"的那一类，见 `geometry.parse_position`）。
+
+    命令行这边"忽略"是错的：用户敲了 `--position 1,2,3` 却看到宠物贴在右下角，
+    会以为程序没听他的——必须说出来。
+    """
+    parsed = geometry.parse_position(text)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} 不是 \"x,y\" 形式的位置（例：1200,600）"
+        )
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM_NAME,
@@ -149,6 +172,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--list-sizes",
         action="store_true",
         help="列出 10 个档位的倍数与像素尺寸、当前屏幕的自适应档位，然后退出",
+    )
+    parser.add_argument(
+        "--position",
+        type=_position_arg,
+        default=None,
+        metavar="x,y",
+        help="宠物左上角位置（屏幕逻辑坐标，如 1200,600；格式不对当场报错退出）",
     )
     parser.add_argument(
         "--exit-after",
@@ -260,6 +290,37 @@ def _resolve_size_level(
     return size.level_for_screen(_screen_height(), cell), LEVEL_SOURCE_SCREEN
 
 
+def _resolve_position(
+    cli_position: tuple[int, int] | None,
+    store: ConfigStore,
+) -> tuple[tuple[int, int] | None, str]:
+    """决定宠物摆在哪儿，返回 `((x, y) 或 None, 来源文字)`。
+
+    **决定顺序（task08 §4）**：
+
+    1. **命令行** `--position`（给了就用，它已经在解析阶段验过格式）；
+    2. **上次保存的**——用 `store.has("position")` 判定，**不是**
+       "读到的值 ≠ 空串"。用 `has()` 的理由与档位完全一样（agent.md §2.4 规则 5）：
+       用户真的拖过、而落脚点**恰好**是缺省落点时，也必须显示"沿用上次"；
+    3. 都没有 → `None`，调用方走**缺省贴右下角**。
+
+    配置里的值格式不对 → `geometry.parse_position()` 记一行日志并返回 `None`，
+    于是**回到缺省落点**，不报错、不影响启动（§2.10 第三类）。
+    """
+    if cli_position is not None:
+        return cli_position, geometry.POSITION_SOURCE_CLI
+
+    if store.has("position"):
+        parsed = geometry.parse_position(store.get("position"))
+        if parsed is None:
+            # 一行日志已经在 `parse_position()` 里记过了，这里补一句"因此回退"。
+            _logger.warning("配置里的 position 用不了，改用缺省落点（贴右下角）")
+        else:
+            return parsed, geometry.POSITION_SOURCE_CONFIG
+
+    return None, geometry.POSITION_SOURCE_DEFAULT
+
+
 def _run_list_sizes(cell: tuple[int, int]) -> int:
     """`--list-sizes`：只读查询，列出 10 个档位 + 当前屏幕的自适应档位。
 
@@ -312,8 +373,8 @@ def _install_sigint_handler(app: QApplication) -> QTimer | None:
     return heartbeat
 
 
-def _print_startup_line(window: PetWindow, level_source: str) -> None:
-    """记一行启动状态：素材包 + 动作 + 帧率来源 + 位置 + 档位/来源/像素尺寸 + 遮罩 + DPI。
+def _print_startup_line(window: PetWindow, level_source: str, position_source: str) -> None:
+    """记一行启动状态：素材包 + 动作 + 帧率来源 + 位置/来源 + 档位/来源 + 遮罩 + DPI。
 
     位置取自窗口的**权威位置**（不是回读窗口坐标）。
     写进日志（同时上控制台）；**不写盘**、不碰配置。
@@ -324,6 +385,10 @@ def _print_startup_line(window: PetWindow, level_source: str) -> None:
     task05 起必须带上**动作 + 每帧毫秒 + 帧率来源**：
     "怎么变快了/变慢了"只有这一行能一眼看出是 `asset.json` 改的、
     还是掉到了遗留兜底表 / 默认 12（task05 §4）。
+
+    task08 起必须带上**位置来源**（`命令行指定` / `沿用上次` / `默认落点`）：
+    "宠物怎么没在昨天的位置"与"怎么又贴在右下角了"靠它一眼分辨
+    （task08 §6 有两条验收直接盯着这个文字）。
     """
     position = window.base_position
     width, height = window.pixel_size
@@ -334,7 +399,7 @@ def _print_startup_line(window: PetWindow, level_source: str) -> None:
     source = action.fps_source.label if action is not None else "（未知）"
     _logger.info(
         "%s %s | pet=%s action=%s %s mode=%s frames=%d frame_ms=%.4f fps_source=%s "
-        "pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s dpr=%.2f",
+        "pos=(%d, %d)(%s) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s dpr=%.2f",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
@@ -346,6 +411,7 @@ def _print_startup_line(window: PetWindow, level_source: str) -> None:
         source,
         position.x(),
         position.y(),
+        position_source,
         window.level,
         size.LEVEL_COUNT,
         level_source,
@@ -523,6 +589,8 @@ def run(argv: list[str] | None = None) -> int:
         return _EXIT_PET_UNAVAILABLE
 
     level, level_source = _resolve_size_level(args.size_level, store, pet.cell)
+    # 位置的决定顺序与档位同构：命令行 > 上次保存的 > 缺省落点（task08 §4）。
+    position, position_source = _resolve_position(args.position, store)
 
     # 镜像状态表：**启动时从配置读一次**（task06 §2 第 6 条：重启后翻转状态还在）。
     # 读操作只读——不会因为"打开程序"就把 mirror 写回配置。
@@ -536,12 +604,17 @@ def run(argv: list[str] | None = None) -> int:
     # 的那一类，绝不能让静置行为因为它失效）。
     idle_state = IdleStateMachine(lambda: normalize_idle_seconds(store.get("idle_seconds")))
 
-    window = PetWindow(pet, level, mirror=mirror, idle_state=idle_state)
+    window = PetWindow(pet, level, mirror=mirror, idle_state=idle_state, config=store)
     window.play_action(action)
-    window.showing_at_default_position()
+    if position is None:
+        window.showing_at_default_position()
+    else:
+        # `user_positioned=True`：这个位置是用户自己的意思（命令行或上次落脚点），
+        # 于是缩放不会把它弹回右下角缺省落点（task08 §4 硬规则）。
+        window.show_at(position[0], position[1], user_positioned=True)
     window.show()
 
-    _print_startup_line(window, level_source)
+    _print_startup_line(window, level_source, position_source)
 
     heartbeat = _install_sigint_handler(app)
 

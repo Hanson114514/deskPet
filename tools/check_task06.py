@@ -1032,11 +1032,35 @@ def _check_window_integration(app) -> None:
 
     drag_window, _ = _make_window(mirror_store=store)
     drag_window.play_action("idle", auto_start=False)
-    drag_window._dragging = True
-    drag_window._press_global = QPoint(1000, 1000)
-    drag_window._drag_base_pos = QPoint(500, 500)
-    drag_window.drag_by(40, 40)
+    # task08 把拖动收进了 `drag.DragController`（旧的 `_dragging` / `_press_global` /
+    # `_drag_base_pos` 三个私有字段已经作废）。这里改用**真实的按下事件**
+    # 进入拖动状态——比直接写私有字段更贴近产品路径。
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    drag_window.show_at(500, 500)
+    drag_window.mousePressEvent(
+        QMouseEvent(
+            QEvent.MouseButtonPress,
+            QPointF(5.0, 5.0),
+            QPointF(505.0, 505.0),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+    )
+    drag_window.mouseMoveEvent(
+        QMouseEvent(
+            QEvent.MouseMove,
+            QPointF(45.0, 45.0),
+            QPointF(545.0, 545.0),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+    )
     moved_to = drag_window.base_position
+    check("拖动确实已经进入（本任务要验'拖动中右键'）", drag_window.dragging is True)
 
     event = QContextMenuEvent(
         QContextMenuEvent.Mouse, QPoint(10, 10), QPointF(1010.0, 1010.0).toPoint()
@@ -1058,11 +1082,21 @@ def _check_window_integration(app) -> None:
     )
     check(
         "拖动中右键不打断拖动（位置与拖动状态都没变）",
-        drag_window.base_position == moved_to and drag_window._dragging is True,
-        f"位置 {drag_window.base_position} / dragging={drag_window._dragging}",
+        drag_window.base_position == moved_to and drag_window.dragging is True,
+        f"位置 {drag_window.base_position} / dragging={drag_window.dragging}",
     )
     # 松手之后右键恢复正常
-    drag_window._dragging = False
+    drag_window.mouseReleaseEvent(
+        QMouseEvent(
+            QEvent.MouseButtonRelease,
+            QPointF(45.0, 45.0),
+            QPointF(545.0, 545.0),
+            Qt.LeftButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+    )
+    check("松手后已退出拖动", drag_window.dragging is False)
     PW.context_menu.build_menu = lambda *a, **k: popup_called.append(True)  # type: ignore[assignment]
     try:
         # 只验"会走到构建菜单"这一步：exec 会真的弹窗，所以用桩替掉。

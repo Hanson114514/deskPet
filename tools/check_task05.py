@@ -564,7 +564,9 @@ def _run_checks() -> int:
     previous_level = app_logger.level
     app_logger.setLevel(logging.INFO)
     try:
-        app_module._print_startup_line(window, "按屏幕自适应")
+        # task08 起 `_print_startup_line()` 多了一栏"位置来源"（启动行要能分辨
+        # "命令行 / 沿用上次 / 默认落点"）。本 task 只验与 task05 有关的那三栏。
+        app_module._print_startup_line(window, "按屏幕自适应", "默认落点")
     finally:
         app_logger.removeHandler(handler)
         app_logger.setLevel(previous_level)

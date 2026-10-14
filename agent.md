@@ -97,7 +97,7 @@ C:\projects\deskPet\
 | `pet_spec.py` | 数据 | `PetSpec` / `ActionSpec` + **帧率解析唯一实现**；规范动作集与默认形象的真值 | ✅ |
 | `pet_loader.py` | 数据 | 两根扫描、`asset.json` 解析、**一次性列全校验**、统一解析"一个说法"、`load_frame_image()` | ✅ |
 | `size.py` | 数据 | 10 级档位（**精确有理数**）、像素换算、屏幕自适应、右下角锚点与夹取 | ✅ task04 |
-| `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转）；`region_for_*` 最终搬到这里 | ⬜ task08 |
+| `hit_test.py` | 数据 | 命中判定唯一入口（含镜像坐标翻转）；`region_for_frame` 的真实现 | ✅ task08 |
 | `sounds.py` | 数据 | 音效映射 + 播放器 + 优雅退化 + 诊断 | ⬜ task10 |
 | `autostart.py` | 系统 | 开机自启（读与修**分开**） | ⬜ task14 |
 | `single_instance.py` | 系统 | 单实例保护 | ⬜ task13 |
@@ -107,9 +107,9 @@ C:\projects\deskPet\
 | `animation.py` | 逻辑 | 帧推进 / 播放方式（loop / pingpong / oneshot）/ 定格 / 片段序列（**纯逻辑**，只有一个 `QObject`） | ✅ task05 |
 | `idle_state.py` | 逻辑 | 久置行为状态机（**纯逻辑，不依赖 Qt**；时间由外部喂） | ✅ task07 |
 | `cursor_watch.py` | 逻辑 | 全局光标轮询 + "有没有真的动了" | ✅ task07 |
-| `drag.py` | 逻辑 | 拖动状态机 + 方向→动作的纯函数 | ⬜ task08 |
+| `drag.py` | 逻辑 | 拖动状态机（`DragState` / `DragController`）+ 方向→动作的纯函数 | ✅ task08 |
 | `mirror.py` | 逻辑 | 镜像状态表（按状态记忆，读写配置） | ✅ task06 |
-| `geometry.py` | 逻辑 | 夹取 / 锚点 / 缺省落点 | ⬜ task08 |
+| `geometry.py` | 逻辑 | 夹取 / 锚点 / 缺省落点 / `"x,y"` 位置解析（**转发 `size`，不重写**） | ✅ task08 |
 | `pet_window.py` | 视图 | 宠物主窗口（事件处理器、显示、隐藏、遮罩、按档位定尺寸 + 右下角锚点切档、**动画驱动 `AnimationDriver`**、**右键菜单入口**） | ✅ |
 | `control_bar.py` | 视图 | 尺寸控制栏（独立顶层窗口 + layout） | ⬜ task09 |
 | `context_menu.py` | 视图 | 右键菜单（每次弹出前重建） | ✅ task06 |
@@ -440,6 +440,28 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 两个例外 | 计时归零但**不切动作**：① `manual`（**已做**）② 拖动中（**接口** `set_suspended(bool)`，task08 接线） |
 | 退出收尾 | `finally` 里 `cursor_watch.stop()` + `idle_timer.stop()` |
 
+### 2.16 拖动、命中与位置（task08 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| 命中判定入口 | `hit_test.hit_test(frame_image, pos, rendered_size, mirrored)`；区域生成 `hit_test.region_for_frame(image, mirrored=False)`。`pet_window.region_for_image()` 只剩**转发**（旧名留给 task01–07 的自检） |
+| **窗口不重复判定** | 能收到 `mousePressEvent` 就说明按在遮罩内（区域外由系统级穿透）。事件处理器**不再调 `hit_test()`**——那会造出第二份判定真值。`hit_test()` 供自检 / 诊断 |
+| 镜像坐标 | `x' = width - 1 - x`（翻**查询点**，不是翻图）；镜像时**先缩到 `rendered_size` 再翻点** |
+| 拖动状态 | `drag.DragState`：`base_pos`（按下时的权威位置）/ `grab_offset` / `press_global` / `last_direction` / `last_target` |
+| 拖动信号 | `drag.DragController.drag_started` / `drag_finished(pos)`；`PetWindow.position_changed(pos)` |
+| 方向纯函数 | `drag.direction_action(dx, last)`：只看符号（**无速度阈值**）；`dx==0` 返回 `last`（沿用），`last` 也没有则 `None` → 调用方按 `DEFAULT_DIRECTION = running_right` 起跑 |
+| 拖动中的动作 | 按下先切 `idle` → 有水平位移才切跑动；**竖直移动不切**（沿用上次方向） |
+| 位置决定顺序 | `命令行 --position` > `has("position")` > **缺省贴右下角**（`size.DEFAULT_MARGIN = 24`，用**整块屏幕**的 `geometry()`） |
+| 位置来源文字 | `geometry.POSITION_SOURCE_*`：`命令行指定` / `沿用上次` / `默认落点`；**启动行必须打印** |
+| 位置格式 | `"x,y"`（**字符串**）；`geometry.format_position()` / `parse_position()` 是唯一的拼法与解析 |
+| 越界两套规则 | **命令行**坏格式 → `argparse` 报错退出（rc=2）；**配置**里的坏值 → 忽略 + 一行日志 + 回缺省落点。与"档位越界"同一种分法 |
+| 写配置时机 | **只在松手与换档**（`_persist_position()` 是唯一出口）；拖动过程**不逐帧写** |
+| 夹取时机 | 夹取在 `_move_clamped()` 里、**早于** `move_to()` 写权威位置（§4.5） |
+| 用户位置优先 | `_user_positioned`：拖动过之后**绝不弹回缺省落点**；切档只做右下角锚点保护 |
+| 挂起接口 | `PetWindow.set_action_suspended(bool)` → `IdleStateMachine.set_suspended()`；拖动开始挂起、结束恢复（恢复 = **计时归零重排**） |
+| `manual` 与拖动 | 拖动开始**退出 `manual`**（"别一直坐着了"，task07 §4 的三条退出方式之一） |
+| 双击 | **按下的那一刻**是不是 `manual` 看 `_manual_rest_at_press`（`_start_drag` 会把 manual 退掉，此刻再问永远是假）；处理完必须 `abort_drag()`（见 §4.15） |
+
 ---
 
 ## 3. 新对话工作流
@@ -671,6 +693,43 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
   `paths.override_dirs(program=ROOT, resource=ROOT)`——**它正是为此存在的**，不要去改路径规则本身。
 - **逻辑高度 vs 物理高度**：`QScreen.geometry()` 给的是**逻辑**值（1080p @125% 报 864），
   而"1080p"说的是**物理**高度。两者混用会让自适应档位差好几级（task04 的标定基准就栽在这里）。
+- **800×800 的虚拟屏幕也会咬到"拖动"这类断言**（task08 实测）：第 6 级是 500×500，
+  在它上面**最大左上角就是 (300,300)**，于是"往右拖 120 px"会被正确地判定成"没动"。
+  写期望值时要用**产品自己的夹取函数**按当前屏幕算一遍，别写死真机上的数字
+  （`check_task08.py` 的 `_clamped()` 就是干这个的）。
+
+### 4.15 没有 `QGuiApplication` 时 `QBitmap.fromImage()` 会**段错误**（task08 实测）
+
+- `QBitmap.fromImage()` / `QRegion(QBitmap)` 在**没有 `QGuiApplication` 实例**时
+  会**直接崩掉进程**（Windows 退出码 `0xC0000005`），**不是**抛异常——
+  所以 `try/except` 拦不住，"降级：算不出来就整帧可点，永不抛异常"那条约定
+  在无 app 的场景下变成了"直接消失"，**比抛异常更糟**。
+- 实测：同一段代码在有 `QApplication` 时正常给出区域（40×40 图上
+  不透明块 `x∈[5,14], y∈[10,29]` → `QRect(5, 10, 10, 20)`），
+  没有时进程当场退出、**一行输出都留不下**（连重定向的文件都是空的）。
+- 对策：`hit_test.can_build_region()` 先问一句"现在能算吗"，**不能就返回 `None`**
+  （=`整帧可点`）。只有**导入期 / 自检**这类没有 app 的场景会走到。
+- **判据**：自检里用**子进程**验（真崩了只带走子进程）；
+  `python tools/check_task08.py` 的 §5 就是这一条。
+  别在自检里直接调——那会把整个自检带走。
+
+### 4.16 双击会先来一个 `mousePressEvent`，于是"拖动"被顺手开起来（task08 实测）
+
+- Qt 的顺序是 **press → release → dblclick**。双击的第 2 次按下**先**触发
+  `mousePressEvent`，于是"只有按在人物身上才起拖"的实现已经把窗口置成
+  `dragging`、并**挂起了静置逻辑**；而这一次按下**没有**配对的 release
+  走到"松手"（它的 release 在 dblclick 之后）。
+- 表现：**双击之后宠物僵住**——`dragging` 恒为真 → 右键菜单永远不弹、
+  静置逻辑永远被挂起（再也不会张望）。task07 的自检当场抓到
+  （双击后 `suspended` 变成 `True` 且不再恢复），而不是猜出来的。
+- 对策：`mouseDoubleClickEvent` 里在 `super()` **之后**调 `abort_drag()`
+  ——**必须在 `super()` 之后**：QWidget 的默认实现会把这次双击再翻成一次
+  `mousePressEvent`，放在前面中止的话紧随其后的 press 会立刻把拖动又开起来。
+- "中止"与"松手"是两件事，**故意不复用** `_finish_drag()`：松手要写配置 +
+  发 `drag_finished`（用户真的挪了位置），中止什么都不留（那两次点击没有位移）。
+  但**动作控制权照常还回去并重新计时**，否则静置逻辑会一直停摆。
+- 推论（写事件处理器时的通则）：**任何"按下才开始"的状态机，都要想清楚
+  双击 / 三击那条路径**——它的第二次按下没有配对的松手。
 
 ---
 
@@ -685,8 +744,8 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task05 | 动起来：按素材帧率播放，循环 / 往返 / 一次性 | ✅ 已完成 |
 | task06 | 右键菜单：换动作、休息/站起来、镜像翻转（按状态记忆） | ✅ 已完成 |
 | task07 | 久置行为：鼠标一停就张望，再等一会儿坐下 | ✅ 已完成 |
-| task08 | 拖动与命中：只有按在人物身上才起拖，松手记住位置 | ⬜ **下一个** |
-| task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ⬜ 未开始 |
+| task08 | 拖动与命中：只有按在人物身上才起拖，松手记住位置 | ✅ 已完成 |
+| task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ⬜ **下一个** |
 | task10 | 音效与双击手势：坐下有声音，双击会挥手 | ⬜ 未开始 |
 | task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ⬜ 未开始 |
 | task12 | 全局热键：藏起来还能叫回来 | ⬜ 未开始 |
@@ -858,7 +917,64 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > **§A 自查**：首轮 FAIL 多是**测试自身**错（扫描没剥注释、跳着喂假时间），产品只改一处；
 > 没越界；探针已删；CPU 误读（21%）经 profile 确认是**测量方法**，未改逻辑。
 
-**下一步**：`tasks/task08.md`（拖动与命中）。**⚠ 开工前先读 §A**。
+**task08（已完成）** —— 拖动与命中。**约定见 §2.16**；新增 `hit_test.py` / `geometry.py` / `drag.py`；
+`pet_window.py` 换成正式拖动（`drag_controller` + `position_changed` + `abort_drag()`）；
+`app.py` 加 `--position` 与"命令行 > 上次保存的 > 缺省"的位置决定顺序，启动行加**位置来源**。
+
+实测（本机 2560×1440 / DPI 100%）：
+
+- **D2 的最终落地方式 = `setMask(QRegion)`**（没有自判定、没有混合）。
+  区域生成的**唯一实现**搬到了 `hit_test.region_for_frame()`，`pet_window.region_for_image()`
+  只剩转发（旧名留给 task01–07 的自检）。区域**只在换帧 / 换档 / 换镜像时重算**
+  （`show_action_frame()` 里那一处 `apply_mask()`），同动作同档位内复用。
+  实测重算**没有抖动**：120 次完整拖动（每次 10 个移动事件）期间心跳定时器照常跑，
+  位置始终精确等于"基准 + 累计位移"。
+- **透明区真的穿透（怎么验的）**：真平台用 Win32 `WindowFromPoint` 判据
+  （§4.9：这是唯一可自动化的判据）。第 4 级（333×333）、人物遮罩外接矩形
+  `122,109 104x151`：**人物中心 → 本窗口 8456878**；
+  **窗口四角 → 全部是别的窗口 197472**（4/4 穿透）。
+  **没有**垫记事本——`WindowFromPoint` 返回"另一个窗口"本身就证明点击不会落到宠物上，
+  比"垫一个记事本再肉眼点"更硬且可自动化。
+- **`setMask` 的边缘锯齿**：本 task 用 1 位 alpha 的真实素材观察，边缘确有台阶，
+  但**与 task01 的占位矩形结论一致**（1 倍观察几乎看不出）。
+  它是 §0 已定案的取舍，**不要求本 task 解决**（源 GIF 的 alpha 本来就是 1 位，§4.12）。
+- **`position` 的真实格式与一次实测值**：`"x,y"`，实测 `"460,330"`（松手那一刻的落脚点）、
+  拖出屏外后实测 `"2227,1107"`（= 屏幕右下角夹取后的值，屏幕 2560×1440、窗口 333×333）。
+  启动行形如 `pos=(2227, 1107)(沿用上次)`。
+- **拖动与静置逻辑的挂起接口最终叫**：`PetWindow.set_action_suspended(bool)`
+  → `IdleStateMachine.set_suspended()`（task07 留的接口，本 task 只接线）。
+  挂起期间计时归零但不切动作；**恢复时重新计时**（松手后再等满 `idle_seconds` 才张望）。
+- **拖动中的动作控制权**：按下先切 `idle` → 有水平位移才切跑动 → 松手回 `idle`。
+  **纯竖直移动沿用上次方向**（`direction_action()` 返回 `None` 表示"没依据"）。
+- **用户拖动过之后缩放不弹回缺省落点**：`_user_positioned` 为真时切档只做右下角锚点保护。
+  实测切档后右下角锚点 `(2560, 1440)` → `(2560, 1440)`（**漂移 0**），
+  而缺省落点是 `(2036, 916)` —— 位置确实以用户为准。
+- **⚠ 顺手修掉一个真 bug（双击把宠物卡住）**：Qt 的顺序是 press → release → dblclick，
+  双击的第 2 次按下会先触发 `mousePressEvent`，于是"起拖"被顺手开起来且**没有配对的松手**，
+  表现是双击后 `dragging` 恒为真（右键菜单永远不弹、静置逻辑永远被挂起）。
+  **是 task07 的自检当场抓到的**（双击后 `suspended` 变 `True` 且不再恢复），
+  不是猜的。对策见 §4.16。
+- **⚠ 另一个真发现：无 `QGuiApplication` 时 `QBitmap.fromImage()` 直接段错误**
+  （`0xC0000005`，`try/except` 拦不住）。对策是 `hit_test.can_build_region()`，见 §4.15。
+
+验收：task08 §6 的 20 条逐条跑过。两个脚本**留在仓库里**：
+`tools/check_task08.py`（offscreen，**128 项断言全过**）+
+`tools/check_task08_real.py`（真平台，**30 项全过**：`WindowFromPoint` 真穿透、
+快速来回拖不丢偏移、拖出屏外后写进配置的是夹取值、重启后落在原处、切档不弹回缺省落点）。
+改过 `pet_window.py` / `app.py` 之后**回归跑了 task04–07 的全部自检与真平台检查**
+（30 / 55 / 128 / 123 项，**全过**），并顺手把 task05 / 06 / 06-real 里
+引用已作废私有字段（`_dragging` / `_press_global` / `_drag_base_pos`）的用例改成**真实鼠标事件**走产品路径。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——几轮 FAIL 都**第一轮就定位到测试自身写错**
+> （offscreen 虚拟屏幕只有 800×800，期望值写死了真机数字；`_code_only()` 把字符串剥掉了
+> 却拿它断言字符串字面量；喂假时钟把时间线污染）。产品代码按事实改了**两处**：
+> ① `hit_test()` 里"缩放必须在镜像分支之外"（自检抓到 rendered_size 不生效）；
+> ② 双击卡死（task07 自检抓到）。②**没有**改到卡范围之外：控制栏 / 设置 / 音效 / 手势 /
+> 热键一律没碰，音效与双击挥手明确留给 task10。③ 文档改动集中在 §2.16 新增小节 +
+> §1.2 三行状态 + §4.14/4.15/4.16 + 本节，与代码改动（3 个新模块 + 2 个模块改）**同量级**。
+> ④ 临时探针（`probe_task08.py` / `probe_task08b.py` 与它们的输出文件）**已全部删掉**。
+
+**下一步**：`tasks/task09.md`（尺寸控制栏）。**⚠ 开工前先读 §A**。
 
 **已知待清理（不阻塞主线）**：
 

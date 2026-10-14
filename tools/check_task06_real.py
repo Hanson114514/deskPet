@@ -90,6 +90,14 @@ def _run() -> int:
     # ------------------------------------------------------------ §1 真遮罩
     section("1. 真平台：遮罩与『翻转后遮罩跟着换面』")
 
+    # ⚠ **先定格在同一帧**再比较遮罩：`idle` 在播的时候每帧轮廓都不同
+    # （实测相邻帧的外接矩形宽度会差 1 px），于是"翻转前后宽度一致"这条
+    # 会在两次读到**不同帧**时偶发失败——那是测试没控制变量，不是产品错了
+    # （task08 加镜像命中用例时这条真的偶发红过一次）。
+    window.hold_frame(0)
+    for _ in range(8):
+        app.processEvents()
+
     mask_before = window.mask()
     check(
         "真平台下窗口设上了遮罩（offscreen 测不出这一条）",
@@ -98,10 +106,16 @@ def _run() -> int:
     )
 
     rect_before = mask_before.boundingRect()
+    frame_before = window.frame_index
     window.toggle_mirror()
     for _ in range(8):
         app.processEvents()
     rect_after = window.mask().boundingRect()
+    check(
+        "翻转前后看的是**同一帧**（定格住了，比较才有意义）",
+        window.frame_index == frame_before,
+        f"帧号 {frame_before} → {window.frame_index}",
+    )
 
     check("翻转后画面确实变了", window.mirrored is True, "mirrored=True")
     check(
@@ -209,13 +223,35 @@ def _run() -> int:
     # ------------------------------------------------------------ §4 拖动 + 右键
     section("4. 真平台：拖动中右键不打断拖动")
 
-    window._dragging = True
-    window._press_global = QPoint(1000, 1000)
-    window._drag_base_pos = QPoint(window.base_position)
+    # task08 把拖动收进了 `drag.DragController`（旧的 `_dragging` / `_press_global` /
+    # `_drag_base_pos` 三个私有字段已作废）。这里改用**真实鼠标事件**进入拖动。
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
     start = window.base_position
-    window.drag_by(60, 40)
+    window.mousePressEvent(
+        QMouseEvent(
+            QEvent.MouseButtonPress,
+            QPointF(5.0, 5.0),
+            QPointF(start.x() + 5.0, start.y() + 5.0),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+    )
+    window.mouseMoveEvent(
+        QMouseEvent(
+            QEvent.MouseMove,
+            QPointF(65.0, 45.0),
+            QPointF(start.x() + 65.0, start.y() + 45.0),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+    )
     moved = window.base_position
     check("拖动真的移动了窗口", moved != start, f"{start} → {moved}")
+    check("已进入拖动状态", window.dragging is True)
 
     PW.context_menu.build_menu = on_menu  # type: ignore[assignment]
     try:
@@ -229,8 +265,18 @@ def _run() -> int:
         window.base_position == moved,
         f"{moved} → {window.base_position}",
     )
-    check("拖动中右键不结束拖动", window._dragging is True, "dragging=True")
-    window._dragging = False
+    check("拖动中右键不结束拖动", window.dragging is True, "dragging=True")
+    window.mouseReleaseEvent(
+        QMouseEvent(
+            QEvent.MouseButtonRelease,
+            QPointF(65.0, 45.0),
+            QPointF(moved.x() + 65.0, moved.y() + 45.0),
+            Qt.LeftButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+    )
+    check("松手后退出拖动", window.dragging is False)
 
     # ------------------------------------------------------------ §5 事件循环存活
     section("5. 翻转 10 次期间事件循环不卡（真事件循环）")

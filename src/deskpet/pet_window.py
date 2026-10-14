@@ -7,6 +7,21 @@ task05 起窗口**持续播放动画**——帧推进由 `animation.Animation` �
 本文件只负责"什么时候问下一帧、把哪一帧画出来"；
 task06 起**右键菜单**（换动作 / 休息 / 镜像翻转）也接在这里：
 菜单本身在 `context_menu.py` 里现造，本文件只负责"什么时候弹、弹完做什么"。
+task08 起**拖动是正式交互**：只有**按在人物身上**才起拖（靠 `setMask` 的真穿透，
+点击透明区时窗口根本收不到事件），松手把落脚点**夹取后**写进配置。
+
+## 拖动与命中的分工（task08）
+
+| 事 | 住哪 |
+| --- | --- |
+| 区域生成与命中判定 | `hit_test.region_for_frame()` / `hit_test.hit_test()` |
+| 基准位置 / 上次方向 / 方向→动作 | `drag.DragState` / `drag.direction_action()` |
+| 夹取 / 锚点 / 缺省落点 / `"x,y"` 解析 | `geometry` |
+| 鼠标事件、切动作、写配置 | **本文件**（事件处理器搬不走） |
+
+**本文件不重复做命中判定**：能收到 `mousePressEvent` 就说明按下点落在遮罩区域内
+（区域外由系统级穿透），再调一次 `hit_test()` 等于造第二份判定真值。
+`hit_test()` 留给自检与诊断用。
 
 ## 镜像的两条衍生数据都要跟着失效（agent.md §4.7 / §3.20）
 
@@ -41,9 +56,10 @@ task06 起**右键菜单**（换动作 / 休息 / 镜像翻转）也接在这里
 """
 
 
+import logging
+
 from PySide6.QtCore import QElapsedTimer, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QBitmap,
     QContextMenuEvent,
     QGuiApplication,
     QImage,
@@ -58,14 +74,18 @@ from PySide6.QtWidgets import QWidget
 
 from typing import Final
 
-from . import PROGRAM_NAME, size
+from . import PROGRAM_NAME, geometry, hit_test, size
 from . import context_menu
 from .animation import MAX_DT_MS, Animation
+from .config import ConfigStore
 from .context_menu import MenuState
+from .drag import DEFAULT_DIRECTION, DragController
 from .idle_state import IdleStateMachine
 from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
+
+logger = logging.getLogger(__name__)
 
 #: 默认落点距屏幕右下角的留白（逻辑单位）。**真值在 `size.DEFAULT_MARGIN`**，
 #: 这里只做引用（同一个约定不要在两处各写一个 24）。
@@ -87,50 +107,13 @@ IDLE_ACTION = DEFAULT_ACTION
 def region_for_image(image: QImage | None) -> QRegion | None:
     """按 ``image`` 的**不透明像素**生成一个窗口区域。
 
-    **区域生成的唯一入口**（agent.md §2.8：把"取哪一帧"与"怎么生成"分开）。
-    task08 接上"取哪一帧 + 镜像"时，把本函数搬到 `hit_test.py` 即可，
-    **不要写第二份**。
+    task08 起**实现搬到了 `hit_test.region_for_frame()`**（agent.md §2.8：
+    "唯一入口……不要写第二份"），这里只保留转发——旧名字在 task01–07 的
+    自检里被用过，改名会让那些回归脚本无谓地红掉。
 
-    返回 ``None`` 表示"**算不出来**"，调用方必须退化成**不设遮罩**（整帧可点）：
-
-    - ``None`` / 空图 / 尺寸非正 → ``None``；
-    - **没有 alpha 通道** = 整块不透明 → 返回整幅区域；
-    - 不透明阈值取 Qt 自带的 ``QImage.createAlphaMask()``（约 ``alpha >= 128``）。
-      真实素材的源 GIF 是 1 位 alpha（只有 0 / 255），所以这个阈值不影响判定。
-
-    本函数**永不抛异常**（agent.md §2.8 的降级约定）。
+    **新代码请直接用 `hit_test`**（它还多了 `mirrored` 参数）。
     """
-    if image is None or image.isNull():
-        return None
-
-    try:
-        source = image
-        ratio = float(source.devicePixelRatio() or 1.0)
-        if ratio > 0 and ratio != 1.0:
-            # 遮罩坐标是**窗口内的逻辑像素**，带 DPR 的图先折回逻辑尺寸，
-            # 否则区域会整体放大 ratio 倍（人物能点到的范围比看到的大一圈）。
-            source = source.scaled(
-                max(1, round(source.width() / ratio)),
-                max(1, round(source.height() / ratio)),
-                Qt.IgnoreAspectRatio,
-                Qt.FastTransformation,
-            )
-
-        width = source.width()
-        height = source.height()
-        if width <= 0 or height <= 0:
-            return None
-
-        if not source.hasAlphaChannel():
-            return QRegion(0, 0, width, height)
-
-        alpha_mask = source.createAlphaMask()
-        if alpha_mask.isNull():
-            return None
-        return QRegion(QBitmap.fromImage(alpha_mask))
-    except Exception:
-        # 降级路径不许再抛异常（"算不出来就整帧可点"）。
-        return None
+    return hit_test.region_for_frame(image)
 
 
 class AnimationDriver(QObject):
@@ -221,6 +204,10 @@ class AnimationDriver(QObject):
 class PetWindow(QWidget):
     """宠物主窗口（task05：按素材帧率持续播放当前动作）。"""
 
+    #: 窗口位置变了（拖动结束 / 夹取后），agent.md §2.2 的信号表。
+    #: **只在真的变了时发**：位置没变的"点一下没拖动"走的是写配置那条路径。
+    position_changed = Signal(QPoint)
+
     def __init__(
         self,
         pet: PetSpec,
@@ -228,6 +215,7 @@ class PetWindow(QWidget):
         parent: QWidget | None = None,
         mirror: MirrorState | None = None,
         idle_state: IdleStateMachine | None = None,
+        config: ConfigStore | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -235,17 +223,24 @@ class PetWindow(QWidget):
         self.pet = pet
         #: 权威位置（左上角，屏幕逻辑坐标）。**只由 move_to() 写**。
         self._base_pos = QPoint(0, 0)
-        #: 一次拖动的基准位置（按下那一刻的 _base_pos）。
-        self._drag_base_pos = QPoint(0, 0)
-        #: 按下时的**全局**坐标；None = 当前没有拖动。
-        self._press_global: QPoint | None = None
-        self._dragging = False
+        #: 拖动控制器（task08）：基准位置 / 上次方向 / 开始与结束信号。
+        #: 鼠标事件处理器留在本类，状态与信号收在 `drag` 里（自检能不开窗口直接测）。
+        self.drag_controller = DragController(self)
+        #: 用户**拖动过**之后为真：位置一旦由用户决定就以它为准，
+        #: 缩放**不得弹回右下角缺省落点**（task08 §4 硬规则）。
+        self._user_positioned = False
+        #: **按下那一刻**是不是 `manual` 坐姿（双击判据，见 `mouseDoubleClickEvent`）。
+        self._manual_rest_at_press = False
         self._quit_shortcuts: list[QShortcut] = []
 
         #: 镜像状态表（task06）。没给就自己造一个"永远不翻转"的
         #: ——`MirrorState` 需要一个 `ConfigStore`，自检里常常没有配置，
         #: 所以这里允许 `None` 并退化（`_mirror` 为 `None` 时恒不翻转）。
         self._mirror = mirror
+
+        #: 配置 store（task08）：**松手时**把落脚点写进 `position`。
+        #: `None` = 没有配置可写（自检里常见），此时只记 DEBUG 日志、不报错。
+        self._config = config
 
         #: 当前显示的帧（**已缩放、已按需镜像**，窗口尺寸就是它的尺寸）。
         self._frame_image = QImage()
@@ -415,11 +410,15 @@ class PetWindow(QWidget):
         self._apply_level(target)
         left, top = anchor.top_left_for(*self.pixel_size)
         self._move_clamped(left, top)
+        # 换档会改左上角（右下角锚点不动），所以这也是"位置变了"的一处：
+        # 与松手一样写一次配置（**不逐帧写**，task08 §4 硬规则）。
+        # 用户拖动过之后位置就以他的为准，**绝不重新算右下角缺省落点**。
+        self._persist_position(self.base_position)
 
     def _move_clamped(self, left: int, top: int) -> None:
         """夹到屏幕内再写权威位置（越界值不进 `_base_pos`，agent.md §4.5）。"""
         width, height = self.pixel_size
-        x, y = size.clamp_position(left, top, width, height, self._screen_area())
+        x, y = geometry.clamp_position(left, top, width, height, self._screen_area())
         self.move_to(x, y)
 
     # ------------------------------------------------------------ 显示
@@ -599,46 +598,180 @@ class PetWindow(QWidget):
         """权威位置（只读）。调用方**不要**用 ``pos()`` 代替它。"""
         return QPoint(self._base_pos)
 
+    @property
+    def user_positioned(self) -> bool:
+        """位置是不是**用户自己定的**（拖动过）。
+
+        task08 §4 硬规则："用户拖动过之后，缩放**不得弹回右下角缺省落点**"。
+        判据就是这一个布尔——`app.py` 启动时按"命令行 / 配置 / 缺省"决定位置，
+        而运行期的切档只做锚点保护，绝不重新算落点。
+        """
+        return self._user_positioned
+
+    @property
+    def dragging(self) -> bool:
+        """当前是不是正在拖动（"拖动途中双击被忽略"看的就是它）。"""
+        return self.drag_controller.active
+
     def move_to(self, x: int, y: int) -> None:
         """把窗口移到屏幕逻辑坐标 ``(x, y)``，并更新权威位置。
 
         **本函数不夹取**：它接受调用方算好的最终位置（`_move_clamped()` 已经夹过）。
         夹取属"摆放策略"而不是"搬运"——放在这里会让"拖到边缘被夹住"与
         "换档后重算锚点"两种意图混在一起，说不清是谁夹的。
+
+        位置变了就发 `position_changed(pos)`（agent.md §2.2 的信号表）：
+        拖动结束 / 夹取后需要一次**完整的位置校正通知**（agent.md §4.6，
+        处理"拖到边缘被夹住、位置没变但仍需同步"这类情况）。
         """
-        self._base_pos = QPoint(int(x), int(y))
-        self.move(self._base_pos)
+        pos = QPoint(int(x), int(y))
+        changed = pos != self._base_pos
+        self._base_pos = pos
+        self.move(pos)
+        if changed:
+            self.position_changed.emit(QPoint(pos))
 
     def showing_at_default_position(self) -> None:
-        """首次显示：贴屏幕右下角，右下各留 ``DEFAULT_MARGIN`` 逻辑单位。
+        """贴屏幕**右下角**缺省落点（右下各留 ``DEFAULT_MARGIN`` 逻辑单位）。
 
-        用**整块屏幕**的 ``geometry()``（而不是排除任务栏的 ``availableGeometry()``），
-        因为"边距 24 逻辑单位"是从**屏幕边缘**量起的，旧实现（``dotPet``）用的也是整屏高度。
-        后果：底部有任务栏时宠物会压在任务栏上沿约 24 逻辑单位（agent.md §4.10）；
-        task09 的控制栏预留会把它再抬起来，**到那时再决定要不要改**。
+        落点算法在 `geometry.default_position()`（**唯一实现**）；
+        用**整块屏幕**的 ``geometry()`` 而不是排除任务栏的 ``availableGeometry()``，
+        因为"边距 24 逻辑单位"是从**屏幕边缘**量起的（agent.md §4.10）。
         """
-        area = self._screen_area()
-        if area[2] <= 0 or area[3] <= 0:  # 拿不到屏幕信息
-            self.move_to(0, 0)
-            return
-
         width, height = self.pixel_size
-        self._move_clamped(
-            area[0] + area[2] - width - DEFAULT_MARGIN,
-            area[1] + area[3] - height - DEFAULT_MARGIN,
-        )
+        x, y = geometry.default_position(width, height, self._screen_area())
+        self.move_to(x, y)
+
+    def show_at(self, x: int, y: int, *, user_positioned: bool = False) -> None:
+        """把窗口摆到 ``(x, y)``，**夹取后**再写权威位置（agent.md §4.5）。
+
+        `app.py` 决定"命令行 / 上次保存的 / 缺省"三条来源后统一走这里。
+        ``user_positioned=True`` 表示"这个位置是用户自己的意思"
+        （命令行给了 `--position`，或配置里有上次落脚点），
+        于是后续缩放不会把它弹回缺省落点（task08 §4 硬规则）。
+        """
+        self._move_clamped(int(x), int(y))
+        if user_positioned:
+            self._user_positioned = True
 
     def drag_by(self, dx: int, dy: int) -> None:
-        """按**按下时记下的基准位置 + 位移**摆放窗口。
+        """按**按下时记下的基准位置 + 位移**摆放窗口（**夹取后**才写权威位置）。
 
         ``dx`` / ``dy`` 是相对**按下点**的累计位移
         （``当前全局坐标 - 按下时的全局坐标``），不是相邻两次移动的增量。
-        基准位置是自己记的，因此**不回读窗口实时坐标**。
+        基准位置是自己记的，因此**不回读窗口实时坐标**（agent.md §4.6）。
+
+        夹取发生在这里、且**早于** `move_to()` 写权威位置——这就是
+        §4.5"越界值不能存进权威位置"在拖动路径上的落点。
         """
-        self.move_to(
-            self._drag_base_pos.x() + int(dx),
-            self._drag_base_pos.y() + int(dy),
+        state = self.drag_controller.state
+        self._move_clamped(
+            state.base_pos.x() + int(dx),
+            state.base_pos.y() + int(dy),
         )
+
+    # ------------------------------------------------------------ 拖动（task08）
+
+    def _start_drag(self, local_pos: QPoint, global_pos: QPoint) -> bool:
+        """进入拖动：接管动作控制权、归零静置计时、切指针形状。
+
+        返回是否真的开始了（已经在拖动中 → `False`，不重复发 `drag_started`）。
+
+        三件事的顺序有意义：
+
+        1. **先挂起静置逻辑**（动作控制权归拖动），再切跑动动作——
+           反了的话状态机可能在两者之间插一次 `stage_changed`，动作闪一下；
+        2. **退出 `manual` 坐姿**：用户拖动 = "别一直坐着了"（task08 §2 第 8 条），
+           这一步同时会把阶段切回 `IDLE`；
+        3. 指针换成"移动"形状（松手还原）。
+        """
+        if self.drag_controller.active:
+            return False
+
+        self.set_action_suspended(True)
+        # 拖动开始就先摆好 idle 的姿势：还没位移时"该播什么"没有依据，
+        # 与其停在 `rest` 的躺姿上，不如从 `idle` 起（松手也是回 `idle`）。
+        self.exit_manual_rest()
+        if self.pet.has_action(IDLE_ACTION):
+            self.play_action(IDLE_ACTION)
+        self.drag_controller.begin(local_pos, global_pos, self._base_pos)
+        self.setCursor(Qt.SizeAllCursor)
+        return True
+
+    def _apply_drag(self, global_pos: QPoint) -> None:
+        """拖动中的一次移动：算位置 → **夹取** → 写权威位置 → 按方向切动作。"""
+        target, action = self.drag_controller.update(global_pos)
+        # 夹取在 `_move_clamped()` 里，**早于** `move_to()` 写权威位置（§4.5）。
+        self._move_clamped(target.x(), target.y())
+        if action is None:
+            # 纯竖直移动：沿用上次方向（不切、不闪）——`direction_action()` 的返回值
+            # 表达的就是"没有依据"，不是"该停了"。
+            return
+        if self.pet.has_action(action) and action != self._animation.action:
+            self.play_action(action)
+
+    def _finish_drag(self, global_pos: QPoint) -> None:
+        """松手：**夹取后**记住落脚点、写配置、恢复静置、还原指针。
+
+        "**只点了一下没拖动**"也走完整条路径（agent.md §4.6）：
+        那一次拖动的位置可能因为贴边被夹住而没变，但仍然需要一次
+        完整的位置校正通知（`move_to()` 里已经处理"变了才发信号"，
+        写配置则每次都写——值没变时 `ConfigStore.set()` 自己短路，不落盘）。
+        """
+        if not self.drag_controller.active:
+            return
+
+        state = self.drag_controller.state
+        final = state.target_position(global_pos)
+        self._move_clamped(final.x(), final.y())
+        # 松手回 `idle`（task08 §2 第 3 条）。
+        if self.pet.has_action(IDLE_ACTION):
+            self.play_action(IDLE_ACTION)
+
+        self._user_positioned = True
+        position = self.base_position
+        self.drag_controller.finish(position)
+        self.set_action_suspended(False)
+        self.unsetCursor()
+        self._persist_position(position)
+
+    def _persist_position(self, pos: QPoint) -> None:
+        """把落脚点写进配置（**只在松手与换档时**，绝不逐帧写）。
+
+        写的是**夹取后**的权威位置（§4.5）。写失败按 §2.10 第二类报错：
+        记 `ERROR` 日志并把系统原因原样带出来——拖动是用户明确要求的操作，
+        它失败了必须让用户知道"这次没记住"。
+        `ConfigStore.set()` 自己**不抛异常**（它返回 `False`），所以这里不会炸。
+
+        没有 `ConfigStore` 时（自检里常常没有）只记 `DEBUG` 并返回：
+        那种情况下"记不住位置"是测试的设定，不是产品故障。
+        """
+        if self._config is None:
+            logger.debug("没有配置 store，跳过位置持久化：%s", geometry.format_position(pos.x(), pos.y()))
+            return
+        text = geometry.format_position(pos.x(), pos.y())
+        if not self._config.set("position", text):
+            reason = self._config.last_error("position") or "未知原因"
+            logger.error("记住宠物位置失败（%s）：%s", text, reason)
+
+    def persist_position(self) -> bool:
+        """把**当前**权威位置写进配置；返回是否写到盘上。
+
+        供"换档时也写一次"与上层（`app.py` 的退出收尾）使用。
+        夹取已经在 `move_to()` 之前发生过了，这里不再夹。
+        """
+        self._persist_position(self.base_position)
+        return self._config is not None
+
+    def set_action_suspended(self, suspended: bool) -> None:
+        """把**动作控制权**交给外部（拖动中）或收回。
+
+        例外的第 ② 条（task07 §4）：挂起期间计时**归零但不切动作**，
+        由拖动逻辑按方向播跑动。**恢复时计时从零重新等**——
+        否则刚松手就立刻张望，用户会觉得"它一直在等着我松手"。
+        """
+        if self._idle is not None:
+            self._idle.set_suspended(bool(suspended))
 
     # ------------------------------------------------------------ 右键菜单
 
@@ -677,7 +810,7 @@ class PetWindow(QWidget):
         """退出 `manual`（主动坐姿）并站起来；返回是否真的退出了。
 
         退出方式有三条（task07 §4）：**再次点菜单 / 双击宠物 / 拖动**。
-        task08 接线拖动，本类先把入口暴露出来。
+        task08 已把拖动这条接上（见 `_start_drag`）。
         """
         if self._idle is None:
             if not self._manual_rest:
@@ -687,15 +820,6 @@ class PetWindow(QWidget):
                 self.play_action(REST_STANDUP_ACTION)
             return True
         return self._idle.exit_manual()
-
-    def set_action_suspended(self, suspended: bool) -> None:
-        """把**动作控制权**交给外部（拖动中）或收回。
-
-        例外的第 ② 条（task07 §4）：挂起期间计时**归零但不切动作**，
-        由拖动逻辑按方向播跑动。**本 task 只暴露接口**，接线在 task08。
-        """
-        if self._idle is not None:
-            self._idle.set_suspended(suspended)
 
     def on_mouse_moved(self) -> None:
         """把"鼠标动了"转成状态机的输入（由 `app.py` 的光标轮询驱动）。"""
@@ -735,7 +859,7 @@ class PetWindow(QWidget):
         - **菜单以宠物窗口为 parent**（`build_menu(self, ...)`）：不设 parent
           的话它只是一条顶层窗口，在"始终置顶"的宠物旁边会掉到别的窗口后面。
         """
-        if self._dragging:
+        if self.drag_controller.active:
             event.accept()
             return
 
@@ -810,8 +934,12 @@ class PetWindow(QWidget):
 
         返回**是否真的设上了遮罩**。区域为空 / 算不出来 → 退化为
         ``clearMask()``（整帧可点），**永不抛异常**。
+
+        实现转发给 `hit_test.region_for_frame()`（**区域生成的唯一入口**）。
+        收进来的图**已经翻过**（镜像在渲染层做），所以"能点到的范围"
+        与"看到的画面"永远一致，这里不需要再管镜像（agent.md §2.14）。
         """
-        region = region_for_image(image)
+        region = hit_test.region_for_frame(image)
         if region is None or region.isEmpty():
             self.clearMask()
             return False
@@ -831,42 +959,106 @@ class PetWindow(QWidget):
             painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        """左键按下：进入拖动。
+
+        **只有按在人物身上才起拖**由 `setMask` 负责——点击透明区时事件
+        由系统级穿透到下面的窗口，本窗口根本收不到 `mousePressEvent`。
+        所以这里**不需要**再判一次坐标（那会造出第二份判定真值，
+        而且与遮罩的任何偏差都会变成"看得见的能点、能点的看不见"）。
+
+        两种坐标**不可混用**（agent.md §4.9）：
+
+        - 位移用 `globalPosition()`（屏幕坐标）；
+        - 命中判定用 `position()`（窗口内坐标）——本 task 只把它记进
+          `DragState.grab_offset`，供诊断与将来的自窗口内判定使用。
+        """
         if event.button() == Qt.LeftButton:
-            # 能收到这个事件，就说明按下点落在遮罩区域内 —— 也就是"按在人物身上"。
-            # 位移一律用全局坐标（窗口内坐标是给命中判定用的，两者不可混用）。
-            self._press_global = event.globalPosition().toPoint()
-            self._drag_base_pos = QPoint(self._base_pos)
-            self._dragging = True
-            self.setCursor(Qt.SizeAllCursor)
+            # 记下"按下这一刻是不是 manual 坐姿"：双击要用**按下前**的值，
+            # 而 `_start_drag()` 会把 manual 退出掉（见 mouseDoubleClickEvent）。
+            self._manual_rest_at_press = self.manual_rest
+            self._start_drag(
+                event.position().toPoint(),
+                event.globalPosition().toPoint(),
+            )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if (
-            self._dragging
-            and self._press_global is not None
-            and event.buttons() & Qt.LeftButton
-        ):
-            delta = event.globalPosition().toPoint() - self._press_global
-            self.drag_by(delta.x(), delta.y())
+        """拖动：位移一律用**全局坐标**算（窗口内坐标是给命中判定用的）。"""
+        if self.drag_controller.active and event.buttons() & Qt.LeftButton:
+            self._apply_drag(event.globalPosition().toPoint())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self._dragging = False
-            self._press_global = None
-            self.unsetCursor()
+        if event.button() == Qt.LeftButton and self.drag_controller.active:
+            self._finish_drag(event.globalPosition().toPoint())
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """双击宠物：**退出 `manual` 坐姿**（task07 §2 第 6 条）。
+        """双击宠物。
 
-        本 task **不做**"双击挥手"那个手势（属 task10），只做这一件事：
+        **拖动途中一律忽略**（task08 §2 第 6 条）：拖动是"按下 → 移动 → 松开"的
+        连续操作，中途插入一个手势会把这次拖动切成两段。本 task **不做**
+        "双击挥手"那个手势（属 task10），只做"拖动途中不触发"这一条。
+
+        不在拖动中且处于 `manual` 坐姿时**退出坐姿**（task07 §2 第 6 条）：
         用户双击的意思是"别一直坐着了"，于是站起来回 `auto` 模式。
-        不在 `manual` 里时**什么都不做**——不抢 task10 的手势。
+
+        ## 为什么最后要 `abort_drag()`
+
+        双击的第 2 次按下会先来一个 `mousePressEvent`（Qt 的固定顺序是
+        press → release → **dblclick**），于是 `_start_drag()` 已经把它当成
+        一次拖动的开始：窗口进入 `dragging`、静置逻辑被挂起。
+        紧接着到来的 `dblclick` **没有**配对的 release（第 2 次按下的 release
+        在 dblclick 之后才到），所以这一次"拖动"会一直挂在那儿——
+        表现是**双击之后宠物僵住**（`dragging` 恒为真 → 右键菜单永远不弹、
+        静置逻辑永远被挂起）。
+
+        task07 的自检当场抓到了这一条（双击后 `suspended` 变成 `True` 且不再恢复）。
+        对策是双击时**明确中止**这次拖动：动作控制权还回去、指针还原。
+        用户真要拖动时，第二次按下之后**移动**会重新进入拖动——
+        双击的那两次点击本身没有位移，中止它不会丢任何东西。
         """
-        if event.button() == Qt.LeftButton and self.manual_rest:
+        if event.button() != Qt.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        if self._manual_rest_at_press:
+            # `manual` 坐姿中双击 → 站起来回 `auto`（task07 §2 第 6 条）。
+            # ⚠ 看的是**按下时**记下的值：双击的第 2 次按下会先走一遍
+            # `_start_drag()`，而它会把 `manual` 退出掉（拖动 = "别坐着了"）。
+            # 此刻再问 `manual_rest` 就永远是假，这一条就失效了。
             self.exit_manual_rest()
+
         super().mouseDoubleClickEvent(event)
+        # ⚠ **必须放在 `super()` 之后**：QWidget 的默认实现会把这次双击
+        # 再翻成一次 `mousePressEvent`（Qt 的顺序是 press → release → dblclick，
+        # 而我们正在处理的那次 press 之前、super 之后还可能再来一次）。
+        # 放在前面中止的话，紧随其后的 press 会立刻把拖动又开起来。
+        self.abort_drag()
+
+    def abort_drag(self) -> bool:
+        """立即中止当前拖动（不写配置、不发 `drag_finished`）；返回是否真的中止了。
+
+        用途只有一个：**双击**。双击的第 2 次按下先来一个 `mousePressEvent`
+        （Qt 的顺序是 press → release → dblclick），于是 `_start_drag()` 已经
+        把窗口置成 `dragging`、并挂起了静置逻辑；而这一次按下**不会**有配对的
+        `mouseReleaseEvent` 走到 `_finish_drag()`（它的 release 在 dblclick 之后，
+        且此时 `active` 已经被这里清掉）。
+
+        "中止"与"松手"是两件事，所以**故意不复用** `_finish_drag()`：
+
+        - 松手要写配置、发 `drag_finished`（用户真的挪了位置）；
+        - 中止什么都不留（那两次点击没有位移，位置本来就是原样）。
+
+        动作控制权照常还回去，并**重新计时**（与松手一致）——
+        否则静置逻辑会一直停摆，宠物再也不会张望。
+        """
+        if not self.drag_controller.active:
+            return False
+        self.drag_controller.active = False
+        self.set_action_suspended(False)
+        self.unsetCursor()
+        return True
 
 
 def _pick_action(pet: PetSpec, preferred: str) -> str:
