@@ -645,6 +645,14 @@ def _log_sound_summary(player: SoundPlayer) -> None:
     """
     report = player.diagnose()
     _logger.info("音效：%s", report.summary())
+    # "支持哪些格式"由 **Qt 后端**说了算，所以这里把实测结果打出来，
+    # 而不是让用户去猜我们的扩展名表：`--list-*` 与日志都看得到同一份事实。
+    if report.decoder_formats:
+        _logger.info(
+            "音效：Qt 后端支持的容器 %s；音频编码 %s",
+            "、".join(report.decoder_formats),
+            "、".join(report.decoder_codecs) or "（问不到）",
+        )
     for name in report.missing:
         _logger.warning("音效 %s：索引里声明了，但文件不在", name)
     for name, reason in report.unplayable:

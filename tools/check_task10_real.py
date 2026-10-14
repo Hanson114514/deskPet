@@ -237,6 +237,51 @@ def _run() -> int:
         report.summary() == "音效 2/2",
         report.summary(),
     )
+    # 多格式：真平台上把 **Qt 后端实际支持的格式**问出来（不是抄清单）。
+    check(
+        "真平台上问得到 Qt 支持的容器",
+        bool(report.decoder_formats),
+        f"实测 {report.decoder_formats}",
+    )
+    check(
+        "真平台上 Qt 报出支持 Ogg（.ogg 可用的事实依据）",
+        any(item.lower() == "ogg" for item in report.decoder_formats),
+        f"实测 {report.decoder_formats}",
+    )
+    check(
+        "真平台上问得到音频编码",
+        bool(report.decoder_codecs),
+        f"实测 {report.decoder_codecs}",
+    )
+
+    # ⚠ 真文件、非 .wav 后缀：确认**后缀不挡路**。
+    # 内容是真的 WAV —— 本机没有 ogg/m4a 编码器，装不了（见 agent.md §4.19）。
+    for named in (".ogg", ".m4a"):
+        stem = named.strip(".")
+        alt = SCRATCH / "pets" / f"t10real{stem}"
+        if alt.exists():
+            shutil.rmtree(alt)
+        shutil.copytree(SCRATCH / "pets" / "t10real", alt)
+        (alt / "sounds" / f"ding{named}").write_bytes(
+            (alt / "sounds" / "ding.wav").read_bytes()
+        )
+        data = json.loads((alt / "asset.json").read_text(encoding="utf-8"))
+        data["sounds"] = {"rest": f"ding{named}", "chime": f"ding{named}"}
+        (alt / "asset.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        alt_player = snd.SoundPlayer(load_pet(alt), 70)
+        alt_player.preload()
+        wait = QDeadlineTimer(2000)
+        while not wait.hasExpired():
+            app.processEvents()
+            app.thread().msleep(5)
+        check(
+            f"真平台上声明 {named} 能加载并播放（后缀不挡路）",
+            alt_player.play("rest") is True,
+            f"playable={alt_player.diagnose().playable}",
+        )
+        alt_player.close()
 
     # ------------------------------------------------------------ §2 启动音时机
     section("2. 启动音时机：preload → chime 的实际延迟 ≈ 80 ms")

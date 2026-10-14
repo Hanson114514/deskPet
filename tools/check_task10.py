@@ -708,6 +708,94 @@ def _run_checks() -> int:
     check("close() 之后可以再 close（幂等、不抛）", (player.close() or True))
     check("close() 清掉了播放器表", not player._players, f"实测 {list(player._players)}")
 
+    # ------------------------------------------------------------ §11 多格式支持
+    section("11. 多格式：后缀不参与判定、支持的格式运行时问 Qt")
+
+    # 后缀清单认得常见写法。
+    for suffix in (".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac", ".wma"):
+        check(
+            f"后缀 {suffix} 在已知清单里",
+            snd.suffix_supported(f"x{suffix}"),
+            f"实测 {snd.suffix_supported(f'x{suffix}')}",
+        )
+    check("大小写不敏感（.OGG）", snd.suffix_supported("x.OGG"))
+    check("乱后缀不在清单里（但**不影响播放**）", not snd.suffix_supported("x.exe"))
+
+    # ⚠ **本 task 最关键的一条**：后缀认不出来**不许**挡住播放。
+    # 判据是"play() 真的走到了设备调用"，而不是"清单里有它"。
+    odd_root = _make_pet("t10oddsuffix", {"rest": "sound.weird", "chime": None}, {"sound.weird": _tiny_wav()})
+    odd_spec = _load(odd_root)
+    odd_player = snd.SoundPlayer(odd_spec, 70)
+    odd_player.preload()
+    _pump_events(app, seconds=1.2)
+    odd_report = odd_player.diagnose()
+    check(
+        "奇怪后缀仍被真的加载（后缀不参与判定）",
+        "rest" in odd_report.playable,
+        f"playable={odd_report.playable}，unplayable={odd_report.unplayable}",
+    )
+    check("奇怪后缀的内容真能播", odd_player.play("rest") is True)
+    check(
+        "奇怪后缀只影响日志措辞（清单里确实没有它）",
+        not snd.suffix_supported("sound.weird"),
+        f"suffix_supported('sound.weird')={snd.suffix_supported('sound.weird')}",
+    )
+
+    # 真文件用 .ogg / .m4a 扩展名：内容是真的 WAV，重点验"后缀不挡路"。
+    for named in (".ogg", ".m4a", ".flac", ".opus"):
+        root = _make_pet(
+            f"t10fmt{named.strip('.')}",
+            {"rest": f"sound{named}", "chime": None},
+            {f"sound{named}": _tiny_wav()},
+        )
+        player_for = snd.SoundPlayer(_load(root), 70)
+        player_for.preload()
+        _pump_events(app, seconds=1.0)
+        check(
+            f"声明 {named} 时能真的加载并播放",
+            player_for.play("rest") is True,
+            f"playable={player_for.diagnose().playable}",
+        )
+        player_for.close()
+
+    # 支持的容器/编码**运行时问 Qt**，不是抄的表。
+    formats = snd.decoder_file_formats()
+    codecs = snd.decoder_audio_codecs()
+    check("问得到 Qt 支持的容器", bool(formats), f"实测 {formats}")
+    check("问得到 Qt 支持的音频编码", bool(codecs), f"实测 {codecs}")
+    check(
+        "Ogg 在 Qt 报出的容器里（.ogg 可用的事实依据）",
+        any(item.lower() == "ogg" for item in formats),
+        f"实测 {formats}",
+    )
+    check(
+        "MP3 / Wave 在 Qt 报出的编码里",
+        {"MP3", "Wave"}.issubset(set(codecs)),
+        f"实测 {codecs}",
+    )
+    check(
+        "报告里带着这两份事实",
+        bool(odd_report.decoder_formats) and bool(odd_report.decoder_codecs),
+        f"formats={len(odd_report.decoder_formats)} codecs={len(odd_report.decoder_codecs)}",
+    )
+    # 问不到也不许抛（没有 QApplication 的场景）。
+    check(
+        "后缀判定是纯查询、不碰磁盘",
+        snd.suffix_supported("完全不存在的目录/x.ogg") is True,
+        "只比较后缀，不 stat 文件",
+    )
+    odd_player.close()
+    check(
+        "已知后缀清单只有一处真值",
+        "KNOWN_AUDIO_SUFFIXES: Final[frozenset[str]]" in _source_of("sounds.py"),
+        "源码里的写法",
+    )
+    check(
+        "播放路径不按后缀拦（可执行代码里没有 suffix 判断挡播放）",
+        "suffix" not in _code_only(ROOT / "src" / "deskpet" / "sounds.py").split("def play")[1].split("def ")[0],
+        "play() 里没有后缀判断",
+    )
+
     # ------------------------------------------------------------ 收尾
     check("窗口能干净关闭", (window.close() or True))
 

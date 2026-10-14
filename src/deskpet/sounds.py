@@ -35,6 +35,30 @@
 代价是 `QMediaPlayer` 每个音效要一个实例 + 一条 `QAudioOutput`，
 所以播放器**按需创建并缓存**（`_players`），`close()` 统一收掉。
 
+## 支持哪些音频格式（**不由本模块决定**）
+
+格式支持来自 **Qt 的 FFmpeg 后端**，本模块**不维护**"哪些格式能播"的清单：
+
+- **播放路径不按扩展名过滤**：任何后缀都会真的去尝试播放，
+  "打不开"由 `_poll_error()`（`error()` + `mediaStatus()`）判定（§4.18）；
+- `KNOWN_AUDIO_SUFFIXES` 只用来让日志说人话（"这个后缀我没见过，但我还是试了"），
+  **不参与任何判定**；
+- "到底支持什么"运行时问 Qt：`decoder_file_formats()` / `decoder_audio_codecs()`
+  （`SoundReport` 里也带着这两份，启动日志会打出来）。
+
+本机实测 Qt 报出的容器：`MP3` / `FLAC` / `Wave` / `Ogg` / `MPEG4` / `QuickTime` /
+`Mpeg4Audio` / `AAC` / `WMA` / `Matroska` / `AVI` / `WMV`；
+音频编码：`MP3` / `AAC` / `AC3` / `EAC3` / `FLAC` / `Wave` / `WMA` / `ALAC`。
+所以 `.ogg` / `.m4a` / `.flac` / `.opus` 这类**本来就该能用**。
+
+⚠ 两条必须记住的事实：
+
+1. **同一扩展名能不能打开取决于文件内容**（§4.18：FFmpeg 探针很宽容，
+   某些内容会被当裸流接受）。所以"支持某格式"只能用**真文件**实测，
+   扩展名保证不了任何事；
+2. **打包时必须带上 Qt 的 multimedia 插件与 FFmpeg 动态库**，
+   否则表现为"开发机能响、打包后没声音"（本阶段不打包，先记在这里）。
+
 ## 三条诊断可见性（task10 §4）
 
 | # | 情况 | 判据 |
@@ -133,6 +157,7 @@ class SoundReport:
     | `unplayable` | 文件在、但**格式打不开**的逻辑名 → `(名字, 原因)` |
     | `undeclared` | `sounds/` 里**存在却没声明**的文件名 |
     | `available` / `reason` | 整体可用标志与原因 |
+    | `decoder_formats` / `decoder_codecs` | **Qt 后端实测支持的容器与音频编码**（运行时问出来的，不是抄的表） |
     """
 
     namespace: str
@@ -145,6 +170,9 @@ class SoundReport:
     reason: str = ""
     #: 能播出来的逻辑名（诊断用）。
     playable: tuple[str, ...] = field(default_factory=tuple)
+    #: Qt 后端实测支持的容器 / 音频编码（问不到时为空元组）。
+    decoder_formats: tuple[str, ...] = field(default_factory=tuple)
+    decoder_codecs: tuple[str, ...] = field(default_factory=tuple)
 
     def summary(self) -> str:
         """汇报文案（**格式不可改**，task10 §2 第 7 条 / §4）。
@@ -180,15 +208,94 @@ def sounds_dir(spec: PetSpec) -> Path:
     return spec.root / SOUNDS_DIR_NAME
 
 
-def _is_audio_candidate(path: Path) -> bool:
-    """扩展名判断**只保留在"要不要尝试播放"这一层**（task10 §4）。
+#: **认得的音效扩展名**（多媒体容器 + 裸音频流）。
+#:
+#: ## 这张表**不参与"能不能播"的判定**
+#:
+#: 它只用来让日志说人话："这个后缀我没见过，但我还是试了"。
+#: "打不开"一律由 `_poll_error()`（`error()` + `mediaStatus()`）说了算
+#: （task10 §4 / §4.18：**别拿扩展名当判据**）。
+#:
+#: ## 支持哪些格式由 **Qt 的 FFmpeg 后端**决定，不由本表决定
+#:
+#: 本机实测（`QMediaFormat.supportedFileFormats(Decode)`）Qt 报出的容器：
+#: `MP3` / `FLAC` / `Wave` / `Ogg` / `MPEG4` / `QuickTime` / `Mpeg4Audio` /
+#: `AAC` / `WMA` / `Matroska` / `AVI` / `WMV`；
+#: 音频编码：`MP3` / `AAC` / `AC3` / `EAC3` / `FLAC` / `Wave` / `WMA` / `ALAC`。
+#: 所以 `.ogg` / `.m4a` / `.flac` / `.opus` 这些**本来就该能用**，
+#: 本表只是把常见写法列全，方便日志区分"认得"与"没见过"。
+#:
+#: ⚠ 同一个扩展名**能不能真的打开取决于文件内容**（§4.18：FFmpeg 探针很宽容，
+#: 某些内容会被当裸流接受）。所以"支持某格式"这句话只能用**真文件**实测，
+#: 扩展名表保证不了任何事。
+KNOWN_AUDIO_SUFFIXES: Final[frozenset[str]] = frozenset(
+    {
+        # 裸音频流 / 常见压缩音频
+        ".wav", ".wave",
+        ".mp3", ".m4a", ".mp4", ".aac", ".alac",
+        ".ogg", ".oga", ".opus", ".flac", ".wma",
+        # 可能装着音轨的容器（用户从别处拿来的文件常常是这些）
+        ".mka", ".mkv", ".webm", ".avi", ".mov", ".aiff", ".aif", ".ac3", ".eac3",
+    }
+)
 
-    旧实现那张"按扩展名给 MCI 设备类型"的表**整体删除**：Qt 这边不需要
-    设备类型，扩展名只用来回答"这个文件值不值得试一次"。
-    认不出来的一律**照试**——"打不开"由试播结果说了算，不由扩展名说了算。
+
+def _is_audio_candidate(path: Path) -> bool:
+    """后缀**认不认得**（**不参与任何判定**，只影响日志措辞）。
+
+    task10 §4 定下的分层：旧实现那张"按扩展名给 MCI 设备类型"的表**整体删除**
+    （Qt 不需要设备类型）。这个函数回答的是"要不要提醒一句"，不是"能不能播"：
+    返回 `False` 时调用方**照样**会尝试播放，只是多记一条 info
+    ——"打不开"由 `_poll_error()` 说了算，不由后缀说了算。
     """
-    suffix = path.suffix.lower()
-    return suffix in {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".wma", ".opus"}
+    return path.suffix.lower() in KNOWN_AUDIO_SUFFIXES
+
+
+def suffix_supported(path: Path | str) -> bool:
+    """这个**后缀**在已知清单里吗（纯查询，不碰磁盘、不做判定）。
+
+    给自检与诊断用。⚠ 它**不是**"这个文件能不能播"的答案——
+    那个问题只有 `SoundPlayer` 问得出来（`_poll_error()`）。
+    """
+    return _is_audio_candidate(Path(path))
+
+
+def supported_suffixes() -> tuple[str, ...]:
+    """已知后缀清单（排序后的元组，供 `--list-*` / 诊断打印）。"""
+    return tuple(sorted(KNOWN_AUDIO_SUFFIXES))
+
+
+def decoder_file_formats() -> tuple[str, ...]:
+    """**Qt 后端当前实际支持的容器**（运行时问 Qt，返回名字元组）。
+
+    这是"支持哪些格式"这条事实的**唯一权威来源**：格式支持随 Qt / FFmpeg
+    的构建而变，抄一张写死的表迟早会与事实分叉。问不到（没有
+    `QMediaFormat` / 没有 `QApplication`）→ 空元组，**永不抛异常**。
+    """
+    try:
+        from PySide6.QtMultimedia import QMediaFormat
+
+        formats = QMediaFormat().supportedFileFormats(
+            QMediaFormat.ConversionMode.Decode
+        )
+    except Exception as exc:  # noqa: BLE001 - 问不到就返回空，调用方退化
+        logger.debug("问 Qt 拿支持的容器失败：%s", exc)
+        return ()
+    return tuple(item.name for item in formats)
+
+
+def decoder_audio_codecs() -> tuple[str, ...]:
+    """**Qt 后端当前实际支持的音频编码**（运行时问 Qt）。问不到 → 空元组。"""
+    try:
+        from PySide6.QtMultimedia import QMediaFormat
+
+        codecs = QMediaFormat().supportedAudioCodecs(
+            QMediaFormat.ConversionMode.Decode
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("问 Qt 拿支持的音频编码失败：%s", exc)
+        return ()
+    return tuple(item.name for item in codecs)
 
 
 def list_undeclared(spec: PetSpec) -> tuple[str, ...]:
@@ -661,7 +768,7 @@ class SoundPlayer(QObject):
     # ------------------------------------------------------------ 诊断
 
     def diagnose(self) -> SoundReport:
-        """三条诊断可见性（`SoundReport` 是**结构化**的，调用方自己决定怎么显示）。"""
+        """三条诊断可见性 + **Qt 后端实测支持的格式**（结构化，调用方自己决定怎么显示）。"""
         entries = tuple(self._entries.values())
         missing = tuple(name for name, entry in self._entries.items() if not entry.exists)
         unplayable = tuple(
@@ -682,6 +789,10 @@ class SoundPlayer(QObject):
             available=self._available,
             reason=self._reason,
             playable=playable,
+            # "支持哪些格式"这条事实**运行时问 Qt**，不抄写死的表
+            # （格式支持随 Qt / FFmpeg 的构建而变，抄的迟早分叉）。
+            decoder_formats=decoder_file_formats(),
+            decoder_codecs=decoder_audio_codecs(),
         )
 
     def report(self) -> SoundReport:
