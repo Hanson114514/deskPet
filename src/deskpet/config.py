@@ -577,4 +577,20 @@ for _field in fields(Config):  # pragma: no cover - 只有代码被改歪了才�
             f"Config.{_field.name} 的默认值 {_effective!r} 与 "
             f"DEFAULTS 的 {DEFAULTS[_field.name]!r} 分叉了"
         )
+
+# 防漂移（task12）：呼出快捷键的默认值**只允许一处**。
+# 真值在 `hotkey.DEFAULT_HOTKEY`（它落在"热键"那一层），`config.DEFAULTS["hotkey"]`
+# 必须与它一致。这里用**函数内导入**规避循环依赖（`hotkey` 会 import `config` 吗？
+# 不会——但 `hotkey` 依赖 PySide6，而 `config` 是"基础"层，导入期拉进 Qt 不划算）。
+def _assert_default_hotkey_matches() -> None:  # pragma: no cover - 只有改歪了才走到
+    from .hotkey import DEFAULT_HOTKEY
+
+    if DEFAULTS["hotkey"] != DEFAULT_HOTKEY:
+        raise RuntimeError(
+            f"config.DEFAULTS['hotkey'] = {DEFAULTS['hotkey']!r} 与 "
+            f"hotkey.DEFAULT_HOTKEY = {DEFAULT_HOTKEY!r} 分叉了（真值只允许一处）"
+        )
+
+
+_assert_default_hotkey_matches()
 del _field

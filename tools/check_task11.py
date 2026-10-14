@@ -275,10 +275,13 @@ def _run_checks() -> int:
         f"{volume.minimum}–{volume.maximum}",
     )
     check(
-        "未实现的只有 开机自启 与 呼出快捷键 两行",
+        # ⚠ task12 起 `呼出快捷键` 已接线，只剩 `开机自启`（task14）。
+        # 这三条期望值是 task12 按事实更新的——它们原文就是"本 task 的边界"，
+        # 而那个边界已经被下游 task 推掉了（与 task10 更新 task07 那两条同理）。
+        "未实现的只剩 开机自启 一行",
         tuple(field.title for field in st.FIELDS if not field.implemented)
-        == ("开机自启", "呼出快捷键"),
-        "、".join(field.title for field in st.FIELDS if not field.implemented),
+        == ("开机自启",),
+        "、".join(field.title for field in st.FIELDS if not field.implemented) or "（没有）",
     )
     check(
         "已删除的两个开关不在描述表里",
@@ -332,17 +335,24 @@ def _window_sections() -> int:
         check("内容区装在 QScrollArea 里（够高的问题不靠调大数字）",
               len(window.findChildren(QScrollArea)) >= 1)
 
-        # 禁用态与标题后缀：未实现的两行。
+        # 禁用态与标题后缀：只剩 `开机自启` 一行未实现。
+        # ⚠ task12 起 `呼出快捷键` **已解锁**（它原来那两条期望值已按事实更新，
+        # 理由见上一节：那个"未实现"的边界是 task11 自己划的，task12 推掉了它）。
         combo, check_w, key_w = (
             window._widgets["pet"],
             window._find_slider(window._widgets["volume"]),
             window._widgets["hotkey"],
         )
         check("角色下拉可用", isinstance(combo, QComboBox) and combo.isEnabled())
-        check("呼出快捷键控件**禁用**", not key_w.isEnabled(), f"enabled={key_w.isEnabled()}")
         check(
-            "呼出快捷键行标题带 `（暂未开放）`",
-            "呼出快捷键（暂未开放）" in _label_texts(window),
+            "呼出快捷键控件**可用**（task12 已接线）",
+            key_w.isEnabled(),
+            f"enabled={key_w.isEnabled()}",
+        )
+        check(
+            "呼出快捷键行标题**不带** `（暂未开放）`",
+            "呼出快捷键" in _label_texts(window)
+            and "呼出快捷键（暂未开放）" not in _label_texts(window),
             "、".join(t for t in _label_texts(window) if "快捷键" in t),
         )
         check(
@@ -351,7 +361,7 @@ def _window_sections() -> int:
             "、".join(t for t in _label_texts(window) if "自启" in t),
         )
         check(
-            "未实现的两行是**禁用**不是隐藏（控件仍在界面上）",
+            "未实现的项是**禁用**不是隐藏（控件仍在界面上）",
             "hotkey" in window._widgets and window._widgets["hotkey"].isVisibleTo(window),
             "控件对象存在且属于窗口",
         )

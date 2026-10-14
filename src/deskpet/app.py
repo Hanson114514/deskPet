@@ -46,7 +46,9 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
 from . import PROGRAM_NAME, __version__
+from . import context_menu
 from . import geometry
+from . import hotkey as hotkey_mod
 from . import logger as log
 from . import paths, pet_loader, size
 from .animation import UnknownActionError
@@ -60,7 +62,7 @@ from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
-from .settings import SettingsWindow
+from .settings import HotkeyChanger, HotkeyOutcome, SettingsWindow
 from .sounds import SOUND_CHIME, SoundPlayer, normalize_volume
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
@@ -396,6 +398,8 @@ class ControlBarController:
         #: → 左上角必然变），但那**不是用户拖动**，控制栏必须一动不动
         #: （task09 §6"本 task 最关键的一条"）。这个标志就是用来把两者分开的。
         self._stepping = False
+        #: 隐藏宠物之前栏是不是开着的（task12：呼出时据此决定要不要放回来）。
+        self._was_visible = False
 
     # ------------------------------------------------------------ 开关
 
@@ -403,6 +407,28 @@ class ControlBarController:
     def visible(self) -> bool:
         """控制栏当前是不是开着（**幂等的判据**）。"""
         return self.bar is not None and self.bar.isVisible()
+
+    @property
+    def was_visible(self) -> bool:
+        """隐藏之前它是不是开着的（task12：呼出时要不要一起放回来）。
+
+        ⚠ 判据是 `self.bar is not None` + 一个**单独记的标志**，不是
+        `isVisible()`：宠物藏起来时栏已经被 `hide()` 了，那一刻问 `isVisible()`
+        永远是假，于是"呼出时把栏一起放回来"就失效了。
+        """
+        return self._was_visible
+
+    def hide_for_pet(self) -> None:
+        """隐藏宠物时把栏一起藏起来（**不碰位置、不碰边距**）。
+
+        与 `close()` 的区别：`close()` 是"用户关掉了栏"，它会把底部预留边距
+        归零、把宠物放回贴屏幕底边——那是**改变状态**。而隐藏是
+        "保留状态不销毁"（task12 §4），呼出时要原样回来，所以这里只 `hide()`，
+        连预留边距都不动。
+        """
+        self._was_visible = self.visible
+        if self.bar is not None:
+            self.bar.hide()
 
     def toggle(self) -> None:
         """`调整大小…` 的动作：开着就关掉，没开就打开（幂等）。"""
@@ -547,6 +573,182 @@ class ControlBarController:
             self.bar.place_relative_to(self._pet_rect(), self.bar.screen_rect())
 
 
+class HotkeyController:
+    """把**全局热键**接到"隐藏 / 呼出"上（task12 的组装层，`app.py` 独有）。
+
+    ## 它要串起来的四件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | 启动注册 | 按候选链试；走了回退就**写回配置**并说一句"已改用 X" |
+    | 热键 = 切换 | 按一次隐藏、再按一次呼出（task12 §6 的"隐藏 → 呼出重复 20 次"） |
+    | **分两拍处理** | 收到信号**不当场动窗口**，先 `QTimer.singleShot(0, ...)` 让出一次事件循环 |
+    | 换热键 | 只试用户给的那一个；失败**回滚到原来那个** |
+
+    ## 为什么必须分两拍（task12 §4 硬要求）
+
+    热键回调发生在"Qt 正在处理某个消息"的栈上。在这一层里直接 `show()` /
+    `hide()` 会让窗口管理器在**一次嵌套的激活流程**里重入：
+    表现是偶尔回到最上层却拿不到焦点，或者窗口先闪一下。
+    让出一次事件循环之后，切换发生在**干净的消息处理边界**上。
+
+    ⚠ **轮询不挂在动画帧回调上**（`agent.md` §4.8 的红线）：窗口隐藏后精灵停帧、
+    帧回调不再触发，热键就永远没人处理。本实现走的是
+    `HotkeyManager.hotkey_pressed` **信号**（D5 = 子线程 + 队列 + 取件定时器），
+    与动画帧率完全无关——隐藏期间动画定时器已经停了，热键照常到达。
+    """
+
+    def __init__(self, window: PetWindow, store: ConfigStore) -> None:
+        self.window = window
+        self.store = store
+        self.manager = hotkey_mod.HotkeyManager(window)
+        #: 控制栏控制器（隐藏时要一起藏）。`app.py` 组装完控制栏再装进来。
+        self.bar_controller: ControlBarController | None = None
+        #: 最近一次注册的结论（启动行与日志用）。
+        self.result = hotkey_mod.RegisterResult(None, False, "")
+        self.manager.hotkey_pressed.connect(self._on_hotkey_pressed)
+        # 窗口的"隐藏宠物"菜单项也走这里（菜单 → 隐藏；热键 → 切换）。
+        window.set_visibility_handler(self.hide)
+
+    # ------------------------------------------------------------ 注册
+
+    def start(self, preferred: str) -> hotkey_mod.RegisterResult:
+        """启动时按候选链注册，并把"用了哪个"告诉窗口与配置。
+
+        **写回配置**只在真的走了回退链时发生（`changed=True`）：
+        首选能用时写一遍是多余的一次磁盘写。
+        """
+        self.result = self.manager.register(preferred)
+        self.window.set_hotkey_available(self.manager.has_hotkey)
+        if self.result.combo is None:
+            _logger.error(
+                "没有可用的呼出快捷键（%s）：隐藏功能已禁用，"
+                "请先在「设置」里指定一个快捷键",
+                self.result.reason,
+            )
+            return self.result
+
+        if self.result.changed:
+            # 说清楚"原快捷键不可用，已改用 X"（task12 §6 明写要有这个说明）。
+            _logger.warning(
+                "原快捷键 %s 不可用，已改用 %s", preferred, self.result.combo
+            )
+            self._persist(str(self.result.combo))
+        _logger.info("呼出快捷键：%s", self.result.combo)
+        return self.result
+
+    def change(self, combo: str, previous: str) -> HotkeyOutcome:
+        """换呼出快捷键（设置窗口那一行调它）：**成功才留下**。
+
+        ## 顺序：先放旧的、再注册新的；失败把旧的抢回来
+
+        `RegisterHotKey` 对同一个组合是"自己占着自己"，所以换键必须
+        **先释放旧的**，否则新键还没试就注定失败（如果新旧相同则直接返回成功）。
+
+        失败路径上一定要 `restore(previous)`：不恢复的话，用户敲了一个被占用的
+        组合之后会落到**一个热键都没有**的状态 —— 那正是 task12 最怕的事情
+        （藏起来叫不回来）。所以"回滚"在这里是**真的把旧热键注册回去**，
+        而不是只把配置写回去（`task12 §6："绝不落到没有热键可用"`）。
+        """
+        if combo == previous:
+            return HotkeyOutcome(True, combo, "")
+        self.manager.release_hotkey()
+        outcome = self.manager.try_register(combo)
+        if outcome.combo is not None:
+            self.window.set_hotkey_available(True)
+            _logger.info("呼出快捷键已改为 %s", outcome.combo)
+            return HotkeyOutcome(True, outcome.combo, "")
+
+        # 失败：把旧的那个抢回来（**即使回滚也失败**，状态也要如实反映）。
+        restored = self.manager.restore(previous)
+        self.window.set_hotkey_available(self.manager.has_hotkey)
+        if restored.combo is None:
+            _logger.error("回滚 %s 也失败了：%s", previous, restored.reason)
+            return HotkeyOutcome(
+                False, None, f"{outcome.reason}（原来的 {previous} 也没能恢复）"
+            )
+        _logger.warning("呼出快捷键 %s 没能启用：%s（已恢复 %s）", combo, outcome.reason, previous)
+        return HotkeyOutcome(False, None, outcome.reason)
+
+    # ------------------------------------------------------------ 隐藏 / 呼出
+
+    def hide(self) -> None:
+        """`隐藏宠物` 菜单项的动作（**只隐藏，不切换**）。
+
+        与热键的区别：热键是"切换"，菜单项是"藏起来"。
+        藏不起来（没有可用热键）→ 说清楚原因，**绝不假装成功**。
+        """
+        if not self.window.hide_pet():
+            self._report_cannot_hide()
+            return
+        _logger.info("宠物已隐藏（按 %s 呼出）", self.manager.combo or "（没有热键）")
+        self._hide_bar()
+
+    def toggle(self) -> None:
+        """热键的动作：藏着就呼出，显示着就隐藏（**两拍处理**，见类说明）。"""
+        if self.window.hidden_by_user:
+            self._show()
+        else:
+            if not self.window.hide_pet():
+                self._report_cannot_hide()
+                return
+            _logger.info("宠物已隐藏（按 %s 呼出）", self.manager.combo or "（没有热键）")
+            self._hide_bar()
+
+    def _on_hotkey_pressed(self) -> None:
+        """收到 `WM_HOTKEY`：**先让出一次事件循环**，再执行切换。
+
+        `singleShot(0, ...)` 就是"分两拍"的实现方式（task12 §4）：
+        它把切换排到当前消息处理**结束之后**，避免在窗口管理器的
+        嵌套激活流程里重入。
+        """
+        QTimer.singleShot(0, self.toggle)
+
+    def _show(self) -> None:
+        """呼出：显示宠物 + 把控制栏一起放回来。"""
+        if not self.window.show_pet():
+            return
+        if self.bar_controller is not None and self.bar_controller.was_visible:
+            self.bar_controller.open()
+
+    def _hide_bar(self) -> None:
+        """隐藏时把控制栏一起藏起来（它是**独立顶层窗口**，不会跟着宠物走）。
+
+        ⚠ 这里**不能**用 `bar_controller.close()`：那会把宠物的底部预留
+        边距归零、把位置改掉——隐藏是"保留状态不销毁"，位置必须原样留着。
+        所以只 `hide()` 栏本身，并记住它本来是开着的。
+        """
+        if self.bar_controller is not None and self.bar_controller.visible:
+            self.bar_controller.hide_for_pet()
+
+    def _report_cannot_hide(self) -> None:
+        """没有可用热键时把附录 B 那句话说出来（**弹窗 + 日志**）。
+
+        用弹窗的理由：这是**用户需要知道并采取行动**的事（去「设置」里指定一个
+        快捷键），属于 `agent.md §2.10` 的第二类。此刻窗口是可见的，
+        模态框不会像启动期那样挡住一个还没起来的程序。
+        """
+        reason = context_menu.REASON_NO_HOTKEY
+        _logger.warning("%s", reason)
+        if self.result.reason:
+            _logger.warning("原因：%s", self.result.reason)
+        log.show_message(PROGRAM_NAME, reason)
+
+    def _persist(self, combo: str) -> None:
+        """把回退链选出来的组合写回配置（**写失败只记日志**）。
+
+        写不进去不影响本次运行：热键已经在系统里注册上了。
+        下次启动会再从配置里的旧值开始试一遍候选链——结果一样。
+        """
+        result = self.store.apply("hotkey", combo)
+        if not result.ok:
+            _logger.error("呼出快捷键没能写回配置：%s", result.error)
+
+    def stop(self) -> None:
+        """退出收尾：**彻底释放热键**（组合不被本进程占着）。"""
+        self.manager.unregister()
+
+
 class SettingsController:
     """把**设置窗口**接到宠物上（task11 的"组装"那一层，`app.py` 独有）。
 
@@ -568,6 +770,15 @@ class SettingsController:
         self._store = store
         self._window = window
         self._dialog: SettingsWindow | None = None
+        #: 换呼出快捷键的处理器（task12）。**每个新窗口都要重新装**：
+        #: 关一次就释放实例，下次打开是一个全新的窗口（见 `open()`）。
+        self._hotkey_changer: HotkeyChanger | None = None
+
+    def set_hotkey_changer(self, changer: "HotkeyChanger | None") -> None:
+        """由 `app.py` 装上"换热键"的函数（task12）。"""
+        self._hotkey_changer = changer
+        if self._dialog is not None:
+            self._dialog.set_hotkey_changer(changer)
 
     @property
     def dialog(self) -> "SettingsWindow | None":
@@ -589,6 +800,11 @@ class SettingsController:
         # 关掉之后**释放实例引用**：下次打开是一个全新的窗口，
         # 不会带着上一次的状态（task11 §2 第 4 条："关闭后再打开正常"）。
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        # ⚠ 每个新窗口都要重新装换热键的处理器（task12）：不装的话，
+        # 第二、三次打开设置窗口时录入快捷键只会写配置、**不注册系统热键**
+        # ——用户看到"设置成功"却按不出来，正是最典型的假成功。
+        if self._hotkey_changer is not None:
+            dialog.set_hotkey_changer(self._hotkey_changer)
         dialog.finished.connect(self._on_finished)
         # 设置里改的值要**立刻**作用到运行时（音量已在 `store.config_changed`
         # 上接了；久置时间由状态机每次判定现读）。
@@ -658,6 +874,10 @@ def _print_startup_line(window: PetWindow, level_source: str, position_source: s
     task08 起必须带上**位置来源**（`命令行指定` / `沿用上次` / `默认落点`）：
     "宠物怎么没在昨天的位置"与"怎么又贴在右下角了"靠它一眼分辨
     （task08 §6 有两条验收直接盯着这个文字）。
+
+    ⚠ task12 的热键**不在这里打印**：它必须在**注册之后**才有结论，
+    而这一行是在窗口 `show()` 之后、热键注册之前打的（那时还不知道结果）。
+    热键那一行由 `HotkeyController.start()` 自己记（`呼出快捷键：…`）。
     """
     position = window.base_position
     width, height = window.pixel_size
@@ -993,11 +1213,27 @@ def run(argv: list[str] | None = None) -> int:
     sound_player.settle()
     _log_sound_summary(sound_player)
 
+    # ------------------------------------------------------------ 全局热键（task12）
+    #
+    # 组装放在**窗口 show() 之后**：热键注册失败时要弹提示、要写配置，
+    # 两件事都希望"用户已经能看到宠物"（隐藏功能才有意义）。
+    #
+    # ⚠ 注册失败**绝不阻断启动**：没有热键只是"不能隐藏"，桌宠照常能用
+    # （`agent.md §2.10` 第三类：可恢复 → 记日志 + 退化）。真的危险的是
+    # "没有热键却允许隐藏"，那一条由 `hide_pet()` 拦住。
+    hotkey_controller = HotkeyController(window, store)
+    hotkey_result = hotkey_controller.start(str(store.get("hotkey") or hotkey_mod.DEFAULT_HOTKEY))
+    if hotkey_result.combo is None:
+        _logger.error("隐藏功能不可用：%s", hotkey_result.reason)
+
     # ------------------------------------------------------------ 尺寸控制栏（task09）
     #
     # 组装放在**窗口 show() 之后**：控制栏要读宠物的权威位置与自己所在屏幕，
     # 两者都要窗口先起来才准（agent.md §4.9 "DPI 缩放需要窗口先起来"）。
     bar_controller = ControlBarController(window)
+    # 隐藏/呼出时要连控制栏一起处理（task12）：藏起来两个都藏、
+    # 呼出来则**只在藏之前它是开着的**才放回来。
+    hotkey_controller.bar_controller = bar_controller
     # `调整大小…` 的动作 = 开关控制栏 **+ 重置静置计时**（task09 §4 "菜单项"）。
     # 重置的理由：用户刚跟界面交互过，接着就张望会显得"没在听"。
     # 用 `IdleStateMachine.on_mouse_moved()` 而不是直接改内部字段——
@@ -1027,6 +1263,9 @@ def run(argv: list[str] | None = None) -> int:
         settings_controller.open()
 
     window.set_settings_handler(_open_settings)
+    # 呼出快捷键那一行（task12）：界面**不碰** RegisterHotKey，
+    # 它只问一句"这个组合能不能用"，注册与回滚都在 HotkeyController 里。
+    settings_controller.set_hotkey_changer(hotkey_controller.change)
 
     # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
     # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；
@@ -1060,9 +1299,13 @@ def run(argv: list[str] | None = None) -> int:
     try:
         code = app.exec()
     finally:
-        # 退出收尾。本阶段还没有热键 / 单实例锁要放（task12 / task13），
-        # 收掉自己的心跳定时器、久置计时器、光标轮询与**音效设备**。
+        # 退出收尾。本阶段还没有单实例锁要放（task13），
+        # 收掉自己的心跳定时器、久置计时器、光标轮询、**全局热键**与音效设备。
         window.stop_animation()
+        # ⚠ **热键必须彻底释放**（task12 §4）：不释放的表现是"组合被本进程占着"，
+        # 退出后立刻重启，同一个组合注册不上（验收里专门盯这一条）。
+        # 放在**最前面**：它比别的收尾更怕"来不及做"。
+        hotkey_controller.stop()
         # 控制栏是**独立顶层窗口**：不显式收起的话它会比宠物活得久
         # （`Qt.Tool` 不计入"最后一个主窗口"，agent.md §4.9）。
         bar_controller.close()

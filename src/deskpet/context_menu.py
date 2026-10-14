@@ -12,10 +12,11 @@
 
 ## 未接线的项是**禁用**不是隐藏
 
-`隐藏宠物`（task12）还没有实现，但**照常出现在菜单里、只是灰掉**——保持菜单位置稳定，
-免得用户以后找不到（task06 §2 第 2 条）。
-（`调整大小…` 已由 task09 接上、`设置…` 已由 task11 接上：两者的"可用性"都是
-**装没装处理器**，没装时仍然灰掉。）
+`隐藏宠物`（task12）已接线；**本文件现在没有未接线的项了**
+（`NOT_WIRED_YET` 是空元组）。它曾经是灰的，理由与将来任何一项一样：
+**保持菜单位置稳定**，免得用户以后找不到（task06 §2 第 2 条）。
+（`调整大小…` 由 task09 接上、`设置…` 由 task11 接上、`隐藏宠物` 由 task12 接上：
+三者的"可用性"都是**装没装处理器**；`隐藏宠物` 还要求**真的有呼出快捷键**。）
 
 ## 文字的真值
 
@@ -66,8 +67,16 @@ MENU_ORDER: Final[tuple[str, ...]] = (
 )
 
 #: 尚未接线的项（**显示为灰色不可点**，不是隐藏）。
-#: task09 接上了 `调整大小…`、task11 接上了 `设置…`，现在只剩 `隐藏宠物`（task12）。
-NOT_WIRED_YET: Final[tuple[str, ...]] = (ID_VISIBILITY,)
+#: task09 接上了 `调整大小…`、task11 接上了 `设置…`、task12 接上了 `隐藏宠物`
+#: ——**现在是空的**，也就是说菜单里不再有"点了没反应"的项。
+NOT_WIRED_YET: Final[tuple[str, ...]] = ()
+
+#: 禁用 `隐藏宠物` 的原因（task12 §6 逐字，附录 B）。
+#: ⚠ 禁用是**没有商量余地的**：一个可用的呼出快捷键都没有时，
+#: 隐藏出去就再也叫不回来，那句话必须原样出现在提示里。
+REASON_NO_HOTKEY: Final[str] = (
+    "没有可用的呼出快捷键，隐藏后将无法呼出。请先在「设置」里指定一个快捷键。"
+)
 
 
 @dataclass(frozen=True)
@@ -82,9 +91,14 @@ class MenuState:
     | `can_mirror` | 当前动作在不在镜像适用范围内 |
     | `can_rest` | 素材里有没有 `rest`（缺动作时那一项点了也没用，灰掉） |
     | `resize_available` / `settings_available` / `visibility_available` | 那三项接上了没有（各自看"装没装处理器"） |
+    | `visibility_reason` | `隐藏宠物` 不可用时的原因（挂到提示条上）；可用时是空串 |
 
     `mirror_on` 与 `can_mirror` **分开**：适用范围外"没有勾选"与"勾选了但无效"
     是两件事，后者会让用户以为点了没反应。
+
+    `visibility_reason` **只在不可用时才有内容**：可用时挂一句"为什么不能藏"
+    只会让用户以为出了什么事。灰色项本身不给提示条（Qt 不给禁用项发
+    `helpEvent`），所以这句话由调用方在别处显示（见 `pet_window` 的用法）。
     """
 
     action: str
@@ -95,6 +109,7 @@ class MenuState:
     resize_available: bool = False
     settings_available: bool = False
     visibility_available: bool = False
+    visibility_reason: str = ""
 
     def action_text(self) -> str:
         """`action` 项当前该显示的文字。"""
@@ -174,10 +189,10 @@ def _apply_state(action: QAction, item_id: str, state: MenuState) -> None:
 def _availability(item_id: str, state: MenuState) -> bool:
     """`调整大小…` / `设置…` / `隐藏宠物` 各自接上了没有。
 
-    `调整大小…`（task09）与 `设置…`（task11）都是**装没装处理器**；
-    `隐藏宠物`（task12）还没实现，`MenuState` 里对应字段恒为 `False`，
-    于是它**显示为灰色不可点**（不是消失）。下游 task 接上时把字段置真即可，
-    本函数不必改。
+    三项都是**装没装处理器**（task09 / task11 / task12）。
+    ⚠ `隐藏宠物` 还多一个条件：**必须有可用的呼出快捷键**——没有热键时
+    藏起来就叫不回来，所以那种情况下即使处理器装了也要灰掉
+    （`visibility_available` 在 `pet_window.menu_state()` 里已经把两件事与在一起）。
     """
     if item_id == ID_RESIZE:
         return state.resize_available

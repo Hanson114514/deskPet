@@ -32,7 +32,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Final
+from typing import Callable, Final, NamedTuple
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -114,6 +114,29 @@ class FieldKind(Enum):
     SLIDER = "slider"
 
 
+class HotkeyOutcome(NamedTuple):
+    """一次"换呼出快捷键"的结果（task12）。
+
+    设置窗口**不碰 `RegisterHotKey`**：它只问一句"这个组合能不能用"。
+    真正的注册在 `app.py` 那层（涉及 Win32 热键、候选链、失败回滚与
+    运行时状态），界面只管显示结论——分层与本项目其他部分一致。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `ok` | 这个组合**真的成了**（系统热键已注册上） |
+    | `combo` | 最终生效的组合；失败时是 `None` |
+    | `reason` | 失败原因（**系统原文优先**，成功时空串） |
+    """
+
+    ok: bool
+    combo: str | None = None
+    reason: str = ""
+
+
+#: 换呼出快捷键的函数签名：`(新说法, 旧说法) -> HotkeyOutcome`。
+HotkeyChanger = Callable[[str, str], HotkeyOutcome]
+
+
 @dataclass(frozen=True)
 class FieldSpec:
     """一行设置的描述（**界面的唯一真相源**）。
@@ -166,7 +189,8 @@ FIELDS: Final[tuple[FieldSpec, ...]] = (
         title="呼出快捷键",
         hint=HINT_HOTKEY,
         kind=FieldKind.KEYSEQ,
-        implemented=False,
+        # task12 接线：这一行解锁（不再带 `（暂未开放）`）。
+        implemented=True,
     ),
     FieldSpec(
         group="声音",
@@ -298,6 +322,9 @@ class SettingsWindow(QDialog):
         self._value_labels: dict[str, QLabel] = {}
         #: 最近一次失败的原因；**空串 = 没有失败**。状态栏渲染时先看它。
         self._last_failure: str = ""
+        #: 换呼出快捷键的处理器（task12，由 `app.py` 装）。
+        #: `None` = 自检里那种"没有系统热键"的场景 → 只写配置。
+        self._hotkey_changer: HotkeyChanger | None = None
 
         self.setWindowTitle(TITLE)
         self.setModal(True)
@@ -456,6 +483,17 @@ class SettingsWindow(QDialog):
             self._applying = False
         self.refresh_status()
 
+    def set_hotkey_changer(self, changer: HotkeyChanger | None) -> None:
+        """装上"换呼出快捷键"的处理器（task12；`app.py` 用）。
+
+        与 `PetWindow.set_resize_handler()` 同一个模式：**装没装决定这一行怎么走**。
+        没装（自检里）→ 只写配置；装了 → **先注册成功再写配置**（见 `_on_keyseq`）。
+
+        ⚠ 在 `__init__` **之后**调用会错过一次 `_load_from_config()`；
+        那句话是有意为之：本方法只影响**之后**的录入行为，不影响初值显示。
+        """
+        self._hotkey_changer = changer
+
     def reload_from_config(self, current_pet: str | None = None) -> None:
         """重新读一遍配置（**重复点 `设置…` 时用**：窗口可能停在旧值上）。
 
@@ -579,10 +617,55 @@ class SettingsWindow(QDialog):
         self._write_field(field, bool(checked))
 
     def _on_keyseq(self, field: FieldSpec, text: str) -> None:
-        """录到一个快捷键（本 task 该控件是禁用的，task12 接上后走这里）。"""
+        """录到一个快捷键（task12 接线）：**先注册成功，再写配置**。
+
+        ## 顺序为什么不能反
+
+        | 顺序 | 后果 |
+        | --- | --- |
+        | 先写配置、再注册 | 注册失败时磁盘上已经是一个**用不了的**快捷键，下次启动还会照着它去注册 |
+        | **先注册、再写配置**（本实现） | 注册失败 → 配置与控件都回到真实状态，磁盘上永远是"真的能用"的那个 |
+
+        注册失败**必须回滚到原来那个**（task12 §6）：这里先
+        `restore(previous)` 把旧热键抢回来，再让控件显示配置里的真值。
+        **绝不落到"没有热键可用"**——那会让 `隐藏宠物` 立刻变成禁用，
+        而用户其实什么都没做错，只是敲了一个被占用的组合。
+
+        ⚠ 校验交给 `hotkey.HotkeyManager.try_register()`：
+        "什么算合法组合"的真值在 `hotkey_spec.parse_combo()` 一处，
+        界面不重复判断（否则两处迟早不一样）。
+        """
         if self._applying:
             return
-        self._write_field(field, str(text))
+        if self._hotkey_changer is None:
+            # 没装改热键的处理器（自检里常见）→ 只写配置，不动系统热键。
+            self._write_field(field, str(text))
+            return
+
+        previous = str(self._store.get(field.key) or "")
+        outcome = self._hotkey_changer(str(text), previous)
+        if not outcome.ok:
+            # 换失败：把**旧热键抢回来**，界面退回真实值，状态栏说清原因。
+            self._hotkey_changer(previous, previous)
+            self._applying = True
+            try:
+                widget = self._widgets.get(field.key)
+                if widget is not None:
+                    widget.set_shortcut_text(previous)  # type: ignore[attr-defined]
+                    widget.reject_capture(outcome.reason)  # type: ignore[attr-defined]
+            finally:
+                self._applying = False
+            self._last_failure = outcome.reason
+            self.refresh_status()
+            logger.warning("设置：快捷键 %s 没能启用：%s", text, outcome.reason)
+            return
+
+        if not self._write_field(field, str(text)):
+            # 写配置失败：热键已经换成新的了，配置还是旧的 →
+            # **把热键换回去**，让两边一致（绝不显示假成功）。
+            self._hotkey_changer(previous, previous)
+            return
+        self._set_status_text(f"呼出快捷键已改为 {text}")
 
     def _on_combo(self, field: FieldSpec) -> None:
         """角色下拉换了：写 `pet`，坏包则退回默认形象 + 提示详情。"""

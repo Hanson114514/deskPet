@@ -340,6 +340,37 @@ def show_fatal_error(message: str) -> bool:
         return False
 
 
+def show_message(title: str, message: str) -> bool:
+    """一条**用户需要知道并采取行动**的提示（不是致命错误）。
+
+    与 `show_fatal_error()` 同一条纪律：Qt 只在确实需要时导入，
+    没有 `QApplication` / 弹不出来时返回 `False`，**调用方仍要写日志**
+    （`agent.md §2.10`：需要用户行动的弹窗 + 日志）。
+
+    ⚠ 它是**模态**的（`dialog.exec()`），所以**只允许在事件循环已经跑起来、
+    窗口可见**的时候调用。启动期的致命错误走 `show_fatal_error()`，
+    只读查询与命令行用法错误走 stderr + 退出码（那些都发生在建 app 之前）。
+    """
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+    except Exception:
+        return False
+
+    if QApplication.instance() is None:
+        return False
+
+    try:
+        dialog = QMessageBox()
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle(title)
+        dialog.setText(message)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
+        return True
+    except Exception:  # pragma: no cover - 弹不出来不改变"已经记了日志"这个事实
+        return False
+
+
 # ------------------------------------------------------------------ 崩溃兜底
 
 

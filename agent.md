@@ -102,7 +102,9 @@ C:\projects\deskPet\
 | `autostart.py` | 系统 | 开机自启（读与修**分开**） | ⬜ task14 |
 | `single_instance.py` | 系统 | 单实例保护 | ⬜ task13 |
 | `restart.py` | 系统 | 重启自己（含锁交接） | ⬜ task13 |
-| `hotkey.py` / `hotkey_filter.py` | 系统 | 全局热键注册 / 原生消息接收 | ⬜ task12 |
+| `win32.py` | 系统 | **Win32 薄绑定**（唯一的 `ctypes` 出口；非 Windows 上导入不炸、只报"不可用"） | ✅ task12 |
+| `hotkey_spec.py` | 系统 | 快捷键**说法**：两套修饰键掩码、`parse_combo` / `format_combo`（纯逻辑） | ✅ task12 |
+| `hotkey.py` | 系统 | 全局热键：子线程消息循环 + 候选链回退 + 彻底释放（**D5 定案**） | ✅ task12 |
 | `rendering.py` | 视图 | 帧 → 目标尺寸的绘制对象 + LRU 缓存（键含**动作/帧号/档位/镜像**） | ✅ task04 / 镜像 task06 |
 | `animation.py` | 逻辑 | 帧推进 / 播放方式（loop / pingpong / oneshot）/ 定格 / 片段序列（**纯逻辑**，只有一个 `QObject`） | ✅ task05 |
 | `idle_state.py` | 逻辑 | 久置行为状态机（**纯逻辑，不依赖 Qt**；时间由外部喂） | ✅ task07 |
@@ -529,6 +531,33 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 菜单接线 | `设置…` 的可用性 = **装没装处理器**（`PetWindow.set_settings_handler()`），与 `调整大小…` 同一模式。处理器里**先 `idle_state.on_mouse_moved()`**（重置静置计时）再开窗口 |
 | **任务栏高度** | `QScreen.geometry()` 在真机上是 **1392**（1440 − 48 任务栏）；`availableGeometry()` 也是 1392。**别把 1440 当屏幕高度写进断言** |
 
+### 2.20 全局热键与隐藏呼出（task12 定案）
+
+| 项 | 约定 |
+| --- | --- |
+| **D5 最终选择** | **子线程 + `GetMessageW` 消息循环 + `queue` + GUI 线程 100 ms 取件定时器**（task12 §4 两条路线里的第二条）。`hotkey_filter.py` **没有创建**——原生消息过滤器那条路没走 |
+| 为什么选它 | 后台线程建自己的窗口、跑自己的消息循环 → **不碰主线程的消息钩子**（没有"隐藏期间钩子被系统摘掉"的风险）、**唤醒是事件驱动的**（平时阻塞在 `GetMessageW`，隐藏期间 CPU 0）、**退出安全**（一条 `PostThreadMessageW(WM_QUIT)` 就收工） |
+| **120 ms 轮询** | **已去掉**。120 那个数一次都没出现在代码里。GUI 线程只剩 `PICKUP_INTERVAL_MS = 100` 的**取件**定时器（从内存队列取，空队列时是微秒级；**不是轮询系统状态**） |
+| ⚠ **注册认线程** | `RegisterHotKey` 必须在**拥有该窗口的那个线程**里调用。从别的线程调会返回 **`1408`（无效窗口；它属于另一线程）**，**不是** `1409`。所以 `hotkey._HotkeyThread.call()` 把所有 Win32 调用都投回子线程执行 |
+| 常量真值 | `hotkey.CANDIDATES`（回退链五条）、`hotkey.DEFAULT_HOTKEY`（**与 `config.DEFAULTS["hotkey"]` 同源，有模块级断言守着**）、`hotkey.PICKUP_INTERVAL_MS = 100`、`hotkey_spec.MOD_*`（系统掩码唯一真值） |
+| **两套掩码** | 系统热键：`Shift 4 / Ctrl 2 / Alt 1 / Win 8`（`Ctrl+Alt+Shift` = **`0x7`**，不是 `0xF`）。界面状态位那套（`0x0001/0x0004/0x0008`）**本 task 一次都没用到**——录入只看 `event.key()` |
+| 掩码转换位置 | **只有一处**：`hotkey_spec`（`MOD_*` 常量 + `parse_combo` / `format_combo` / `win_mods_to_names`）。别的模块不许手算掩码 |
+| 说法格式 | `"Ctrl+Alt+Shift+P"`，**展示顺序固定 `Ctrl → Alt → Shift → Win`**。解析大小写不敏感、收 `Control`/`Meta`/`Windows` 等别名 |
+| 校验 | 必须**至少一个修饰键** + **恰好一个主键**；非法 → `ComboError` 带原因（文案 `快捷键必须包含 Ctrl / Alt / Shift / Win 之一`） |
+| 注册顺序 | 首选（配置里的）→ 失败按 `CANDIDATES` 依次试（跳过与首选重复的）→ 全失败 `combo = None` |
+| 回退后 | **写回配置**（只在 `changed=True` 时写一次）+ 日志 `原快捷键 X 不可用，已改用 Y` |
+| **`combo is None` 时必须禁用隐藏** | 菜单 `隐藏宠物` 的可用性 = **装了处理器 AND 真有热键**（`MenuState.visibility_available`）。`hide_pet()` 自己**再拦一道**返回 `False`（默认 `_hotkey_available = False`，即"不知道就按没有处理"） |
+| 提示文案真值 | `context_menu.REASON_NO_HOTKEY` 一处：`没有可用的呼出快捷键，隐藏后将无法呼出。请先在「设置」里指定一个快捷键。` |
+| 隐藏语义 | **保留状态不销毁**：只 `hide()`，窗口 / 帧缓存 / 档位 / 位置全留；**动画定时器停掉**（隐藏期间不烧 CPU），呼出时**从原来那一帧接着播** |
+| 呼出置顶 | `show_pet()` 里 `setWindowFlag(Qt.WindowStaysOnTopHint, True)` **然后**才 `show()` + `raise_()`（改标志会让系统重建底层窗口，顺序反了等于"显示完立刻被藏掉"） |
+| 热键 = 切换 | 按一次隐藏、再按一次呼出（用户 2025 确认）。菜单项是**单向**的"隐藏" |
+| **分两拍处理** | `_on_hotkey_pressed` 里 **`QTimer.singleShot(0, self.toggle)`**——不当场动窗口。理由：热键回调发生在"Qt 正在处理某个消息"的栈上，直接 `show()` 会让窗口管理器在嵌套激活流程里重入 |
+| 控制栏跟着走 | `ControlBarController.hide_for_pet()` 只 `hide()` 栏，**不碰位置与预留边距**；`was_visible` **单独记标志**（宠物藏起来时 `isVisible()` 永远是假，拿它当判据会让"呼出时放回栏"失效） |
+| 换热键 | 设置窗口那一行进 `HotkeyChanger`：**先注册成功、再写配置**（反了会让磁盘上留下一个用不了的组合）。失败 → `restore(previous)` **真的把旧热键抢回来** + 控件回滚 + 状态栏说原因。**绝不落到"没有热键可用"** |
+| ⚠ 每个新设置窗口都要重装 changer | `SettingsController.open()` 里每造一个 `SettingsWindow` 都要 `set_hotkey_changer()`——不装的话第 2 次以后的录入**只写配置、不注册系统热键**（典型的假成功） |
+| 退出 | `finally` 里**最先**调 `hotkey_controller.stop()` → `manager.unregister()`（`PostThreadMessage(WM_QUIT)` → `join(2s)`）；子线程 `finally` 里 `UnregisterHotKey` + `DestroyWindow` |
+| 窗口 proc 签名 | `WNDPROC` 四个参数与返回值**都必须是指针宽度**（`WPARAM`/`LPARAM`/`LRESULT`）；而且回调对象**必须模块级持有强引用**（`_WINDOW_PROC`），否则是野指针。详见 §4.20 |
+
 ---
 
 ## 3. 新对话工作流
@@ -855,6 +884,42 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 - ⚠ **同一个扩展名能不能打开取决于内容**（§4.18 第 3 条），
   所以"支持某格式"只能用真文件实测，扩展名保证不了任何事。
 
+### 4.20 Win32 全局热键的四个实测坑（task12）
+
+- **`RegisterHotKey` 认线程**：它必须在**拥有那个窗口的线程**里调用，否则返回
+  **`1408`（`无效窗口；它属于另一线程`）**——**不是** `1409`。这两个错误码只差一位，
+  粗心看日志会得出"所有快捷键都被占用了"的错误结论（本项目差点照这个结论去
+  写"回退链耗尽"的提示）。判据：同一 `hwnd`，主线程调 `False/1408`，
+  子线程内调 `True/0`。对策：所有 Win32 调用都经 `_HotkeyThread.call()` 投回子线程。
+- **`GetLastError` 成功时不写**：它只在**失败**时被设置，成功时保留**上一次**的值。
+  所以"注册成功 + 紧接着读到 1408"这种自相矛盾的记录真会出现。对策：
+  `win32.clear_last_error()` 在每次调用前清零，并且**判据永远是返回值**，
+  错误码只在返回假时才有意义。
+- **`WNDPROC` 的签名必须是指针宽度**：`LRESULT` / `WPARAM` / `LPARAM` 在 64 位下
+  都是 8 字节。把 `lParam` 声明成 `int` 时 `DefWindowProcW` 会抛
+  `ctypes.ArgumentError: argument 4: OverflowError: int too long to convert`，
+  而**回调里的异常不会冒泡**——只在 stderr 打一行
+  `Exception ignored while calling ctypes callback function`，极容易被当成噪音忽略。
+  另外回调对象**必须模块级强引用**（`_WINDOW_PROC`）：没人引用它就是野指针。
+- **`keybd_event` 在自动化会话里送不到热键**（**测试方法坑，不是产品问题**）：
+  实测同一台机器上，`keybd_event(Ctrl,Alt,Shift,P)` 之后消息队列**什么都没有**
+  （信号 0 次），而 `PostThreadMessageW(tid, WM_HOTKEY)` **立刻**触发 1 次。
+  原因是 `keybd_event` 走**真实键盘输入栈**，要由输入系统在"键盘焦点"上下文中派发，
+  无人值守 / 前台是别的进程时不保证成立。**对策**：自检把判据拆成两半各自用最硬的那种
+  ——**消息接收链路**用投递验（系统在热键被按时做的就是往线程队列投 `WM_HOTKEY`），
+  **注册与释放**用真 Win32 调用验；"操作系统愿不愿意派发"这一条只能**人工按键确认**。
+
+**顺带核实的两条系统语义**（用来支撑"占用"与"强杀"这两条验收）：
+
+- **占用是跨进程的**：父进程占住组合后，**另一个进程**注册同一组合会拿到 `1409`；
+  同一个进程内换一个 `id` 注册同一组合也是 `1409`。所以"用别的程序占住"这个
+  验收手段是成立的。
+- **强制结束进程不会留下占着的热键**：`taskkill /F`（走 `TerminateProcess`，
+  不执行我们的 `finally`、也就不会 `UnregisterHotKey`）之后**立刻**注册同一组合
+  是**成功**的。也就是说"强杀 → 热键没释放"这条**在本机不成立**：热键的归属是
+  **进程**，进程一消亡系统就回收它。真正需要"主动释放"的场景是**正常退出后
+  立刻重启**（那时旧进程可能还在收尾），而正常退出本来就走 `finally`。
+
 ---
 
 ## 5. 当前进度
@@ -872,8 +937,8 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task09 | 尺寸控制栏：一条悬浮条，缩放时按钮不动 | ✅ 已完成 |
 | task10 | 音效与双击手势：坐下有声音，双击会挥手 | ✅ 已完成 |
 | task11 | 设置窗口：五行设置、改完立即生效、绝不显示假成功 | ✅ 已完成 |
-| task12 | 全局热键：藏起来还能叫回来 | ⬜ **下一个** |
-| task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ 未开始 |
+| task12 | 全局热键：藏起来还能叫回来 | ✅ 已完成 |
+| task13 | 单实例与重启自己：换完形象要能活着回来 | ⬜ **下一个** |
 | task14 | 开机自启：状态是真的、开关能关掉、启动文件夹里只有一个文件 | ⬜ 未开始 |
 
 **task01（已完成）** —— 透明置顶窗口可拖可退，`setMask` 真穿透已实测。
@@ -1310,7 +1375,87 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 > 是它的真值，本 task 只是占位，task14 接上时换成真实查询结果）；
 > **② 状态栏的成功提示文案**（`已切换到「…」；重启后生效`）卡里没给，属自定。
 
-**下一步**：`tasks/task12.md`（全局热键）。**⚠ 开工前先读 §A**。
+**task12（已完成）** —— 全局热键：藏起来还能叫回来。**约定见 §2.20，踩坑见 §4.20**；
+新增 `win32.py`（`ctypes` 唯一出口）、`hotkey_spec.py`（掩码 + 说法解析）、
+`hotkey.py`（`HotkeyManager` + 子线程消息循环）；
+`pet_window.py` 加 `hide_pet()` / `show_pet()` / `visibility_changed` / `set_hotkey_available()`；
+`context_menu.py` 的 `NOT_WIRED_YET` 清空、加 `REASON_NO_HOTKEY`；
+`settings.py` 解锁 `呼出快捷键` 行（加 `HotkeyOutcome` / `set_hotkey_changer()`）；
+`keycapture.py` 主键名改问 `hotkey_spec.format_qt_key()`（不再用 `QKeySequence`）、加 `reject_capture()`；
+`app.py` 加 `HotkeyController`（注册 / 切换 / 换热键 / 释放）+ `logger.show_message()`。
+
+**D5 的最终选择 = 子线程 + `GetMessageW` + `queue` + 100 ms 取件**（`hotkey_filter.py`
+**没有创建**）。**120 ms 轮询已去掉**：GUI 线程那个定时器是**从内存队列取件**
+（空队列时微秒级），不是轮询系统状态。**"分两拍处理"**的实现方式 =
+`_on_hotkey_pressed` 里 `QTimer.singleShot(0, self.toggle)`。
+
+实测（本机 2560×1440 / DPI 100%）：
+
+- **本机 `Ctrl+Alt+Shift+P` 直接可用**（没走回退链，`changed=False`）；启动日志
+  `呼出快捷键：Ctrl+Alt+Shift+P`。
+- **回退链 + 写回配置（真进程实测）**：先用一个占位进程占住 `Ctrl+Alt+Shift+P`
+  再启动桌宠 → 日志 `原快捷键 Ctrl+Alt+Shift+P 不可用（…错误 1409），已改用 Ctrl+Alt+Shift+O`，
+  `config.json` 里 `hotkey` 真的被改写成 **`Ctrl+Alt+Shift+O`**。
+- **候选链全占住 → `combo=None`**：日志 `所有候选快捷键都注册不上` +
+  `没有可用的呼出快捷键（…）：隐藏功能已禁用`；`MenuState.visibility_available` 为假
+  →菜单 `隐藏宠物` **灰掉**（不是隐藏），`hide_pet()` 也**拒绝隐藏**（返回 `False`）。
+- **隐藏 / 呼出（真窗口）**：投一条真 `WM_HOTKEY` → 宠物隐藏（`hidden=True`、
+  `visible=False`、动画定时器**已停**）；再投一条 → 呼出（`visible=True`、
+  **仍带 `WindowStaysOnTopHint`**、动画定时器**恢复**）。
+  隐藏→呼出 **20 次**：始终是**同一个窗口对象**、帧总数不变、档位与位置全程未变，
+  40 次切换共 **1380 ms（平均 34.5 ms/次）**——证明是"保留状态"而不是重建窗口。
+- **换热键失败会回滚**：先用另一个 `HotkeyManager` 真占住 `Ctrl+Shift+F9`，
+  再 `change()` 过去 → `ok=False` + 占用文案；断言 **`manager.combo` 仍是原来那个**
+  `Ctrl+Alt+Shift+P`，并且**再投一条 `WM_HOTKEY` 它真的还能触发**（不只是"字段没变"）。
+- **退出时彻底释放**：`stop()` 之后 `combo=None`；**立刻**新建 manager 注册同一组合
+  **成功**。
+- ⚠ **踩到并修掉一个真 bug：`RegisterHotKey` 认线程**（`1408` 而不是 `1409`）。
+  第一版从 GUI 线程调用子线程建出来的窗口 → 注册全失败。三个探针取到了干净判据
+  （主线程调 `False/1408`、**子线程内**调 `True/0`），对策是把所有 Win32 调用
+  经 `_HotkeyThread.call()` 投回子线程。**已记进 §4.20。**
+- ⚠ **另一处必须记下来的：`WNDPROC` 签名 + 回调强引用**。把 `lParam` 当 `int`
+  会让 `DefWindowProcW` 抛 `OverflowError`，而**回调里的异常不冒泡**（只在 stderr
+  打一行 `Exception ignored while calling ctypes callback function`）。
+- **强杀路径实测（系统语义，已记 §4.20）**：`taskkill /F` 之后**立刻**注册同一组合
+  **成功**——热键归属**进程**，进程消亡系统就回收。所以"强杀后热键没释放"这条
+  **在本机不成立**，不需要为它做额外处理。
+- **CPU**：可见播放时实测 **0.00%**（4 秒采样）。隐藏期间的判据是**动画定时器已停**
+  + 取件定时器只有 100 ms 一次的空队列检查（微秒级）——**没有 120 ms 轮询在空转**。
+
+验收：task12 §6 的 **15 条逐条跑过**（15 条里有 3 条只能人工确认，见下）。
+两个脚本**留在仓库里**：`tools/check_task12.py`（offscreen，**110 项断言全过**）+
+`tools/check_task12_real.py`（真平台，**27 项全过**）。改过 `pet_window.py` /
+`settings.py` / `context_menu.py` / `keycapture.py` / `app.py` / `config.py` / `logger.py`
+之后**回归跑了 task04–11 的全部 offscreen 自检**（30 / 55 / 128 / 123 / 128 / 115 / 117 / 115 项，**全过**）
+与全部真平台检查（task05/06/07/08/09/10/11，**全过**）。
+
+**⚠ 没能自动化的 3 条（必须人工按键确认）**：① 真按 `Ctrl+Alt+Shift+P` 呼出
+（`keybd_event` 在自动化会话里送不到热键，见 §4.20；消息链路本身已被投递法覆盖）；
+② "切到浏览器它还在最上层"（要看观感）；③ 中文键盘布局下 AltGr 不会多报一个 Alt
+（卡里也写了"若发现异常，记录到 agent.md"——本机**未发现异常**，录入只读 `event.key()`）。
+
+> **§A 自查**：① **没有**同一个问题试 3 次以上——`1408` 那次用了**三个递进的只读探针**
+> （建窗口有效性 → 线程归属 → 干净对照）就定位到根因，`src/` 只按事实改了一处
+> （`_HotkeyThread.call()`）；首轮 FAIL 里绝大多数**一次就判定是测试自己写错**
+> （手写 `0x4|0x1` 当 Ctrl+Alt、`_code_only()` 用空格拼 token 却拿带点字面量去判、
+> 拿未来才录到的值断言现在、把 `FIELDS.title` 当成渲染后的标题、
+> 搜索 `"modifiers"` 命中了我们自己的 `modifiers_text()`、`_FakeWin32` 漏替常量与方法）。
+> ② **没有**改到卡范围之外：单实例 / 重启 / 自启 / 托盘 / 多热键 / 宏一律没碰；
+> `hidden→呼出` 只做了"保留状态"，没有做销毁重建。
+> ③ 文档改动集中在 §2.20 新增小节 + §4.20 新增小节 + §1.2 三行 + D5 + 本节，
+> 与代码改动（3 个新模块 + 7 个模块改）**同量级**。
+> ④ 临时探针（`tools/probe_task12*.py`、`tools/probe_t12_*.py`、
+> `data/probe_t12*.txt`、`data/t12acc*`、`data/t12*_out.txt`、`data/t12cpu*`、`data/t12x*`）
+> **已全部删掉**（`Get-ChildItem data` 现在只剩日志与各 task 的 `*_check.txt` / `*_real.txt`）。
+> ⑤ **规格缺口（按顺序规则处理，需你确认）**：卡里把候选链写成 `Win+Alt+P`，
+> 又规定展示顺序固定 `Ctrl → Alt → Shift → Win` —— 两者对同一个组合给出两种写法。
+> 本单位**以顺序规则为准**（`Win+Alt+P` 的规范写法 = `Alt+Win+P`），因为它才是
+> 用户可见、也是写进配置与录入控件的那一个；两者解析到**同一掩码 `0x9`**，
+> 所以注册行为完全一致。自检里有一条专门盯它。
+> ⑥ 顺带按事实更新了 `check_task11.py` 的 **3 条期望值**（它们原文写着"呼出快捷键未实现"，
+> 而那正是 task11 自己划的、被 task12 推掉的边界；与 task10 更新 task07 那两条同理）。
+
+**下一步**：`tasks/task13.md`（单实例与重启自己）。**⚠ 开工前先读 §A**。
 
 **已知待清理（不阻塞主线）**：
 
@@ -1323,7 +1468,7 @@ offscreen 平台**不支持 `setMask`**（§4.9），所以"遮罩真的跟着�
 | D2 | 点击穿透 | task01 之前 | ✅ **已定案**：`setMask(QRegion)`（接受边缘锯齿） |
 | D3 | 缩放算法：`SmoothTransformation` / 三倍最近邻 | task04 之前 | ✅ **已定案（task04）**：`SmoothTransformation`。理由：源 GIF 是 1 位 alpha，放大时最近邻会把台阶等比放大；`SmoothTransformation` 柔化边缘，代价只是边缘多出半透明像素，而"`setMask` 有锯齿"本来就是已接受的取舍 |
 | D4 | 音频后端：`QMediaPlayer`（可播 mp3）/ `QSoundEffect`（只支持 wav） | task10 之前 | ✅ **已定案（task10）**：`QMediaPlayer` + `QAudioOutput`（要能播 mp3；**不需要额外依赖**，`PySide6.QtMultimedia` 实测可用） |
-| D5 | 全局热键路线：原生消息过滤器 / 子线程+队列+定时器 | task12 之前 | ⬜ 未定 |
+| D5 | 全局热键路线：原生消息过滤器 / 子线程+队列+定时器 | task12 之前 | ✅ **已定案（task12）**：**子线程 + `GetMessageW` 消息循环 + `queue` + GUI 线程 100 ms 取件定时器**。理由：不碰主线程消息钩子（隐藏期间没有"钩子被摘"的风险）、唤醒是事件驱动（隐藏期间 CPU 0）、退出安全。**`hotkey_filter.py` 没有创建**；**原定的 120 ms 轮询已去掉** |
 | D6 | 单实例机制：`QLocalServer` / 命名互斥体 | task13 之前 | ⬜ 未定 |
 | D7 | 自带素材包补 `fps` | 任意 | ✅ **已落实**：两个包、13 个动作全是 `30.0` |
 | D8 | `hitmask.json` 是否继续支持 | task03 之前 | ✅ **已定案：不再需要**（`setMask` 按 alpha 生成区域），读取与降级一律不做 |

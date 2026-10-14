@@ -216,6 +216,10 @@ class PetWindow(QWidget):
     #: **只在真的变了时发**：位置没变的"点一下没拖动"走的是写配置那条路径。
     position_changed = Signal(QPoint)
 
+    #: 隐藏 / 呼出（task12，agent.md §2.2 的信号表）。`True` = 现在可见。
+    #: 控制栏等"跟着宠物一起走"的窗口挂在它上面（藏起来要一起藏）。
+    visibility_changed = Signal(bool)
+
     def __init__(
         self,
         pet: PetSpec,
@@ -268,6 +272,16 @@ class PetWindow(QWidget):
         #: `设置…` 的处理函数（task11）：`app.py` 装进来，负责"打开/前置设置窗口"。
         #: 与 `_resize_handler` 同一种做法：**没装就灰掉**。
         self._settings_handler: Callable[[], None] | None = None
+
+        #: `隐藏宠物` 的处理函数（task12）：`app.py` 装进来。
+        self._visibility_handler: Callable[[], None] | None = None
+
+        #: 现在有没有可用的呼出快捷键（task12）。`False` → `隐藏宠物` 灰掉。
+        #: ⚠ 默认 `False` 是**安全的那一侧**：没有热键时藏起来叫不回来，
+        #: 所以"不知道"必须按"没有"处理（`app.py` 注册完热键会立刻置真）。
+        self._hotkey_available = False
+        #: 当前是不是被用户藏起来了（**保留状态不销毁**，见 `hide_pet()`）。
+        self._hidden = False
 
         #: **底部预留边距**（task09 的"缩放中按钮不动"机制）：窗口底边距屏幕底边的
         #: 逻辑单位数。`0` = 贴屏幕底边（缺省落点的样子）；`RESERVED` = 抬起来给
@@ -616,6 +630,16 @@ class PetWindow(QWidget):
         """停表但**保留当前画面**（定格是另一回事，见 `hold_frame()`）。"""
         self._driver.stop()
 
+    @property
+    def animation_driver_running(self) -> bool:
+        """动画定时器还在不在转（诊断与自检用）。
+
+        task12 用它验两件事：**隐藏期间表已停**（不白烧 CPU）、
+        **呼出后表又转起来**（帧回调恢复）。判据就是 `timer.isActive()`，
+        没有第二个布尔开关（agent.md §2.13："还在播吗就是 `isActive()`"）。
+        """
+        return self._driver.running
+
     def hold_frame(self, index: int) -> None:
         """定格在第 ``index`` 帧；**画面完全不动，也不再排下一次换帧**。
 
@@ -722,6 +746,80 @@ class PetWindow(QWidget):
         `app.py` 用闭包把"打开/前置设置窗口 + 重置静置计时"接进来。
         """
         self._settings_handler = handler
+
+    # ------------------------------------------------------------ 隐藏 / 呼出（task12）
+
+    def set_visibility_handler(self, handler: Callable[[], None] | None) -> None:
+        """装上 `隐藏宠物` 的处理函数（task12）。`None` → 菜单项**灰掉**。
+
+        与 `调整大小…` / `设置…` 完全同一个模式。⚠ 这里的"灰掉"还有一个
+        **更硬的理由**：一个可用的呼出快捷键都没有时，隐藏出去就再也叫不回来，
+        所以那种情况下**必须**禁用（task12 §6），不能只靠处理器在不在。
+        """
+        self._visibility_handler = handler
+
+    def set_hotkey_available(self, available: bool) -> None:
+        """告诉窗口"现在有没有可用的呼出快捷键"（决定 `隐藏宠物` 能不能点）。
+
+        `False` → 菜单项禁用 + 一句提示。**判据是"真有热键"，不是"装了处理器"**：
+        处理器永远装着，但候选链全军覆没时藏起来就是灾难（task12 §4）。
+        """
+        self._hotkey_available = bool(available)
+
+    @property
+    def hidden_by_user(self) -> bool:
+        """当前是不是"被用户藏起来了"（诊断与自检用）。"""
+        return self._hidden
+
+    def hide_pet(self) -> bool:
+        """隐藏宠物（**保留状态不销毁**）；返回是否真的藏起来了。
+
+        ## 三条约定（task12 §4）
+
+        1. **保留状态不销毁**：只 `hide()`，窗口、帧缓存、档位、位置**全部留着**，
+           呼出时是瞬时的（省掉重新解码几十张 PNG）。验收里"隐藏→呼出 20 次
+           不变慢"盯的就是这条。
+        2. **没有可用热键就拒绝隐藏**（返回 `False`）：藏出去叫不回来比什么都糟。
+        3. **只停表，不拆状态**：动画定时器停掉（隐藏期间没人看，白烧 CPU），
+           但 `Animation` 的帧号保留——呼出时从**原来那一帧**接着播。
+        """
+        if self._hidden:
+            return True  # 幂等：已经藏着了
+        if not self._hotkey_available:
+            # 绝不显示假成功：返回 False，调用方据此提示"没有可用的呼出快捷键"。
+            logger.warning("拒绝隐藏宠物：没有可用的呼出快捷键（藏起来就叫不回来了）")
+            return False
+        self._hidden = True
+        self._driver.stop()
+        self.hide()
+        self.visibility_changed.emit(False)
+        return True
+
+    def show_pet(self) -> bool:
+        """呼出宠物：恢复可见 + **重新声明置顶**；返回是否真的显示了。
+
+        ## 为什么要"重新声明置顶"
+
+        `WindowStaysOnTopHint` 是**创建窗口时**交给系统的属性，窗口在隐藏期间
+        可能被系统换掉底层窗口（任务栏重建、桌面切换、别的程序抢最上层），
+        只 `show()` 有几率回来时**不在最上层**。这里用
+        `setWindowFlag(..., True)` 重新声明一次，再 `raise_()` 补一下。
+
+        ⚠ 改窗口标志会让系统**重建**底层窗口（Qt 会 `hide()` 再显示），
+        所以顺序必须是"先改标志、再 `show()`"——反了就成了"显示完立刻被重建藏掉"。
+        """
+        if not self._hidden:
+            # 没藏着也把置顶补一次：这条路径可能被别的入口调用（诊断用）。
+            self.raise_()
+            return self.isVisible()
+        self._hidden = False
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.show()
+        self.raise_()
+        # 呼出后从**原来那一帧**接着播（动画状态没被动过）。
+        self._driver.start()
+        self.visibility_changed.emit(True)
+        return True
 
     def set_reserved(self, on: bool) -> None:
         """打开 / 关闭"底部预留机制"（task09 §4："用户显式指定位置时不生效"）。
@@ -1039,6 +1137,10 @@ class PetWindow(QWidget):
         （`set_resize_handler()` 装了处理器才为真——没装时仍然灰掉，
         这样"自检里没接控制栏"的窗口不会给用户一个点了没反应的菜单项）。
         `settings_available` 同理（task11：`set_settings_handler()`）。
+
+        `visibility_available`（task12）判的是**两件事都要成立**：装了处理器
+        **并且**真的有可用的呼出快捷键。只看处理器是不够的——候选链全军覆没时
+        藏起来就叫不回来了（`hide_pet()` 也会再拦一道）。
         """
         action = self._animation.render_action
         can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
@@ -1050,6 +1152,10 @@ class PetWindow(QWidget):
             can_rest=self.can_rest(),
             resize_available=self._resize_handler is not None,
             settings_available=self._settings_handler is not None,
+            visibility_available=(
+                self._visibility_handler is not None and self._hotkey_available
+            ),
+            visibility_reason="" if self._hotkey_available else context_menu.REASON_NO_HOTKEY,
         )
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
@@ -1096,10 +1202,15 @@ class PetWindow(QWidget):
             # task11：`设置…` 同理，处理器由 `app.py` 装（打开/前置设置窗口）。
             if self._settings_handler is not None:
                 self._settings_handler()
+        elif item_id == context_menu.ID_VISIBILITY:
+            # task12：`隐藏宠物`。没装处理器 / 没有可用热键时菜单项本来就是灰的，
+            # 真到了这里也只走同一条 `hide_pet()`（它自己还会再拦一道）。
+            if self._visibility_handler is not None:
+                self._visibility_handler()
+            else:
+                self.hide_pet()
         elif item_id == context_menu.ID_QUIT:
             self.close()
-        # visibility 本 task 仍是禁用的，
-        # 能点到它说明禁用没生效——那种情况什么都不做，绝不"顺手实现"。
 
     def toggle_mirror(self) -> bool:
         """翻转**当前动作**的镜像；返回是否成功（写失败 → `False`）。

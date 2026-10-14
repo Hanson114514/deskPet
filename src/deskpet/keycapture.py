@@ -1,23 +1,23 @@
-"""快捷键录入控件：**本 task 只建骨架**（task12 接线，task11 §3）。
-
-## 为什么现在就要有它
-
-task11 的设置窗口里 `呼出快捷键` 那一行**必须是灰色不可点**、标题带 `（暂未开放）`
-——控件本身照常出现在界面上（"未实现的项不许隐藏掉"，task11 §5）。
-把控件造出来、把禁用态与展示格式定死，task12 就只需要"解锁 + 接上注册"。
+"""快捷键录入控件：点一下进入录入态，按一次组合就录下来（task11 建骨架、task12 接线）。
 
 ## 录入的三条硬约定（task11 §4 / agent.md §4.9）
 
 1. **判定以"实测按下的按键"为准，不看 `event.modifiers()`**：
-   中文键盘布局下 AltGr 会被报成 Alt（§3.4），拿 `modifiers()` 判断会把
+   中文键盘布局下 AltGr 会被报成 Alt（§4.9），拿 `modifiers()` 判断会把
    `Ctrl+Alt` 认成别的东西。本类因此只在 `keyPressEvent` 里看 `event.key()`。
 2. **修饰键单独按下不算一次录入**：只按 `Ctrl` 不松手时，界面显示
    "已按下的修饰键 + `…`"，等真正的主键到来才成立。
 3. **至少一个修饰键**：`A` 单独按下不成组合，`Ctrl+A` 才成。
    Esc 是**取消**（不是"录成 Esc"）。
 
-`task11` 阶段这些行为**不会真的发生**——控件是禁用的，收不到按键。
-所以实现刻意做成"最小但正确"：task12 的活只剩"把这行解锁 + 接上热键注册"。
+## 主键名字的真值在 `hotkey_spec`
+
+本类**不自己拼字母表**（拼表会在小键盘、功能键上出错），而是问
+`hotkey_spec.format_qt_key()`。这样"录入时显示成什么"与"注册时用什么"
+走的是**同一张表**——两处各有一张表就迟早对不上。
+
+⚠ 本类**不碰配置**：它只负责"录到一个说法"。写配置是调用方（设置窗口）的事
+——那样"写失败回滚"只有一条路径（task11 §4"勾选失败回滚"）。
 """
 
 import logging
@@ -26,11 +26,13 @@ from typing import Final
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QPushButton, QWidget
 
+from . import hotkey_spec
+
 logger = logging.getLogger(__name__)
 
 #: 展示顺序**固定**为 `Ctrl → Alt → Shift → Win`（task11 §4）。
 #: 这不是"按用户按下的次序"——同一组合每次都要长得一样，用户才比得出来。
-MODIFIER_ORDER: Final[tuple[str, ...]] = ("Ctrl", "Alt", "Shift", "Win")
+MODIFIER_ORDER: Final[tuple[str, ...]] = hotkey_spec.MODIFIER_ORDER
 
 #: 各修饰键的 Qt 键值 → 展示名。**真值只在这里一处**（QKeySequence 的
 #: 字符串形式会随平台变化，不能拿来当判据）。
@@ -47,6 +49,9 @@ LISTENING_SUFFIX: Final[str] = "…"
 
 #: 只按了修饰键、还没有主键时的占位。
 NO_MAIN_KEY: Final[str] = ""
+
+#: 没设过快捷键时按钮上的文字。
+UNSET_TEXT: Final[str] = "未设置"
 
 
 def modifiers_text(names: list[str] | tuple[str, ...]) -> str:
@@ -138,6 +143,16 @@ class KeyCaptureEdit(QWidget):
         self._pressed = []
         self._apply_button_text()
 
+    def reject_capture(self, reason: str) -> None:
+        """录入态下**被拒**（组合不合法 / 被别的程序占用）：退出录入、保留原值。
+
+        `captured` 只在"录到一个能用的组合"时发；被拒是另一条路径，
+        所以这里单独开一个方法给调用方（设置窗口）用——**由它决定说什么**
+        （task12 §6：原值必须保留、原因必须说出来）。
+        """
+        self.cancel_capture()
+        logger.info("快捷键录入被拒：%s", reason)
+
     def keyPressEvent(self, event) -> None:  # noqa: ANN001 - Qt 签名
         """录入态的按键处理。
 
@@ -171,7 +186,7 @@ class KeyCaptureEdit(QWidget):
             event.accept()
             return
 
-        main_key = _key_text(key)
+        main_key = hotkey_spec.format_qt_key(key)
         if main_key is None:
             self.rejected.emit("这个键不能当快捷键的主键")
             event.accept()
@@ -193,17 +208,4 @@ class KeyCaptureEdit(QWidget):
             prefix = modifiers_text(self._pressed)
             self._button.setText(f"{prefix}{LISTENING_SUFFIX}" if prefix else LISTENING_SUFFIX)
             return
-        self._button.setText(self._text or "未设置")
-
-
-def _key_text(key: int) -> str | None:
-    """主键的展示文字；判不出来（纯修饰键 / 未知键）返回 `None`。
-
-    `QKeySequence.toString()` 在 Windows 上给的就是 `Ctrl+Alt+P` 这种写法，
-    与配置里 `hotkey` 的既有格式一致（`"Ctrl+Alt+Shift+P"`，agent.md §2.4），
-    所以这里**用它而不是自己拼一张字母表**：拼表会在小键盘、功能键上出错。
-    """
-    from PySide6.QtGui import QKeySequence
-
-    text = QKeySequence(key).toString()
-    return text or None
+        self._button.setText(self._text or UNSET_TEXT)
