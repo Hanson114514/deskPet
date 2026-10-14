@@ -2,8 +2,8 @@
 
 ## 三件事，只有三件
 
-1. **取缩放后的帧**：`FrameRenderer.frame(action, index, level)`；
-2. **缓存**：同一 `(动作, 帧序号, 档位)` 只缩放一次（放大**只在换档 / 首次取帧时**做，
+1. **取缩放后的帧**：`FrameRenderer.frame(action, index, level, mirrored=False)`；
+2. **缓存**：同一 `(动作, 帧序号, 档位, 镜像)` 只缩放一次（放大**只在换档 / 首次取帧时**做，
    绝不每帧做）；
 3. **上限**：缓存有明确上限，来回切档不会把内存吃满。
 
@@ -14,11 +14,18 @@
 代价是**边缘会出现半透明像素**，于是 `setMask` 的区域可能比"纯 0/255"时略小一圈——
 可点范围与视觉范围仍然一致（都由同一张缩放图算出来），符合 §2.8 的约定。
 
-## 缓存键：本 task 只有三维，task06 必须补上镜像
+## 缓存键：四个维度，一个都不能少（task06 已补齐）
 
-键是 `(动作, 帧序号, 档位)`。**task06 加镜像时务必把镜像并进这个键**，
-否则"翻转后拿到未翻转的缓存图"（agent.md §4.7 那条坑）会立刻复现。
-`_cache_key()` 是本文件里**唯一**拼键的地方，改动只在这一处。
+键是 `(动作, 帧序号, 档位, **镜像**)`。镜像这一维是 task06 补上的：
+漏掉它的表现是"翻转后拿到未翻转的缓存图"（agent.md §4.7 / 迁移清单 §3.20
+点名的**必然踩点**）——第一次翻转看起来对（缓存还没这张），第二次开始错。
+`cache_key()` 是本文件里**唯一**拼键的地方。
+
+## 镜像在哪一层做
+
+**渲染层**，用 `QImage.flipped(Qt.Horizontal)`：不生成新素材、不改 `asset.json`、
+不动原 PNG（task06 §4 渲染契约）。镜像**不影响锚点与档位**——
+水平翻转折点对称，"右下角锚点不动"仍然成立。
 
 ## LRU 而不是"按档位保留"
 
@@ -59,22 +66,24 @@ class FrameRenderer:
         self.dpi_scale = float(dpi_scale) if dpi_scale else 1.0
         self._limit = max(1, int(limit))
         #: `键 -> QPixmap`；`OrderedDict` 的**尾部是最新**（LRU 淘汰头部）。
-        self._cache: "OrderedDict[tuple[str, int, int], QPixmap]" = OrderedDict()
+        self._cache: "OrderedDict[tuple[str, int, int, bool], QPixmap]" = OrderedDict()
         #: 统计信息（自检看"有没有真的走缓存"用，不影响行为）。
         self.hits = 0
         self.misses = 0
 
     # ------------------------------------------------------------ 对外
 
-    def frame(self, action: str, index: int, level: int) -> QPixmap:
+    def frame(self, action: str, index: int, level: int, mirrored: bool = False) -> QPixmap:
         """取 `action` 第 `index` 帧在 `level` 档下**已经缩放好**的图。
+
+        `mirrored=True` 时返回**水平翻转后**的图（在渲染层做，见模块开头）。
 
         取不到（动作不存在 / 帧号越界 / 文件坏）→ 返回**空 `QPixmap`**
         （`.isNull()` 为真），**永不抛异常**：调用方按"没有图可画"退化
         （agent.md §2.8 的降级约定）。空结果**不进缓存**——帧文件是外部输入，
         下次再问一次才有机会在用户补上文件后恢复。
         """
-        key = self.cache_key(action, index, level)
+        key = self.cache_key(action, index, level, mirrored)
 
         cached = self._cache.get(key)
         if cached is not None:
@@ -83,7 +92,7 @@ class FrameRenderer:
             return cached
 
         self.misses += 1
-        pixmap = self._render(action, index, level)
+        pixmap = self._render(action, index, level, mirrored)
         if pixmap.isNull():
             return pixmap
 
@@ -91,13 +100,15 @@ class FrameRenderer:
         self._evict()
         return pixmap
 
-    def cache_key(self, action: str, index: int, level: int) -> tuple[str, int, int]:
-        """缓存键。**拼键的唯一入口**——task06 加镜像只改这一处。
+    def cache_key(
+        self, action: str, index: int, level: int, mirrored: bool = False
+    ) -> tuple[str, int, int, bool]:
+        """缓存键。**拼键的唯一入口**（含镜像维度，见模块开头）。
 
         档位先 `clamp_level`：越界档位与夹取后的档位**共用同一份缓存**，
         免得"配置里写 99"造出一堆永远不会再被问到的键。
         """
-        return (action, int(index), size.clamp_level(level))
+        return (action, int(index), size.clamp_level(level), bool(mirrored))
 
     def cached_count(self) -> int:
         """当前缓存里有几张图。"""
@@ -114,11 +125,20 @@ class FrameRenderer:
         while len(self._cache) > self._limit:
             self._cache.popitem(last=False)
 
-    def _render(self, action: str, index: int, level: int) -> QPixmap:
-        """真正做缩放的地方：读原图 → 缩到该档像素尺寸 → `QPixmap`。"""
+    def _render(self, action: str, index: int, level: int, mirrored: bool = False) -> QPixmap:
+        """真正做缩放的地方：读原图 → **按需镜像** → 缩到该档像素尺寸 → `QPixmap`。
+
+        **镜像在缩放之前做**：先翻再缩与先缩再翻在 `IgnoreAspectRatio` +
+        等比档位下结果等价，但先翻少一次全尺寸的拷贝（源图就是原尺寸）。
+        翻转本身用 `QImage.flipped(Qt.Horizontal)`，**不产生新素材文件**。
+        （`QImage.mirrored()` 在当前 PySide6 里已标记弃用，别再改回去。）
+        """
         image = pet_loader.load_frame_image(self.spec, action, index)
         if image.isNull():
             return QPixmap()
+
+        if mirrored:
+            image = image.flipped(Qt.Horizontal)
 
         target = size.pixel_size(image_size(image), level)
         if (image.width(), image.height()) == target:

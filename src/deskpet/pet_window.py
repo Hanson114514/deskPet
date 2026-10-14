@@ -4,7 +4,18 @@ task01 交付了**最小可运行骨架**（占位图形 + 拖 + 退出）；tas
 **真实素材的第一帧**，占位模块 `placeholder.py` 已随之删除；
 task04 起窗口尺寸由**尺寸档位**决定（10 级、屏幕自适应、右下角锚点）；
 task05 起窗口**持续播放动画**——帧推进由 `animation.Animation` 决定，
-本文件只负责"什么时候问下一帧、把哪一帧画出来"。
+本文件只负责"什么时候问下一帧、把哪一帧画出来"；
+task06 起**右键菜单**（换动作 / 休息 / 镜像翻转）也接在这里：
+菜单本身在 `context_menu.py` 里现造，本文件只负责"什么时候弹、弹完做什么"。
+
+## 镜像的两条衍生数据都要跟着失效（agent.md §4.7 / §3.20）
+
+翻转之后**两样东西**必须重算，少一样就出坑：
+
+1. **帧缓存**：键含镜像维度（`rendering.FrameRenderer.cache_key()`）；
+2. **`QRegion` 遮罩**：按**镜像后的图**重算（`apply_mask()` 收的就是镜像后的图）。
+
+`_on_mirror_changed()` 是这两件事的唯一落点。
 
 **三条硬约定**：
 
@@ -33,6 +44,7 @@ task05 起窗口**持续播放动画**——帧推进由 `animation.Animation` �
 from PySide6.QtCore import QElapsedTimer, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBitmap,
+    QContextMenuEvent,
     QGuiApplication,
     QImage,
     QKeySequence,
@@ -47,7 +59,10 @@ from PySide6.QtWidgets import QWidget
 from typing import Final
 
 from . import PROGRAM_NAME, size
+from . import context_menu
 from .animation import MAX_DT_MS, Animation
+from .context_menu import MenuState
+from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
 
@@ -57,6 +72,11 @@ DEFAULT_MARGIN = size.DEFAULT_MARGIN
 
 #: 本 task 显示的动作（动画播放属 task05，这里只取第一帧）。
 DEFAULT_ACTION = "idle"
+
+#: `坐下休息` 切到的动作，以及 `站起来` 切回的动作（task06 §2 第 7 条）。
+#: 动作名用 2025 定案的下划线写法（`sit` 已作废，**不做别名**，agent.md §0）。
+REST_ACTION = "rest"
+REST_STANDUP_ACTION = DEFAULT_ACTION
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
@@ -201,6 +221,7 @@ class PetWindow(QWidget):
         pet: PetSpec,
         level: int | None = None,
         parent: QWidget | None = None,
+        mirror: MirrorState | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -215,15 +236,24 @@ class PetWindow(QWidget):
         self._dragging = False
         self._quit_shortcuts: list[QShortcut] = []
 
-        #: 当前显示的帧（**已缩放**，窗口尺寸就是它的尺寸）。
+        #: 镜像状态表（task06）。没给就自己造一个"永远不翻转"的
+        #: ——`MirrorState` 需要一个 `ConfigStore`，自检里常常没有配置，
+        #: 所以这里允许 `None` 并退化（`_mirror` 为 `None` 时恒不翻转）。
+        self._mirror = mirror
+
+        #: 当前显示的帧（**已缩放、已按需镜像**，窗口尺寸就是它的尺寸）。
         self._frame_image = QImage()
         #: 当前动作名（**权威来源是 `self._animation.action`**，这里保留一份是为了
         #: 让"窗口显示的是哪个动作"在窗口自己身上问得到）。
         self._action = _pick_action(pet, DEFAULT_ACTION)
         #: 当前帧序号（**权威来源是 `self._animation.index`**）。
         self._frame_index = 0
+        #: "手动坐下休息"（右键菜单点出来的休息）。
+        #: ⚠ 它与自动的久置状态机（task07）**不是一回事**：那个要计时、会自动切回，
+        #: 这个只是一次手动动作切换，不做任何计时（task06 §5 明确划界）。
+        self._manual_rest = False
 
-        #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位（task06 还要加镜像）。
+        #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位**与镜像**（task06 已补齐）。
         self._renderer = FrameRenderer(pet, self._device_pixel_ratio())
         #: 当前档位。`None` 表示还没定（构造时要么给 level、要么自适应）。
         self._level = 0
@@ -234,6 +264,12 @@ class PetWindow(QWidget):
         self._driver.frame_due.connect(self._on_frame_due)
         #: 已经显示过的帧号（**用来跳过无变化的重绘**，见 `_on_frame_due`）。
         self._shown_index: int | None = None
+        #: 已经显示过的镜像态（**与 `_shown_index` 同理**：镜像变了就要重绘）。
+        self._shown_mirrored: bool | None = None
+
+        if self._mirror is not None:
+            # 镜像一变，帧与遮罩都要重取重算（本文件的唯一落点）。
+            self._mirror.mirror_changed.connect(self._on_mirror_changed)
 
         self._setup_window()
         self._apply_level(self._resolve_initial_level(level))
@@ -325,12 +361,13 @@ class PetWindow(QWidget):
         后续切档一律走 `set_size_level()` 的锚点保护。
         """
         self._level = size.clamp_level(level)
+        mirrored = self.mirrored
 
         # **按动画当前那一帧**重新渲染（不是 `self._frame_index` 快照）：
         # 动画正在播时帧号一直在动，切档必须跟上动画的当前帧，
         # 否则会出现"换了档但画面停在旧帧"。
         pixmap = self._renderer.frame(
-            self._animation.render_action, self._animation.index, self._level
+            self._animation.render_action, self._animation.index, self._level, mirrored
         )
         if not pixmap.isNull():
             # 缓存里的 QPixmap 是**共享**的，转成 QImage 时 Qt 会做一次深拷贝，
@@ -339,6 +376,7 @@ class PetWindow(QWidget):
             self._frame_index = self._animation.index
             self._action = self._animation.render_action
             self._shown_index = self._animation.index
+            self._shown_mirrored = mirrored
 
         width, height = self.pixel_size
         self.setFixedSize(width, height)
@@ -389,27 +427,72 @@ class PetWindow(QWidget):
 
     @property
     def frame_image(self) -> QImage:
-        """当前显示的帧（**已缩放**；只读，空图 = 没有图可画）。"""
+        """当前显示的帧（**已缩放、已按需镜像**；只读，空图 = 没有图可画）。"""
         return self._frame_image
 
+    # ------------------------------------------------------------ 镜像
+
+    @property
+    def mirror(self) -> MirrorState | None:
+        """镜像状态表（只读；没有配置时是 `None`，此时恒不翻转）。"""
+        return self._mirror
+
+    @property
+    def mirrored(self) -> bool:
+        """当前动作**此刻**该不该镜像。
+
+        判据全在 `MirrorState.is_on()` 一处（适用范围外恒为 `False`），
+        本类不自己判"这个动作能不能镜像"——那是 `mirror.can_mirror()` 的事。
+        """
+        if self._mirror is None:
+            return False
+        return self._mirror.is_on(self._animation.render_action)
+
+    def _on_mirror_changed(self, action: str, on: bool) -> None:
+        """镜像变了：**帧与遮罩一起重取重算**（agent.md §4.7 的唯一落点）。
+
+        只对**当前正在显示的动作**起作用：用户翻的是别的状态时，
+        当前画面不该被改动（"按状态记忆"的意思就是各管各的）。
+
+        重取帧走 `_repaint_current()`，它会把镜像并进缓存键与遮罩。
+        """
+        if action != self._animation.render_action:
+            # 翻的是别的状态：只更新记忆，画面不动（切回该状态时自然生效）。
+            return
+        self._repaint_current()
+
+    def _repaint_current(self) -> None:
+        """按**当前动作 / 当前帧 / 当前档位 / 当前镜像**重取帧并重设遮罩。
+
+        换镜像后必须走这一条：`show_action_frame` 会重新问渲染层要图
+        （键含镜像，所以拿到的确实是翻过的那张），并顺带重算遮罩。
+        """
+        self.show_action_frame(self._animation.render_action, self._animation.index)
+
     def show_action_frame(self, action: str, index: int) -> bool:
-        """显示 ``action`` 的第 ``index`` 帧（按当前档位缩放），并重设窗口遮罩。
+        """显示 ``action`` 的第 ``index`` 帧（按当前档位缩放 + **按需镜像**），并重设窗口遮罩。
 
         返回**是否真的换上了新帧**。取不到图（动作不存在 / 帧号越界 /
         文件读不出来）时**保留原来的画面**并返回 ``False``——绝不把已经
         画好的东西擦掉，也绝不抛异常（agent.md §2.8 的降级约定）。
 
+        **镜像在这里生效**：翻转的是渲染层给出的图，`apply_mask()` 收的也是
+        这张**已经翻过**的图，于是"能点到的范围"与"看到的画面"永远一致
+        （task06 §4："镜像与掩码"）。
+
         **不改窗口尺寸**：尺寸只由档位决定（`set_size_level()`）。
         帧的实际像素尺寸与 `cell` 不一致时（只是个警告，§2.5），
         渲染层按**真实图**的尺寸缩放，所以窗口尺寸仍以 `cell` 的档位换算为准。
         """
-        pixmap = self._renderer.frame(action, index, self._level)
+        mirrored = self.mirrored
+        pixmap = self._renderer.frame(action, index, self._level, mirrored)
         if pixmap.isNull():
             return False
 
         self._frame_index = int(index)
         self._action = action
         self._frame_image = pixmap.toImage()
+        self._shown_mirrored = mirrored
         # 换帧之后**衍生数据必须失效重算**（agent.md §4.7）：遮罩是上一帧的形状
         # 就会出现"人物变了但可点区域没变"。
         self.apply_mask(self._frame_image)
@@ -440,6 +523,7 @@ class PetWindow(QWidget):
 
         self._action = self._animation.action
         self._shown_index = None
+        self._shown_mirrored = None
         # 先把第一帧放上去，再开表：开表后 `frame_due` 会立刻来一次，
         # 那一次会因为"帧号没变"而跳过重绘（`_on_frame_due`）。
         self.show_action_frame(self._animation.render_action, self._animation.index)
@@ -472,10 +556,19 @@ class PetWindow(QWidget):
         **帧号没变就不重绘**：单帧动作与"区间只有一帧"的片段会让推进原地不动，
         这时每 33 ms 重画同一张图纯属浪费（还白白偏高 CPU）。
         遮罩同理——同一帧的形状没必要重算（agent.md §2.8"同动作同档位内复用"）。
+
+        **镜像也算"变没变"**：换镜像走的是 `_repaint_current()`（信号驱动），
+        正常不需要在这里兜；但把镜像并进判据只有好处——万一将来有人
+        不动信号直接改了镜像表，画面也不会停在旧的那一面。
         """
         index = self._animation.index
         render_action = self._animation.render_action
-        if index == self._shown_index and render_action == self._action:
+        mirrored = self.mirrored
+        if (
+            index == self._shown_index
+            and render_action == self._action
+            and mirrored == self._shown_mirrored
+        ):
             return
         if self.show_action_frame(render_action, index):
             self._shown_index = index
@@ -532,6 +625,108 @@ class PetWindow(QWidget):
             self._drag_base_pos.x() + int(dx),
             self._drag_base_pos.y() + int(dy),
         )
+
+    # ------------------------------------------------------------ 右键菜单
+
+    @property
+    def manual_rest(self) -> bool:
+        """当前是不是"手动坐下休息"（右键菜单点出来的那次）。"""
+        return self._manual_rest
+
+    def can_rest(self) -> bool:
+        """素材里有没有 `rest`（"缺动作就不切"，agent.md §2.5）。"""
+        return self.pet.has_action(REST_ACTION)
+
+    def menu_state(self) -> MenuState:
+        """现算一份菜单状态（**每次弹出前调一次**，勾选态与文字都按此刻的值）。
+
+        `mirror_on` 只在适用范围内才有意义，所以这里把它与 `can_mirror`
+        一起给出去——适用范围外两者分别是"假"与"不可点"。
+        """
+        action = self._animation.render_action
+        can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
+        return MenuState(
+            action=action,
+            manual_rest=self._manual_rest,
+            mirror_on=can_mirror and self.mirrored,
+            can_mirror=can_mirror,
+            can_rest=self.can_rest(),
+        )
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        """右键：在**鼠标处**弹菜单（task06 §4"定位"）。
+
+        两条行为契约落在这里：
+
+        - **拖动中右键不弹菜单**：拖动是"按下 → 移动 → 松开"的连续操作，
+          中途插一个菜单会把这次拖动切成两段（松手时窗口停在半路）。
+          取舍是"**明确忽略拖动中的右键**"——比"打断拖动"更不容易让用户困惑
+          （task06 §4 允许两种做法，选一种并记在 agent.md）。
+          菜单**不进入**拖动状态，所以它也不会顺带改位置。
+        - **菜单以宠物窗口为 parent**（`build_menu(self, ...)`）：不设 parent
+          的话它只是一条顶层窗口，在"始终置顶"的宠物旁边会掉到别的窗口后面。
+        """
+        if self._dragging:
+            event.accept()
+            return
+
+        menu = context_menu.build_menu(self, self.menu_state())
+        # 每一次弹出都是**新建的菜单**：选完就当次丢弃，不留跨次状态。
+        menu.setAttribute(Qt.WA_DeleteOnClose, True)
+        chosen = menu.exec(event.globalPos())
+        self._handle_menu_choice(context_menu.action_id(chosen))
+
+    def _handle_menu_choice(self, item_id: str) -> None:
+        """菜单选完了：按**稳定 id** 分派（**不看文字**）。
+
+        没选（`Esc` / 点菜单外 → `item_id` 为空串）就什么都不做——
+        "关闭且不做任何事"是 task06 §4 明写的契约。
+        """
+        if not item_id:
+            return
+        if item_id == context_menu.ID_MIRROR:
+            self.toggle_mirror()
+        elif item_id == context_menu.ID_ACTION:
+            self.toggle_rest()
+        elif item_id == context_menu.ID_QUIT:
+            self.close()
+        # resize / settings / visibility 本 task 一律是禁用的，
+        # 能点到它们说明禁用没生效——那种情况什么都不做，绝不"顺手实现"。
+
+    def toggle_mirror(self) -> bool:
+        """翻转**当前动作**的镜像；返回是否成功（写失败 → `False`）。
+
+        写失败时 `MirrorState.toggle()` **不改内存、不发信号**，
+        所以画面与勾选都保持原样，不会出现"看着翻过去了、其实没记住"
+        （agent.md §2.10 第二类：绝不显示假成功）。
+        """
+        if self._mirror is None:
+            return False
+        return self._mirror.toggle(self._animation.render_action)
+
+    def toggle_rest(self) -> None:
+        """`坐下休息` ↔ `站起来`（**同一个菜单项**，id 恒为 `action`）。
+
+        只做**一次手动动作切换**，不做任何计时——"久置自动张望/坐下"是 task07
+        的状态机，两者别混（task06 §5 明确划界）。
+
+        素材里没有 `rest` 时**什么都不做**（"缺动作就不切"，
+        agent.md §2.5：不许为找不到的动作硬塞替身）。
+        """
+        if self._manual_rest:
+            target = REST_STANDUP_ACTION
+            if not self.pet.has_action(target):
+                return
+            self._manual_rest = False
+        else:
+            target = REST_ACTION
+            if not self.pet.has_action(target):
+                return
+            self._manual_rest = True
+
+        # 切动作会重建帧与遮罩（走 `play_action` → `show_action_frame`）。
+        # 镜像不必在这里处理：新动作自己那份记忆由 `mirrored` 现算。
+        self.play_action(target)
 
     # ------------------------------------------------------------ 遮罩
 

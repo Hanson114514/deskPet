@@ -49,6 +49,7 @@ from . import paths, pet_loader, size
 from .animation import UnknownActionError
 from .config import ConfigStore
 from .errors import DataDirError
+from .mirror import MirrorState
 from .pet_loader import PetLoadError, list_reports, resolve_pet
 from .pet_spec import PetSpec
 from .pet_window import PetWindow
@@ -326,7 +327,7 @@ def _print_startup_line(window: PetWindow, level_source: str) -> None:
     source = action.fps_source.label if action is not None else "（未知）"
     _logger.info(
         "%s %s | pet=%s action=%s %s mode=%s frames=%d frame_ms=%.4f fps_source=%s "
-        "pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s dpr=%.2f",
+        "pos=(%d, %d) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s dpr=%.2f",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
@@ -344,6 +345,8 @@ def _print_startup_line(window: PetWindow, level_source: str) -> None:
         width,
         height,
         mask_state,
+        # 镜像这一栏是 task06 加的：翻转是不是**记住了**只看这一行。
+        "on" if window.mirrored else "off",
         window.devicePixelRatioF(),
     )
 
@@ -514,7 +517,11 @@ def run(argv: list[str] | None = None) -> int:
 
     level, level_source = _resolve_size_level(args.size_level, store, pet.cell)
 
-    window = PetWindow(pet, level)
+    # 镜像状态表：**启动时从配置读一次**（task06 §2 第 6 条：重启后翻转状态还在）。
+    # 读操作只读——不会因为"打开程序"就把 mirror 写回配置。
+    mirror = MirrorState(store)
+
+    window = PetWindow(pet, level, mirror=mirror)
     window.play_action(action)
     window.showing_at_default_position()
     window.show()

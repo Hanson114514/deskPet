@@ -344,6 +344,8 @@ class ConfigStore(QObject):
 
         - 值类型不合法 → `False` + 警告（内存**不动**，避免"内存是脏值、磁盘是旧值"）；
         - `mirror` 不合法**整项拒收**；合法但含适用范围外的键 → 只保留合规部分；
+        - **写盘失败 → `False` + 内存回滚**：内存永远与磁盘一致，
+          调用方（界面）据此回滚控件，绝不显示假成功（agent.md §2.10 第二类）；
         - 写入成功时该项会被记为"**真的写过**"（`has()` 变真），
           哪怕写的正好是它的默认值（用户主动选了默认档位，agent.md §2.4 规则 5）。
         """
@@ -370,8 +372,16 @@ class ConfigStore(QObject):
             self._present.add(key)
             return True
 
+        previous = self._values.get(key)
         self._values[key] = normalized
         if not self._write():
+            # **内存回滚**（task06 补）：写盘失败时内存必须退回去，
+            # 否则会同时坏两件事：
+            #   ① 界面上"内存说成功、磁盘是旧值"，`get()` 与实际不符；
+            #   ② 下一次 `set()` 拿**已经改过的**内存去比"值没变"，
+            #      于是走"不写盘"的短路并返回 `True` —— 用户看到翻转成功了，
+            #      但磁盘上一个字节都没落（这个坑是 task06 的写失败自检抓到的）。
+            self._values[key] = previous
             reason = self._last_errors.get(key) or self.last_error() or "写配置失败"
             self._last_errors[key] = reason
             return False
