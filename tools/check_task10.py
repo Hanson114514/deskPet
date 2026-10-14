@@ -227,8 +227,8 @@ def _run_checks() -> int:
     section("1. 逻辑名真值 + 音量归一（只有两个逻辑名）")
 
     check(
-        "逻辑名恰好是 rest / chime",
-        snd.SOUND_NAMES == ("rest", "chime"),
+        "逻辑名恰好是 start / waving / rest",
+        snd.SOUND_NAMES == ("start", "waving", "rest"),
         f"实测 {snd.SOUND_NAMES}",
     )
     check("音量量程 0–100", (snd.VOLUME_MIN, snd.VOLUME_MAX) == (0, 100))
@@ -297,28 +297,37 @@ def _run_checks() -> int:
     for name, actual, expected in cases:
         check(name, actual == expected, f"实测 {actual!r}")
 
-    # ------------------------------------------------------------ §3 无音效（真实自带包）
-    section("3. 自带包没有 sounds 声明 → 无音效、不崩")
+    # ------------------------------------------------------------ §3 真实自带包
+    section("3. 自带包已按命名规律声明 sounds（start/waving/rest）")
 
     weedy = load_pet(ROOT / "assets" / "weedy")
-    check("自带包 weedy 的 sounds 是空声明", not weedy.sounds, f"实测 {dict(weedy.sounds)}")
+    check(
+        "自带包 weedy 声明了三个逻辑名",
+        set(weedy.sounds) == {"start", "waving", "rest"},
+        f"实测 {dict(weedy.sounds)}",
+    )
+    check(
+        "weedy 的候选都是数组（不再是单个字符串）",
+        all(isinstance(v, tuple) for v in weedy.sounds.values()),
+        f"实测 {dict(weedy.sounds)}",
+    )
 
     bare_player = snd.SoundPlayer(weedy)
     ready: list[tuple[bool, str]] = []
     bare_player.sound_ready.connect(lambda ok, why: ready.append((ok, why)))
     bare_player.preload()
-    check("无声明时 available 为假", bare_player.available is False)
+    check("声明了音效时 available 为真", bare_player.available is True)
     check(
-        "无声明时原因说得清",
-        "没有声明任何音效" in bare_player.unavailable_reason,
+        "有音效时没有 unavailable_reason",
+        bare_player.unavailable_reason == "",
         f"实测 {bare_player.unavailable_reason!r}",
     )
-    check("无声明时 summary() == 无音效", bare_player.summary() == "无音效", bare_player.summary())
     check("preload 发出了 sound_ready", len(ready) == 1, f"实测 {len(ready)} 次")
-    check("play('rest') 静默返回假、不抛", bare_player.play("rest") is False)
+    check("play('rest') 能播", bare_player.play("rest") is True)
     check("play 未知逻辑名也静默", bare_player.play("bgm") is False)
     bare_player.preload()
     check("preload 幂等（第二次不再发信号）", len(ready) == 1, f"实测 {len(ready)} 次")
+    bare_player.close()
 
     # ------------------------------------------------------------ §4 音量与播放器
     section("4. 播放器音量（运行时读回、立刻作用）")
@@ -335,7 +344,9 @@ def _run_checks() -> int:
     section("5. 三条诊断可见性（用自检自己造的临时包）")
 
     # ① 声明了但文件不在。
-    missing_root = _make_pet("t10missing", {"rest": "没有这个文件.mp3", "chime": None})
+    missing_root = _make_pet(
+        "t10missing", {"rest": ["没有这个文件.mp3"], "waving": None}
+    )
     missing_spec = _load(missing_root)
     missing_player = snd.SoundPlayer(missing_spec, 70)
     missing_player.preload()
@@ -343,16 +354,20 @@ def _run_checks() -> int:
     check("① 声明了但文件不在 → missing 记到", "rest" in missing_report.missing, f"{missing_report.missing}")
     check("① 不可用", missing_player.available is False)
     check(
-        "① 汇报文案：rest 缺文件、chime 声明的就是 null",
-        missing_report.summary() == "音效 0/2（缺 rest、chime）",
+        "① 汇报文案：rest 缺文件、waving 声明的就是 null",
+        missing_report.summary() == "音效 0/2（缺 rest）",
         missing_report.summary(),
     )
-    check("① 来源是索引声明而不是猜文件名", missing_spec.sounds.get("rest") == "没有这个文件.mp3")
+    check(
+        "① 来源是索引声明而不是猜文件名",
+        missing_spec.sounds.get("rest") == ("没有这个文件.mp3",),
+        f"实测 {missing_spec.sounds.get('rest')!r}",
+    )
 
     # ② 文件在、格式打不开（改名 txt）。真的建 QMediaPlayer 试一次。
     broken_root = _make_pet(
         "t10broken",
-        {"rest": "broken.txt", "chime": "ok.wav"},
+        {"rest": ["broken.txt"], "waving": ["ok.wav"]},
         {"broken.txt": b"this is definitely not audio\n" * 8},
     )
     broken_spec = _load(broken_root)
@@ -414,7 +429,7 @@ def _run_checks() -> int:
     # 一个**真能播**的文件：确认"没报错 = 能播"这条成立，汇报文案是「音效 2/2」。
     good_root = _make_pet(
         "t10good",
-        {"rest": "ding.wav", "chime": "ding.wav"},
+        {"rest": ["ding.wav"], "waving": ["ding.wav"]},
         {"ding.wav": _tiny_wav()},
     )
     good_player = snd.SoundPlayer(_load(good_root), 70)
@@ -423,7 +438,7 @@ def _run_checks() -> int:
     good_report = good_player.diagnose()
     check(
         "好文件被判成能播（异步结论落定）",
-        "rest" in good_report.playable and "chime" in good_report.playable,
+        "rest" in good_report.playable and "waving" in good_report.playable,
         f"{good_report.playable}",
     )
     check("真能播时 available 为真", good_player.available is True)
@@ -442,7 +457,7 @@ def _run_checks() -> int:
     # ------------------------------------------------------------ §6 双击手势
     section("6. 双击手势：整段一次 + 播完回 idle + 拖动中忽略")
 
-    gesture_root = _make_pet("t10gesture", {"chime": None})
+    gesture_root = _make_pet("t10gesture", {"waving": None})
     gesture_spec = _load(gesture_root)
 
     window = PetWindow(gesture_spec, 4)
@@ -463,7 +478,7 @@ def _run_checks() -> int:
     check("wave_once 真的开始了", started is True)
     check("手势期间动作是 waving", window.action == "waving", f"实测 {window.action}")
     check("手势走的是片段序列", window.animation.in_sequence is True)
-    check("手势同时播了 chime", plays == ["chime"], f"实测 {plays}")
+    check("手势同时播了 waving 音效", plays == ["waving"], f"实测 {plays}")
     check("片段是整段一次（loop=1、不收窄区间）", window.animation.mode.value == "loop")
 
     # 手动跑完整个片段（不依赖真实定时器）。
@@ -508,7 +523,7 @@ def _run_checks() -> int:
     normal_window._sounds = _NormalRecorder()
     _send_double_click(normal_window, QEvent, QPointF, Qt, QMouseEvent)
     check("正常双击后动作是 waving", normal_window.action == "waving", f"实测 {normal_window.action}")
-    check("正常双击播了 chime", normal_plays == ["chime"], f"实测 {normal_plays}")
+    check("正常双击播了 waving 音效", normal_plays == ["waving"], f"实测 {normal_plays}")
     check("双击被正确中止拖动（不僵住）", normal_window.dragging is False)
 
     # 连点不叠加：两次 wave_once 仍然只从起点播一次。
@@ -523,14 +538,14 @@ def _run_checks() -> int:
     repeat_window._sounds = _RepeatRecorder()
     repeat_window.wave_once()
     repeat_window.wave_once()
-    check("连点两次仍各播一次 chime（先回起点）", repeat_plays == ["chime", "chime"], f"实测 {repeat_plays}")
+    check("连点两次仍各播一次 waving 音效（先回起点）", repeat_plays == ["waving", "waving"], f"实测 {repeat_plays}")
     check(
         "连点后仍在片段起点（没有推进到半路）",
         repeat_window.animation.index == 0,
         f"实测 index={repeat_window.animation.index}",
     )
 
-    # 缺 waving 的素材：不挥手，但 chime 照播。
+    # 缺 waving 的素材：不挥手，但 waving 音效照播。
     no_wave_root = _fresh_dir(SCRATCH / "t10nowave")
     frames = no_wave_root / "frames"
     frames.mkdir()
@@ -541,7 +556,7 @@ def _run_checks() -> int:
                 "name": "nowave",
                 "cell": [8, 8],
                 "actions": {"idle": {"frames": ["idle_00.png"], "fps": 30.0}},
-                "sounds": {"chime": None},
+                "sounds": {"waving": None},
             },
             ensure_ascii=False,
         ),
@@ -558,7 +573,11 @@ def _run_checks() -> int:
 
     nowave_window._sounds = _NoWaveRecorder()
     check("缺 waving 时不挥手（可恢复退化）", nowave_window.wave_once() is False)
-    check("缺 waving 时 chime 照播（交互音不依赖素材动作）", nowave_plays == ["chime"], f"实测 {nowave_plays}")
+    check(
+        "缺 waving 动作时音效照播（交互音不依赖素材动作）",
+        nowave_plays == ["waving"],
+        f"实测 {nowave_plays}",
+    )
     check("缺 waving 后停在 idle", nowave_window.action == "idle", f"实测 {nowave_window.action}")
 
     # ------------------------------------------------------------ §7 与 task05 的边界
@@ -723,7 +742,7 @@ def _run_checks() -> int:
 
     # ⚠ **本 task 最关键的一条**：后缀认不出来**不许**挡住播放。
     # 判据是"play() 真的走到了设备调用"，而不是"清单里有它"。
-    odd_root = _make_pet("t10oddsuffix", {"rest": "sound.weird", "chime": None}, {"sound.weird": _tiny_wav()})
+    odd_root = _make_pet("t10oddsuffix", {"rest": ["sound.weird"]}, {"sound.weird": _tiny_wav()})
     odd_spec = _load(odd_root)
     odd_player = snd.SoundPlayer(odd_spec, 70)
     odd_player.preload()
@@ -745,7 +764,7 @@ def _run_checks() -> int:
     for named in (".ogg", ".m4a", ".flac", ".opus"):
         root = _make_pet(
             f"t10fmt{named.strip('.')}",
-            {"rest": f"sound{named}", "chime": None},
+            {"rest": [f"sound{named}"]},
             {f"sound{named}": _tiny_wav()},
         )
         player_for = snd.SoundPlayer(_load(root), 70)

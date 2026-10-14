@@ -84,7 +84,7 @@ from .idle_state import IdleStateMachine
 from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
-from .sounds import SOUND_CHIME, SOUND_REST, SoundPlayer
+from .sounds import SOUND_REST, SOUND_WAVING, SoundPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +260,7 @@ class PetWindow(QWidget):
         self._config = config
 
         #: 音效播放器（task10）。`None` = 没有音效可播（自检里常见）——
-        #: 此时"休息有声音""双击有 chime"都**静默**，不影响任何其他行为。
+        #: 此时"休息有声音""双击有 waving 音效"都**静默**，不影响任何其他行为。
         #: ⚠ 所有播放器调用都在 GUI 线程（`QMediaPlayer` 不是线程安全的，§4.9）。
         self._sounds = sounds
 
@@ -1320,7 +1320,7 @@ class PetWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        """双击宠物：**完整挥手一次 + 播 `chime`**（task10 §4"双击手势"）。
+        """双击宠物：**完整挥手一次 + 播 `waving`**（task10 §4"双击手势"）。
 
         **拖动途中一律忽略**（task10 §2 第 5 条 / task08 §2 第 6 条）：拖动是
         "按下 → 移动 → 松开"的连续操作，中途插入一个手势会把这次拖动切成两段。
@@ -1388,11 +1388,12 @@ class PetWindow(QWidget):
         self.wave_once()
 
     def wave_once(self) -> bool:
-        """完整播放一次 `waving` 并播 `chime`；返回手势有没有真的开始。
+        """完整播放一次 `waving` 并播 `waving` 音效；返回手势有没有真的开始。
 
-        素材里没有 `waving` 时**不挥手**（agent.md §2.5："缺 `waving` 就不挥手，
-        按可恢复路径退化"）——但 `chime` **照样播**：它是"双击这个交互"的声音，
-        与素材有没有挥手动作无关（task10 §4 把 `chime` 定义为"双击交互音"）。
+        素材里没有 `waving` 动作时**不挥手**（agent.md §2.5："缺 `waving` 就不挥手，
+        按可恢复路径退化"）——但音效**照样播**：它是"双击这个交互"的声音，
+        与素材有没有挥手动作无关（task10 §4 把 `waving` 定为"双击交互音"；
+        逻辑名与动作同形是刻意的，两者各查各的表，不互相牵制）。
         """
         started = False
         if self.pet.has_action(WAVING_ACTION):
@@ -1409,7 +1410,7 @@ class PetWindow(QWidget):
             # 万一它触发了收尾，那时标志还该是假（免得收尾逻辑被上一次手势带走）。
             self._gesture_active = True
             started = True
-        self._play_sound(SOUND_CHIME)
+        self._play_sound(SOUND_WAVING)
         return started
 
     def _on_sequence_done(self) -> None:

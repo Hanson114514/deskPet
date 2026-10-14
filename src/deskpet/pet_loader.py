@@ -122,7 +122,7 @@ class PetCandidate:
     root: Path
     source: str
     display_name: str
-    sounds: dict[str, str] = field(default_factory=dict)
+    sounds: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -152,12 +152,20 @@ class PetReport:
         return self.candidate.source
 
     def sound_summary(self) -> str:
-        """音效摘要（`--list-pets` 打印用）。没有声明任何音效 → `"无音效"`。"""
+        """音效摘要（`--list-pets` 打印用）。没有声明任何音效 → `"无音效"`。
+
+        候选多于一个时打全并标出个数：这份摘要的用处正是"一眼看出有几个备选"。
+        """
         if not self.candidate.sounds:
             return "无音效"
         parts = []
-        for name, filename in self.candidate.sounds.items():
-            parts.append(f"{name}→{filename}" if filename else f"{name}→(未提供文件)")
+        for name, filenames in self.candidate.sounds.items():
+            if not filenames:
+                parts.append(f"{name}→(未提供文件)")
+            elif len(filenames) == 1:
+                parts.append(f"{name}→{filenames[0]}")
+            else:
+                parts.append(f"{name}→{len(filenames)} 个（{'、'.join(filenames)}）")
         return "、".join(parts)
 
     def conclusion(self) -> str:

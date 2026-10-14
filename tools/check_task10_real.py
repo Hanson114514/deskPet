@@ -5,7 +5,7 @@
 但"设备真的被占用过又真的被释放"必须真设备）：
 
 1. 真实音频设备能开出来（`QMediaPlayer` 真的加载成功，而不是 ffmpeg 报错）；
-2. **启动音时机**：从 `preload()` 到 `chime` 被播的实际延迟（期望 ≈ 80 ms）；
+2. **启动音时机**：从 `preload()` 到 `start` 被播的实际延迟（期望 ≈ 80 ms）；
 3. **退出后没有残留进程占用音频设备**：跑完一个真实进程，立刻再起一个，音效仍正常；
 4. **长跑**：休息 / 双击重复 50 次不出现"后续没声音"（设备句柄泄漏的表现）；
 5. 双击手势在**真事件循环**下能完整播完并回到 `idle`。
@@ -133,7 +133,7 @@ def _make_probe_pet() -> Path:
                 "name": "t10real",
                 "cell": [32, 32],
                 "actions": actions,
-                "sounds": {"rest": "ding.wav", "chime": "ding.wav"},
+                "sounds": {"start": ["ding.wav"], "rest": ["ding.wav"], "waving": ["ding.wav"]},
             },
             ensure_ascii=False,
             indent=2,
@@ -160,7 +160,7 @@ def _make_broken_pet() -> Path:
     # 实测被 Qt 拒绝的几种：随机字节 / 全零 / 这种重复文本 / 单个字节 / 截断的 mp3 头。
     (root / "sounds" / "broken.txt").write_bytes(b"not audio\n" * 40)
     data = json.loads((root / "asset.json").read_text(encoding="utf-8"))
-    data["sounds"] = {"rest": "broken.txt", "chime": "ding.wav"}
+    data["sounds"] = {"rest": ["broken.txt"], "waving": ["ding.wav"]}
     (root / "asset.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -227,14 +227,14 @@ def _run() -> int:
     report = player.diagnose()
 
     check(
-        "真设备下两个音效都判成能播",
-        set(report.playable) == {"rest", "chime"},
+        "真设备下三个音效都判成能播",
+        set(report.playable) == {"start", "rest", "waving"},
         f"playable={report.playable}，unplayable={report.unplayable}",
     )
     check("真设备下 available 为真", player.available is True, player.unavailable_reason)
     check(
-        "真设备下汇报文案是「音效 2/2」",
-        report.summary() == "音效 2/2",
+        "真设备下汇报文案是「音效 3/3」",
+        report.summary() == "音效 3/3",
         report.summary(),
     )
     # 多格式：真平台上把 **Qt 后端实际支持的格式**问出来（不是抄清单）。
@@ -266,7 +266,7 @@ def _run() -> int:
             (alt / "sounds" / "ding.wav").read_bytes()
         )
         data = json.loads((alt / "asset.json").read_text(encoding="utf-8"))
-        data["sounds"] = {"rest": f"ding{named}", "chime": f"ding{named}"}
+        data["sounds"] = {"rest": [f"ding{named}"], "waving": [f"ding{named}"]}
         (alt / "asset.json").write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -284,14 +284,14 @@ def _run() -> int:
         alt_player.close()
 
     # ------------------------------------------------------------ §2 启动音时机
-    section("2. 启动音时机：preload → chime 的实际延迟 ≈ 80 ms")
+    section("2. 启动音时机：preload → start 的实际延迟 ≈ 80 ms")
 
     chime_at: list[float] = []
     recorder = _Recorder(player)
     original_play = recorder.play
 
     def _timed_play(name: str) -> bool:
-        if name == snd.SOUND_CHIME:
+        if name == snd.SOUND_START:
             chime_at.append(time.perf_counter())
         return original_play(name)
 
@@ -304,7 +304,7 @@ def _run() -> int:
     timer = QTimer()
     timer.setSingleShot(True)
     timer.setTimerType(Qt.PreciseTimer)
-    timer.timeout.connect(lambda: recorder.play(snd.SOUND_CHIME))
+    timer.timeout.connect(lambda: recorder.play(snd.SOUND_START))
     timer.start(STARTUP_CHIME_DELAY_MS)
     pump = QDeadlineTimer(1200)
     while not pump.hasExpired() and not chime_at:
@@ -389,7 +389,7 @@ def _run() -> int:
     check("打不开时播放静默返回假", broken_player.play("rest") is False)
     check(
         "好音效不受坏音效影响",
-        "chime" in broken_report.playable,
+        "waving" in broken_report.playable,
         f"playable={broken_report.playable}",
     )
 

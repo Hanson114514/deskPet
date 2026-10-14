@@ -75,7 +75,7 @@ from .settings import (
     RestartOutcome,
     SettingsWindow,
 )
-from .sounds import SOUND_CHIME, SoundPlayer, normalize_volume
+from .sounds import SOUND_START, SoundPlayer, normalize_volume
 
 #: 让 Python 解释器有机会执行信号处理器的"心跳"间隔（毫秒）。
 #: Qt 的事件循环不会自己回到解释器，没有这个心跳时 Ctrl+C 不会及时生效。
@@ -319,9 +319,14 @@ def _run_list_actions(spec: PetSpec) -> int:
             f"{action.fps:g} fps（每帧 {action.frame_ms:.4f} ms，来源：{action.fps_source.label}）"
         )
     if spec.sounds:
-        print("  音效：")
-        for sound_name, filename in spec.sounds.items():
-            shown = filename if filename else "(索引里声明了，但没有给文件名)"
+        print("  音效（播放时在候选里随机选一个）：")
+        for sound_name, filenames in spec.sounds.items():
+            if not filenames:
+                shown = "(索引里声明了，但没有给文件名)"
+            elif len(filenames) == 1:
+                shown = filenames[0]
+            else:
+                shown = f"{len(filenames)} 个：{'、'.join(filenames)}"
             print(f"    · {sound_name} → {shown}")
     else:
         print("  音效：无音效")
@@ -1558,11 +1563,11 @@ def run(argv: list[str] | None = None) -> int:
     #   3. 预热超过 `PRELOAD_TIMEOUT_MS` 没结果 → **另一个定时器**兜底，
     #      按"没有音效"照常启动（用户不该因为一块网卡/声卡卡住就用不上桌宠）。
     #
-    # 三个定时器是**互相取消**的：谁先到就把另外两个停掉，所以 `chime` 只会响一次。
+    # 三个定时器是**互相取消**的：谁先到就把另外两个停掉，所以启动音只会响一次。
     startup_chime_timer = QTimer()
     startup_chime_timer.setSingleShot(True)
     startup_chime_timer.setTimerType(Qt.PreciseTimer)
-    startup_chime_timer.timeout.connect(lambda: sound_player.play(SOUND_CHIME))
+    startup_chime_timer.timeout.connect(lambda: sound_player.play(SOUND_START))
 
     preload_timeout_timer = QTimer()
     preload_timeout_timer.setSingleShot(True)
@@ -1571,7 +1576,7 @@ def run(argv: list[str] | None = None) -> int:
     def _on_sound_ready(available: bool, reason: str) -> None:
         """预热有结果了：**先停掉超时兜底**，再按 80 ms 排启动音。
 
-        预热失败也照常排：`play()` 自己会静默跳过，"没声明 chime"与"文件坏了"
+        预热失败也照常排：`play()` 自己会静默跳过，"没声明 start"与"文件坏了"
         都不该让启动流程分叉（音效是可选功能，agent.md §2.10 第三类）。
 
         **只排一次**：`settle()` 之后会再发一次 `sound_ready`（把异步结论带过来），

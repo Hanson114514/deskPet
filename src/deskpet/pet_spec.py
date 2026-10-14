@@ -162,8 +162,9 @@ class PetSpec:
     cell: tuple[int, int]
     actions: dict[str, ActionSpec]
     action_order: tuple[str, ...]
-    #: 逻辑名 → 文件名。**只认索引里的声明**，没有兜底表（§2.5）。
-    sounds: dict[str, str]
+    #: 逻辑名 → **候选文件名集合**（播放时随机选一个）。空元组 = 声明了这个逻辑名
+    #: 但没有给文件（`null`）。**只认索引里的声明**，没有兜底表（§2.5）。
+    sounds: dict[str, tuple[str, ...]]
     root: Path
     #: `"user"` / `"bundled"`。
     source: str
@@ -311,13 +312,25 @@ def build_action_spec(
     return None, issues, warnings
 
 
-def parse_sounds(value: Any, *, namespace: str = "") -> tuple[dict[str, str], list]:
-    """`sounds` 是"逻辑名 → 文件名或 `null`"，**只认声明**（§2.5）。
+def parse_sounds(
+    value: Any, *, namespace: str = ""
+) -> tuple[dict[str, tuple[str, ...]], list]:
+    """`sounds` 是"逻辑名 → **文件名数组**或 `null`"，**只认声明**（§2.5）。
+
+    ```json
+    {"start": ["waving_00.wav", "waving_01.wav"], "rest": ["rest_00.wav"], "waving": null}
+    ```
 
     - `sounds` 缺失 / 不是对象 → 空字典（**不算问题**：音效是可选功能）；
-    - 值是 `null` → 记为 `""`（"声明了这个逻辑名、但没有对应文件"）；
-    - 值是非空字符串 → 采用；
+    - 值是 `null` → 记为 `()`（"声明了这个逻辑名、但没有对应文件"）；
+    - 值是**数组** → 只收其中的非空字符串，得到候选集合；
+    - **旧的"单个字符串"写法已废弃**（`"chime": "文件.mp3"`）：按类型不符丢弃 + 一条警告。
+      这是**故意的**——契约只有一种形态，"两种写法都行"会让"随机选一个"退化成
+      "其实只有一个"，晚一步才发现就晚了；
     - 其它（数字 / 对象 / 空串）→ 丢弃 + 一条警告（**不是**致命问题）。
+
+    数组里混进坏项（数字 / 空串）时**只丢那一项**，好的照收：一个写错的文件名
+    不该让同一逻辑名下其它能播的音效一起失效。整条候选集为空 → 与 `null` 等价。
     """
     from .pet_loader import IssueKind, PetIssue
 
@@ -325,7 +338,7 @@ def parse_sounds(value: Any, *, namespace: str = "") -> tuple[dict[str, str], li
         return {}, []
 
     warnings: list[PetIssue] = []
-    kept: dict[str, str] = {}
+    kept: dict[str, tuple[str, ...]] = {}
     for key, item in value.items():
         if not isinstance(key, str) or not key:
             warnings.append(
@@ -338,17 +351,43 @@ def parse_sounds(value: Any, *, namespace: str = "") -> tuple[dict[str, str], li
             )
             continue
         if item is None:
-            kept[key] = ""
+            kept[key] = ()
             continue
-        if isinstance(item, str) and item.strip():
-            kept[key] = item
+        if isinstance(item, str):
+            warnings.append(
+                PetIssue(
+                    IssueKind.SOUND_INVALID,
+                    namespace,
+                    None,
+                    f"sounds.{key} 的值必须是一个文件名数组（如 [\"{item}\"]），"
+                    f"旧的单个字符串写法已废弃，已忽略",
+                )
+            )
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, bytes):
+            names = [
+                entry
+                for entry in item
+                if isinstance(entry, str) and entry.strip()
+            ]
+            dropped = len(item) - len(names)
+            if dropped:
+                warnings.append(
+                    PetIssue(
+                        IssueKind.SOUND_INVALID,
+                        namespace,
+                        None,
+                        f"sounds.{key} 里有 {dropped} 项不是非空文件名，已忽略",
+                    )
+                )
+            kept[key] = tuple(names)
             continue
         warnings.append(
             PetIssue(
                 IssueKind.SOUND_INVALID,
                 namespace,
                 None,
-                f"sounds.{key} 的值必须是文件名或 null，实际是 "
+                f"sounds.{key} 的值必须是文件名数组或 null，实际是 "
                 f"{type(item).__name__}（{item!r}），已忽略",
             )
         )

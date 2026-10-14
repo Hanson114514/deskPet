@@ -1,16 +1,28 @@
 """音效：逻辑名映射 + 播放器封装 + **优雅退化** + 三条诊断可见性。
 
-## 只有两个逻辑名
+## 三个逻辑名，每个对应**一组**候选文件
 
-| 逻辑名 | 用途 |
-| --- | --- |
-| `rest` | 主动休息（右键菜单）+ 久置自动休息**共用**（旧名 `sit`，随动作改名） |
-| `chime` | **启动音** + 双击交互音 |
+| 逻辑名 | 用途 | 素材命名 |
+| --- | --- | --- |
+| `start` | **启动音** | `start_*.wav` |
+| `waving` | **双击交互音**（与挥手动作同名） | `waving_*.wav` |
+| `rest` | 主动休息（右键菜单）+ 久置自动休息**共用** | `rest_*.wav` |
 
-**映射只由素材索引 `sounds` 声明决定**（`{"rest": "文件.mp3", "chime": null}`）：
-没有兜底表、不自动认 `sounds/rest.mp3`（task10 §4"不猜文件名"）。
-解析已经在 task03 落地（`pet_spec.parse_sounds`）：`null` 记成空串、
-坏数据只进 warnings，本模块**只消费**，不重复解析、不重复告警。
+⚠ 旧名 `chime`（启动音与双击音共用）**已作废，不留别名**：两个时机各响各的。
+
+`asset.json` 的 `sounds.<逻辑名>` 是**文件名数组**，播放时**随机选一个**：
+
+```json
+{"sounds": {"start": ["waving_00.wav", "waving_01.wav"],
+            "waving": ["waving_00.wav", "waving_01.wav"],
+            "rest": ["rest_00.wav", "rest_01.wav", "rest_02.wav"]}}
+```
+
+**映射只由素材索引 `sounds` 声明决定**：没有兜底表、**不按命名规律自动扫目录**
+（task10 §4"不猜文件名"）。命名规律（`<逻辑名>_<序号>.wav`）是人**写进索引**时的
+依据，程序侧只认索引里那份清单——"自动发现"会让"删掉一个音效"变成做不到的事。
+解析已经在 task03 落地（`pet_spec.parse_sounds`），本模块**只消费**，
+不重复解析、不重复告警。
 
 ## 播放器调用的线程约定（**必须遵守**）
 
@@ -71,6 +83,7 @@
 """
 
 import logging
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -91,10 +104,19 @@ VOLUME_MAX: Final[int] = 100
 #: 音量读不出来时的兜底（配置层已经校验过类型，这里挡的是"绕过配置层"的调用）。
 DEFAULT_VOLUME: Final[int] = 70
 
-#: 逻辑名真值（**只有两个**，task10 §4）。`startup` 与双击都用 `chime`。
+#: 逻辑名真值（**只有三个**）。与 `sounds/` 的文件命名前缀一一对应：
+#: `start_*` / `waving_*` / `rest_*`（见 §"随机选一个"）。
+#:
+#: - `start`：**启动音**；
+#: - `waving`：**双击交互音**（与挥手动作同名）；
+#: - `rest`：主动休息 + 久置自动休息**共用**。
+#:
+#: ⚠ 旧名 `chime`（启动音与双击音共用一个名字）**已作废，不留别名**：
+#: 现在两个时机各用各的音效，共用一个名字会让"双击响的到底是哪一个"说不清。
+SOUND_START: Final[str] = "start"
+SOUND_WAVING: Final[str] = "waving"
 SOUND_REST: Final[str] = "rest"
-SOUND_CHIME: Final[str] = "chime"
-SOUND_NAMES: Final[tuple[str, ...]] = (SOUND_REST, SOUND_CHIME)
+SOUND_NAMES: Final[tuple[str, ...]] = (SOUND_START, SOUND_WAVING, SOUND_REST)
 
 #: 汇报文案里"缺"与"无法播放"的分隔符（**格式不可改**，task10 §2 第 7 条）。
 _MISSING_SEP: Final[str] = "（缺 "
@@ -129,11 +151,9 @@ def normalize_volume(raw: object) -> int:
 
 
 @dataclass
-class SoundEntry:
-    """一个**声明过的**逻辑名当前的状况（诊断与汇报都读它）。"""
+class Candidate:
+    """**一个**候选文件（逻辑名下的一个数组项）的状况。"""
 
-    name: str
-    #: 索引里声明的文件名；空串 = 声明了逻辑名但没有文件名（`null`）。
     filename: str
     #: 绝对路径（没有文件名时为 `None`）。
     path: Path | None
@@ -143,6 +163,71 @@ class SoundEntry:
     playable: bool | None = None
     #: 不能播放的原因（`playable is False` 时有值）。
     reason: str = ""
+
+
+@dataclass
+class SoundEntry:
+    """一个**声明过的**逻辑名当前的状况（诊断与汇报都读它）。
+
+    ## 一个逻辑名对应**一组**候选文件
+
+    索引里 `sounds.<逻辑名>` 是一个**文件名数组**，`play()` 每次在其中**随机选一个**。
+    所以条目内部按候选文件各记一份 `Candidate`，而"这个逻辑名到底能不能响"
+    的判据是**至少有一个候选能播**（`playable is True`）——
+    组里有坏文件不该把整条逻辑名判死（见 `parse_sounds` 的同一条理由）。
+    """
+
+    name: str
+    #: 索引里声明的候选文件（**保持索引顺序**；空元组 = 声明了但没给文件）。
+    candidates: tuple[Candidate, ...] = ()
+
+    @property
+    def filename(self) -> str:
+        """候选文件名的简写（只有一个时是它自己；多个时用、分隔）。诊断文案用。"""
+        return "、".join(item.filename for item in self.candidates)
+
+    @property
+    def path(self) -> Path | None:
+        """第一个候选的绝对路径（没有候选时为 `None`）。**判定请用 `exists`**。"""
+        return self.candidates[0].path if self.candidates else None
+
+    @property
+    def exists(self) -> bool:
+        """**至少有一个**候选文件真的在磁盘上。"""
+        return any(item.exists for item in self.candidates)
+
+    @property
+    def playable(self) -> bool | None:
+        """`True` = 至少一个候选真的能播；`False` = 全都不能；`None` = 还没问出结论。"""
+        if any(item.playable is True for item in self.candidates):
+            return True
+        if self.candidates and all(item.playable is False for item in self.candidates):
+            return False
+        return None
+
+    @property
+    def reason(self) -> str:
+        """不能播放的原因（`playable is False` 时有值）。"""
+        if self.playable is not False:
+            return ""
+        for item in self.candidates:
+            if item.reason:
+                return item.reason
+        return "候选文件都无法播放"
+
+    def playable_candidates(self) -> tuple[Candidate, ...]:
+        """**已经试过而且没报错**的候选（随机选一个的范围）。
+
+        `playable is None`（还没问出结论）的也算在内：`settle()` 的约定是
+        "没问出问题就按能播算"，随机选中的那个真坏了也只是这一次没声音，
+        下一拍换一个候选就好——比"因为还没结论就干脆不响"更符合直觉。
+        """
+        usable = [
+            item
+            for item in self.candidates
+            if item.exists and item.playable is not False
+        ]
+        return tuple(usable)
 
 
 @dataclass
@@ -318,7 +403,12 @@ def list_undeclared(spec: PetSpec) -> tuple[str, ...]:
         logger.warning("音效目录读不了：%s（%s）", directory, exc)
         return ()
 
-    declared = {filename for filename in spec.sounds.values() if filename}
+    declared = {
+        filename
+        for filenames in spec.sounds.values()
+        for filename in filenames
+        if filename
+    }
     return tuple(sorted(name for name in names if name not in declared))
 
 
@@ -331,7 +421,7 @@ class SoundPlayer(QObject):
     | --- | --- |
     | 音量 | 配置 `volume`，0–100，越界夹取；非法值归 0 |
     | 预加载 | **异步**预热（`preload()` 立即返回，结果走 `sound_ready`） |
-    | 启动音时机 | 由调用方（`app.py`）在预热有结果后按 80 ms 排 `chime` |
+    | 启动音时机 | 由调用方（`app.py`）在预热有结果后按 80 ms 排 `start` |
     | 重复触发 | 再次播放**先回到起点**再播，避免叠加 |
     | 优雅退化 | 可用标志变 `False` + 记原因，**绝不让程序起不来** |
     | 退出 | `close()` 关闭全部播放器（挂在 `aboutToQuit` / `closeEvent` 上） |
@@ -349,10 +439,15 @@ class SoundPlayer(QObject):
         super().__init__(parent)
         self._spec = spec
         self._volume = normalize_volume(volume)
-        #: 逻辑名 → 播放器（**按需创建并缓存**；`close()` 统一收掉）。
-        self._players: dict[str, object] = {}
-        #: 逻辑名 → `QAudioOutput`（音量挂在它上面，与播放器一一对应）。
-        self._outputs: dict[str, object] = {}
+        #: **播放器键 → 播放器**：键是 `(逻辑名, 候选文件名)`。
+        #:
+        #: ⚠ 键**必须带文件名**：一个逻辑名现在有一组候选，各是**不同的媒体源**，
+        #: 共用一个 `QMediaPlayer` 就得每次 `setSource()` 重新加载——
+        #: 那会把"随机换一个"变成"每次都等一次解码"，随机播放的即时感全没了。
+        #: 按候选各留一个播放器，预热一次之后每次播放都是现成的。
+        self._players: dict[tuple[str, str], object] = {}
+        #: 同一个键 → `QAudioOutput`（音量挂在它上面，与播放器一一对应）。
+        self._outputs: dict[tuple[str, str], object] = {}
         #: 每个声明过的逻辑名的状况（诊断与汇报的原料）。
         self._entries: dict[str, SoundEntry] = {}
         #: 整体可用标志与原因（优雅退化的对外表达）。
@@ -375,30 +470,30 @@ class SoundPlayer(QObject):
         `QMediaPlayer` 没有 `QApplication` 会直接崩，所以试播一律留给 `preload()`。
         """
         directory = sounds_dir(self._spec)
-        for name, filename in self._spec.sounds.items():
-            if not filename:
-                # `null` / 空串 = "这个包确实没有这个音效"（与没写这个键等价）。
-                self._entries[name] = SoundEntry(
-                    name=name,
-                    filename="",
-                    path=None,
-                    exists=False,
-                    playable=False,
-                    reason="索引里声明了但没有给文件名",
-                )
+        for name, filenames in self._spec.sounds.items():
+            if not filenames:
+                # `null` / 空数组 = "这个包确实没有这个音效"（与没写这个键等价）。
+                self._entries[name] = SoundEntry(name=name, candidates=())
                 logger.info("音效 %s：索引里声明了但没有给文件名，静默", name)
                 continue
 
-            path = directory / filename
-            exists = path.is_file()
-            self._entries[name] = SoundEntry(
-                name=name, filename=filename, path=path, exists=exists
-            )
-            if not exists:
-                logger.warning("音效 %s 声明了文件但文件不在：%s", name, path)
-            elif not _is_audio_candidate(path):
-                # 扩展名认不出来**不是**结论：照样试一次，"打不开"由试播说了算。
-                logger.info("音效 %s 的扩展名认不出来，仍然尝试播放：%s", name, path)
+            candidates: list[Candidate] = []
+            for filename in filenames:
+                path = directory / filename
+                exists = path.is_file()
+                candidates.append(
+                    Candidate(filename=filename, path=path, exists=exists)
+                )
+                if not exists:
+                    logger.warning("音效 %s 声明了文件但文件不在：%s", name, path)
+                elif not _is_audio_candidate(path):
+                    # 扩展名认不出来**不是**结论：照样试一次，"打不开"由试播说了算。
+                    logger.info("音效 %s 的扩展名认不出来，仍然尝试播放：%s", name, path)
+            self._entries[name] = SoundEntry(name=name, candidates=tuple(candidates))
+            if len(candidates) > 1:
+                logger.info(
+                    "音效 %s：%d 个候选，每次播放随机选一个", name, len(candidates)
+                )
 
         if not self._entries:
             self._reason = "素材索引里没有声明任何音效"
@@ -452,7 +547,7 @@ class SoundPlayer(QObject):
         - 若在这里 `sleep` 等"加载完成"信号，就是**主线程忙等**——
           task10 §4 明写禁止。所以本函数**不等**任何信号，只把状态推进。
         - "预热到底成没成"由调用方用一个 **2 秒超时定时器**兜底
-          （`app.py` 的 `_schedule_startup_chime`），超时就当作"没有音效"照常启动。
+          （`app.py` 的启动音定时器），超时就当作"没有音效"照常启动。
 
         **幂等**：重复调用只做一次。
         """
@@ -462,21 +557,28 @@ class SoundPlayer(QObject):
 
         playable: list[str] = []
         for name, entry in self._entries.items():
-            if entry.path is None or not entry.exists:
-                # 诊断第 ① 条：声明了但文件不在。**不算可用**，也不试播。
-                continue
-            reason = self._prepare(name, entry)
-            if reason:
-                # 同步就能判定的失败（路径转不成 URL / 对象建不出来）。
-                entry.playable = False
-                entry.reason = reason
-                logger.warning("音效 %s 打不开（%s）：%s", name, reason, entry.path)
-                continue
-            # 加载是**异步**的（见 `_prepare`）：此刻不能说它"能播"，
-            # 只能说"没被同步判定挡掉"。真正的结论由 `settle()` 问出来，
-            # 所以这里先记为 `None`（未知）。
-            entry.playable = None
-            playable.append(name)
+            usable: list[Candidate] = []
+            for candidate in entry.candidates:
+                if not candidate.exists:
+                    # 诊断第 ① 条：声明了但文件不在。**不算可用**，也不试播。
+                    continue
+                reason = self._prepare(name, candidate)
+                if reason:
+                    # 同步就能判定的失败（路径转不成 URL / 对象建不出来）。
+                    candidate.playable = False
+                    candidate.reason = reason
+                    logger.warning(
+                        "音效 %s 打不开（%s）：%s", name, reason, candidate.path
+                    )
+                    continue
+                # 加载是**异步**的（见 `_prepare`）：此刻不能说它"能播"，
+                # 只能说"没被同步判定挡掉"。真正的结论由 `settle()` 问出来，
+                # 所以这里先记为 `None`（未知）。
+                candidate.playable = None
+                usable.append(candidate)
+            # 逐候选试播；**至少一个没被挡掉**就算这条逻辑名可能响。
+            if usable:
+                playable.append(name)
 
         self._playable_names = playable
         # 已经确定的失败（同步那几条）先摘掉；剩下的能不能播由 `settle()` 定。
@@ -502,7 +604,7 @@ class SoundPlayer(QObject):
         调用返回时状态还是 `LoadingMedia`，坏文件的结论要等 Qt 的解码线程给出来。
         调用方（`app.py`）在预热后调一次，把结论定下来：
 
-        - 同步就失败的 / 问出来有错的 → `entry.playable is False`；
+        - 同步就失败的 / 问出来有错的 → `candidate.playable is False`；
         - 问不出问题的 → 记成 `True`（**没报错就是没坏**），免得因为
           "加载慢"就把一个好音效判死——真坏了会在第一次播放时以"没声音"表现。
 
@@ -511,19 +613,23 @@ class SoundPlayer(QObject):
         before = self._available
         before_reason = self._reason
         for name, entry in self._entries.items():
-            if entry.playable is None and entry.exists:
+            for candidate in entry.candidates:
+                if candidate.playable is not None or not candidate.exists:
+                    continue
                 # ⚠ 这里**不能**直接记成"能播"：坏文件的结论要先问一次播放器。
                 # `errorOccurred` 在真平台上**并不可靠**（task10 实测：设备已被别的
                 # 播放器占用时，坏文件的报错根本没发出来），所以判据取**状态本身**
                 # ——`mediaStatus()` / `error()` 与那个信号说的是同一件事，
                 # 但它们**问得到**，不必赌信号一定送达。
-                reason = self._poll_error(name)
+                reason = self._poll_error(name, candidate)
                 if reason:
-                    entry.playable = False
-                    entry.reason = reason
-                    logger.warning("音效 %s 打不开（%s）：%s", name, reason, entry.filename)
+                    candidate.playable = False
+                    candidate.reason = reason
+                    logger.warning(
+                        "音效 %s 打不开（%s）：%s", name, reason, candidate.filename
+                    )
                     continue
-                entry.playable = True
+                candidate.playable = True
         self._playable_names = [
             name for name, entry in self._entries.items() if entry.playable is True
         ]
@@ -546,13 +652,17 @@ class SoundPlayer(QObject):
             return "素材索引里没有声明任何音效"
 
         parts: list[str] = []
-        missing = [name for name, entry in self._entries.items() if not entry.exists]
+        missing = [
+            name
+            for name, entry in self._entries.items()
+            if entry.candidates and not entry.exists
+        ]
         broken = [
             name
             for name, entry in self._entries.items()
             if entry.exists and entry.playable is False
         ]
-        blank = [name for name, entry in self._entries.items() if entry.path is None]
+        blank = [name for name, entry in self._entries.items() if not entry.candidates]
         if missing:
             parts.append(f"声明了但文件不在：{'、'.join(missing)}")
         if broken:
@@ -562,8 +672,10 @@ class SoundPlayer(QObject):
             parts.append(f"声明了但没有文件名：{'、'.join(blank)}")
         return "；".join(parts) if parts else "没有可用的音效"
 
-    def _prepare(self, name: str, entry: SoundEntry) -> str:
-        """为 `name` 建好播放器、接上错误信号、启动加载。返回**同步就能判定的**失败原因。
+    def _prepare(self, name: str, candidate: Candidate) -> str:
+        """为 `(name, candidate)` 建好播放器、接上错误信号、启动加载。
+
+        返回**同步就能判定的**失败原因（成功时空串）。
 
         ## 为什么不能同步问 `mediaStatus()`
 
@@ -574,7 +686,7 @@ class SoundPlayer(QObject):
         **同步读状态会把每一个坏文件都判成"能播"**。
 
         所以"格式打不开"（诊断第 ② 条）只能靠 `errorOccurred` 信号回来，
-        由 `_on_player_error()` 落到 `entry.playable` 上。本函数只做**不依赖加载**
+        由 `_on_player_error()` 落到候选的 `playable` 上。本函数只做**不依赖加载**
         的那几条判定（路径 → URL、对象构造），并把错误信号接好。
         """
         try:
@@ -582,31 +694,42 @@ class SoundPlayer(QObject):
         except ImportError as exc:  # pragma: no cover - PySide6 自带的模块
             return f"QtMultimedia 不可用（{exc}）"
 
-        assert entry.path is not None
-        url = QUrl.fromLocalFile(str(entry.path))
+        assert candidate.path is not None
+        url = QUrl.fromLocalFile(str(candidate.path))
         if not url.isValid() or url.isEmpty():
-            return f"文件路径转不成 URL：{entry.path}"
+            return f"文件路径转不成 URL：{candidate.path}"
 
+        key = self._player_key(name, candidate)
         try:
-            output = self._outputs.get(name)
+            output = self._outputs.get(key)
             if output is None:
                 output = QAudioOutput(self)
-                self._outputs[name] = output
-            player = self._players.get(name)
+                self._outputs[key] = output
+            player = self._players.get(key)
             if player is None:
                 player = QMediaPlayer(self)
                 player.setAudioOutput(output)
                 player.errorOccurred.connect(
-                    lambda error, text, key=name: self._on_player_error(key, error, text)
+                    lambda error, text, k=key: self._on_player_error(k, error, text)
                 )
-                self._players[name] = player
+                self._players[key] = player
             output.setVolume(self._volume / 100.0)
             player.setSource(url)
         except Exception as exc:  # noqa: BLE001 - 播放器构造失败也只是"没有声音"
             return f"{type(exc).__name__}: {exc}"
         return ""
 
-    def _poll_error(self, name: str) -> str:
+    @staticmethod
+    def _player_key(name: str, candidate: Candidate) -> tuple[str, str]:
+        """播放器缓存的键：`(逻辑名, 候选文件名)`。**唯一拼键处**。
+
+        带上逻辑名是为了让日志/诊断能顺着键找回条目；带上文件名是因为
+        同一个逻辑名的不同候选是**不同的媒体源**，必须各有一个播放器
+        （见 `__init__` 里 `_players` 的说明）。
+        """
+        return (name, candidate.filename)
+
+    def _poll_error(self, name: str, candidate: Candidate) -> str:
         """**问一次**播放器"这个文件到底能不能开"，返回原因（没问题时空串）。
 
         为什么要有这一条而不是只等 `errorOccurred`：**信号不保证送达**。
@@ -623,7 +746,7 @@ class SoundPlayer(QObject):
         **永不抛异常**：拿不到播放器 / 问不动都按"没问题"处理（乐观，
         真坏了会在第一次播放时以"没声音"的形式表现出来，不影响启动）。
         """
-        player = self._players.get(name)
+        player = self._players.get(self._player_key(name, candidate))
         if player is None:
             return ""
         try:
@@ -639,20 +762,31 @@ class SoundPlayer(QObject):
             if player.mediaStatus() == QMediaPlayer.MediaStatus.InvalidMedia:
                 return "Qt 认为这个文件不是可播放的媒体"
         except Exception as exc:  # noqa: BLE001 - 问不出来就不下结论
-            logger.debug("查音效 %s 的播放状态失败：%s", name, exc)
+            logger.debug("查音效 %s（%s）的播放状态失败：%s", name, candidate.filename, exc)
         return ""
 
-    def _on_player_error(self, name: str, error: object, text: str) -> None:
-        """Qt 报了播放错误：**把它记进条目**（诊断第 ② 条的唯一来源）。
+    def _on_player_error(
+        self, key: tuple[str, str], error: object, text: str
+    ) -> None:
+        """Qt 报了播放错误：**把它记进那个候选**（诊断第 ② 条的唯一来源）。
 
         信号可能在预热之后才到（异步解码），所以这里不只看预热期的状态：
-        任何时刻来的错误都记下来，并**停掉那一条的后续尝试**
-        （`entry.playable = False` → `play()` 直接静默跳过，不再反复重试同一个坏文件）。
+        任何时刻来的错误都记下来，并**停掉那一个候选的后续尝试**
+        （`candidate.playable = False` → 随机选它时就跳过，不再反复重试同一个坏文件）。
+
+        ⚠ 只判**那一个候选**死，不牵连同一逻辑名下的其它候选：
+        一组里有一个坏文件不该让整条逻辑名变哑（见 `SoundEntry` 的说明）。
 
         `NoError` 要挡掉：Qt 会在正常的一次加载结束时也发一个 `NoError`。
         """
+        name, filename = key
         entry = self._entries.get(name)
         if entry is None:  # pragma: no cover - 只有本模块建的播放器，名字一定在表里
+            return
+        candidate = next(
+            (item for item in entry.candidates if item.filename == filename), None
+        )
+        if candidate is None:  # pragma: no cover - 同上
             return
         try:
             from PySide6.QtMultimedia import QMediaPlayer
@@ -663,16 +797,18 @@ class SoundPlayer(QObject):
             pass
 
         reason = text or str(getattr(error, "name", error))
-        if entry.playable is False and entry.reason == reason:
+        if candidate.playable is False and candidate.reason == reason:
             return  # 同一个原因不重复记
-        entry.playable = False
-        entry.reason = reason
-        # 已经在可播列表里的要从里面摘掉，否则汇报文案会把它算成可用。
-        if name in self._playable_names:
+        candidate.playable = False
+        candidate.reason = reason
+        # 整条逻辑名都哑了才从可播列表里摘掉：还有别的候选能响就照旧算可用。
+        # `entry.playable` 是聚合值（`True` = 至少一个候选能播），此刻它已经把
+        # 刚判死的这个候选算进去了，所以 `is not True` 正是"全组都哑了"。
+        if entry.playable is not True and name in self._playable_names:
             self._playable_names.remove(name)
         self._available = bool(self._playable_names)
         self._reason = self._compose_reason()
-        logger.warning("音效 %s 打不开（%s）：%s", name, reason, entry.filename)
+        logger.warning("音效 %s 打不开（%s）：%s", name, reason, filename)
 
     # ------------------------------------------------------------ 播放
 
@@ -682,33 +818,47 @@ class SoundPlayer(QObject):
         "静默跳过"是 task10 §4 明写的契约：音效缺失 / 坏掉 / 没声明
         都不该让程序有任何可见的异常，最多留一条日志。
 
-        **重复触发先回起点**：`setPosition(0)` 之后再 `play()`，
-        免得连点两次双击时两次声音叠在一起（task10 §6"不叠加成怪声"）。
+        ## 随机选一个（本 task 的新契约）
+
+        索引里 `sounds.<逻辑名>` 是**文件名数组**，每次调用在**能用的**候选里
+        **随机挑一个**（`random.choice`）。"能用"= 文件在、且没被判过打不开；
+        候选为空就退化成"没声音"，**不抛异常**。
+
+        ## 重复触发先回起点
+
+        `setPosition(0)` 之后再 `play()`，免得连点两次双击时两次声音叠在一起
+        （task10 §6"不叠加成怪声"）。注意**只停这一次要播的那个播放器**：
+        随机可能挑到另一个候选，顺手把别的候选一起停了反而打断正在响的那一个。
         """
         entry = self._entries.get(name)
         if entry is None:
             logger.debug("音效 %s 没有在索引里声明，静默跳过", name)
             return False
-        if entry.path is None or not entry.exists:
-            logger.debug("音效 %s 的文件不可用（%s），静默跳过", name, entry.filename or "没有文件名")
+        usable = entry.playable_candidates()
+        if not usable:
+            logger.debug(
+                "音效 %s 没有可用的候选文件（%s），静默跳过",
+                name,
+                entry.filename or "没有文件名",
+            )
             return False
-        if entry.playable is False:
-            # 已经确知打不开（`errorOccurred` 报过）：**不再重试**同一个坏文件，
-            # 否则每次双击都白等一次解码超时。
-            logger.debug("音效 %s 打不开，静默跳过：%s", name, entry.reason)
-            return False
-        player = self._players.get(name)
-        output = self._outputs.get(name)
+
+        candidate = random.choice(usable)
+        key = self._player_key(name, candidate)
+        player = self._players.get(key)
+        output = self._outputs.get(key)
         if player is None or output is None:
             # 没预热过就直接播：补一次准备（**同一条确定路径**，不开旁路）。
-            reason = self._prepare(name, entry)
+            reason = self._prepare(name, candidate)
             if reason:
-                entry.playable = False
-                entry.reason = reason
-                logger.warning("音效 %s 打不开（%s），静默跳过", name, reason)
+                candidate.playable = False
+                candidate.reason = reason
+                logger.warning(
+                    "音效 %s 打不开（%s），静默跳过：%s", name, reason, candidate.filename
+                )
                 return False
-            player = self._players.get(name)
-            output = self._outputs.get(name)
+            player = self._players.get(key)
+            output = self._outputs.get(key)
             if player is None or output is None:  # pragma: no cover - 走不到
                 return False
 
@@ -718,8 +868,15 @@ class SoundPlayer(QObject):
             player.setPosition(0)
             player.play()
         except Exception as exc:  # noqa: BLE001 - 播放失败同样只是"没有声音"
-            logger.warning("音效 %s 播放失败：%s: %s", name, type(exc).__name__, exc)
+            logger.warning(
+                "音效 %s 播放失败（%s）：%s: %s",
+                name,
+                candidate.filename,
+                type(exc).__name__,
+                exc,
+            )
             return False
+        logger.debug("音效 %s 播放：%s", name, candidate.filename)
         return True
 
     def set_volume(self, value: int) -> int:
@@ -739,11 +896,11 @@ class SoundPlayer(QObject):
 
     def stop(self) -> None:
         """停掉全部正在播的音效（退出前用；不销毁播放器）。"""
-        for name, player in self._players.items():
+        for key, player in self._players.items():
             try:
                 player.stop()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("停掉音效 %s 失败：%s", name, exc)
+                logger.debug("停掉音效 %s 失败：%s", key, exc)
 
     def close(self) -> None:
         """关闭全部播放器，避免句柄泄漏（task10 §4"退出"那一行）。
@@ -753,15 +910,15 @@ class SoundPlayer(QObject):
         （task10 §6 的验收就盯着它）。
         """
         self.stop()
-        for name, player in self._players.items():
+        for key, player in self._players.items():
             try:
                 player.setSource(QUrl())
             except Exception as exc:  # noqa: BLE001 - 释放失败也不该抛
-                logger.debug("释放音效 %s 的播放器失败：%s", name, exc)
+                logger.debug("释放音效 %s 的播放器失败：%s", key, exc)
             try:
                 player.deleteLater()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("销毁音效 %s 的播放器失败：%s", name, exc)
+                logger.debug("销毁音效 %s 的播放器失败：%s", key, exc)
         self._players.clear()
         self._outputs.clear()
 
@@ -770,7 +927,12 @@ class SoundPlayer(QObject):
     def diagnose(self) -> SoundReport:
         """三条诊断可见性 + **Qt 后端实测支持的格式**（结构化，调用方自己决定怎么显示）。"""
         entries = tuple(self._entries.values())
-        missing = tuple(name for name, entry in self._entries.items() if not entry.exists)
+        # "缺"= 声明了候选但**一个文件都不在**；`null`（没有候选）不算缺，算"没要求"。
+        missing = tuple(
+            name
+            for name, entry in self._entries.items()
+            if entry.candidates and not entry.exists
+        )
         unplayable = tuple(
             (name, entry.reason or "未知原因")
             for name, entry in self._entries.items()
@@ -812,7 +974,7 @@ class SoundPlayer(QObject):
 #
 # 约定：模块级调用一律写在函数定义之后（曾经写反导致 NameError）。
 
-if SOUND_NAMES != (SOUND_REST, SOUND_CHIME):  # pragma: no cover
+if SOUND_NAMES != (SOUND_START, SOUND_WAVING, SOUND_REST):  # pragma: no cover
     raise RuntimeError(f"音效逻辑名被改动了：{SOUND_NAMES}")
 
 if (VOLUME_MIN, VOLUME_MAX) != (0, 100):  # pragma: no cover

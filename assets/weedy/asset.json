@@ -554,5 +554,22 @@
       ],
       "fps": 30.0
     }
+  },
+  "sounds": {
+    "start": [
+      "waving_00.wav",
+      "waving_01.wav",
+      "waving_02.wav"
+    ],
+    "waving": [
+      "waving_00.wav",
+      "waving_01.wav",
+      "waving_02.wav"
+    ],
+    "rest": [
+      "rest_00.wav",
+      "rest_01.wav",
+      "rest_02.wav"
+    ]
   }
 }
