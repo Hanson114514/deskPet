@@ -1229,6 +1229,12 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | task15 | 可选的边缘抗锯齿：浅色背景下不刺眼，关掉则与现在一模一样 | ✅ 已完成 |
 | task16 | 帧缓存上限小于动作帧数：每帧都在重算 | ✅ 已完成（**约定见 §2.12 缓存上限行，踩坑见 §4.24**） |
 
+**分发版 0.2.0（2026-10-16，用户主动要求）** —— 版本号 `0.1.0` → **`0.2.0`**（`src/deskpet/__init__.py`
+一处），重新打包 onedir 便携版并压成分发 zip。**细节见 §6 末两行**；
+实测：冻结 exe `--version` = `deskPet 0.2.0`、`check_dist.py` 40 项全过、
+`check_dist_autostart.py` 9 项全过、解压副本再真跑一次 rc=0。
+**没有改任何源码逻辑**（只动版本号字符串）。
+
 **task01（已完成）** —— 透明置顶窗口可拖可退，`setMask` 真穿透已实测。
 交付 `run.py` / `main.py` / `src/deskpet/{__init__,__main__,app,pet_window,placeholder}.py`。
 实测（2560×1440 / 100%）：落点 `(2286, 1166)`、尺寸 `250×250`、距右/下边缘各 24 逻辑单位；
@@ -2201,6 +2207,9 @@ task12 更新 task11 同理）。
 | 入口 | `main.py`（顶层静态 import）；`console=False`（无控制台，输出全落 `data/deskpet.log`） |
 | 实测 | `tools/check_dist.py`（**39 项全过**：布局 / 真启动 / 只读查询 / rc=2 / 单实例 / 无残留）+ `check_dist_autostart.py`（**9 项全过**：冻结包里真建 `.lnk` 并读回目标）。日志实测 `pet=weedy … mask=on`、`音效 3/3`、`呼出快捷键 Ctrl+Alt+Shift+P` |
 | 清理 | `dist/`、`build/`、`*.spec` 已在 `.gitignore` 里（**`deskpet.spec` 本该被忽略，但它是交付物，按需 `git add -f`**） |
+| **版本号真值** | **`src/deskpet/__init__.py` 的 `__version__` 一处**（`--version`、启动行、`setApplicationVersion()` 都读它）；zip 文件名 `<版本>-win64` 由它决定 |
+| **0.2.0 重打包（2026-10-16）** | 用户要求：`0.1.0` → **`0.2.0`**（task02–16 的功能增量 + 修掉的真 bug）。`dist/deskPet/`（**512.9 MB**）+ `dist/deskPet-0.2.0-win64.zip`（**230.7 MB / 1711 条目**）。冻结 exe `--version` = `deskPet 0.2.0`；`check_dist.py` **40 项全过**、`check_dist_autostart.py` **9 项全过**；**解压副本**再真跑一次（rc=0、启动行 `pet=weedy … antialias=off`）。旧 `deskPet-0.1.0-win64.zip` 已删除 |
+| ⚠ 打包后必做 | **删掉 `dist/deskPet/data/`**（自检真跑过就会造出来）。交付物必须"从没运行过"：带着构建机的 `config.json` 会让用户桌宠按开发机的档位/位置摆，`deskpet.log` 会把排查方向带偏（spec 里已自动删一次，但**跑完自检还会再生**） |
 
 版本控制：仓库已 `git init`（分支 `main`），`.gitignore` 已忽略
 `data/`、`__pycache__/`、`dist/`、`build/`、`*.spec`、虚拟环境目录；**每个 task 完成提交一次**
