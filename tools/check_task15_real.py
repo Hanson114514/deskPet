@@ -26,6 +26,16 @@
 
 ⚠ 节奏劣化超标 → **记录事实 + 报告用户**，**不许**自己去改动画逻辑（task15 §6）。
 
+> **⚠ task16 起，本脚本 §1 的节奏数不再代表"日常播放"**：
+> 它只采样 **3 秒（≈ 一轮）**，而 `idle` 一轮就是 90 帧 × 33.3 ms ≈ 3.0 秒
+> —— **第一轮必然全是缓存未命中**（缓存此刻还是空的），所以它量的是
+> **冷启动那一轮**，不是用户日常看到的节奏。
+> task16 实测：同一台机器、同一套代码，只看一轮是 **+72.7%**，
+> 预热满一轮之后再看是 **+2.7%**（`check_task16_real.py` §1 的口径）。
+> **"开启抗锯齿的节奏与关闭时同量级"这条结论以 `check_task16_real.py` 为准**；
+> 本脚本这里保留原样是为了**不篡改 task15 已验收的历史数据**，
+> 只把它降级为"冷启动一轮"的观察值。
+
 ## 这一份**不动用户真实配置**
 
 自检的 `config.json` 落在 `data/task15_real_scratch/` 里，跑完删掉。
@@ -155,9 +165,10 @@ def _run() -> int:
             f"{baseline:.1f} → {enabled:.1f} ms/帧（{slowdown * 100:+.1f}%）",
         )
         _LINES.append(
-            "    ⚠ 已超标，但根因是「缓存上限 64 < idle 的 90 帧」导致每帧全部未命中"
-            "（task04 起就存在）。task15 §6 要求：记录事实 + 报告用户，"
-            "不许自行修改动画/缓存逻辑。"
+            "    ⚠ task16 已修掉根因（上限 64 < idle 的 90 帧 → 每帧全部未命中），"
+            "但**本小节的数仍然偏高**：它只采样一轮，量到的是**冷启动**那一轮"
+            "（缓存此刻还是空的）。日常播放的节奏见 check_task16_real.py §1："
+            "预热满一轮后是 +2.7%。"
         )
     else:  # pragma: no cover
         check("能量出基线节奏", False, f"baseline={baseline}")
@@ -238,16 +249,21 @@ def _check_cache_behaviour(spec, size_mod) -> None:
     | **缓存未命中** | 3.2 ms（无 AA）/ 25.5 ms（有 AA） | 每一帧都在重算 |
 
     判据不看绝对值（那随机器变），看的是**帧数与缓存上限的关系**：
-    `idle` 有 90 帧、上限 64 → 必然每帧未命中。这一条**与抗锯齿无关**，
-    是 task04 定下 `DEFAULT_CACHE_LIMIT = 64` 时就存在的行为。
+    `idle` 有 90 帧，而上限在 task16 之前**恒为 64** → 必然每帧未命中。
+
+    ⚠ **task16 已把这条修掉**：上限现在按"这一档一张多大 + 内存预算（160 MiB）"
+    算，第 6 级是 167 张 > 90 帧 → 第二轮**全命中**。所以本节现在的身份是
+    **回归基线**：既量出"现在的上限是多少"，也保留"上限被调小就必然全不命中"
+    这条反证（`limit=frames-1`），用来证明这个判据**有分辨力**
+    （没有对照的断言证明不了什么，§4.23 的教训）。
     """
     import time
 
     from deskpet import rendering
 
     frames = spec.action("idle").frame_count
-    limit = rendering.DEFAULT_CACHE_LIMIT
-    note(f"idle 帧数 = {frames}，缓存上限 = {limit}")
+    limit = rendering.FrameRenderer(spec).limit_for_level(6)
+    note(f"idle 帧数 = {frames}，第 6 级缓存上限 = {limit}（task16 起按预算算）")
 
     # 实测：连开两轮，看第二轮能不能全命中
     for antialias in (False, True):
@@ -266,13 +282,27 @@ def _check_cache_behaviour(spec, size_mod) -> None:
         )
 
     check(
-        f"缓存上限({limit}) < idle 帧数({frames}) —— 这解释了为什么每帧都在重算",
-        limit < frames,
-        f"上限={limit} 帧数={frames}（若上限 >= 帧数，抗锯齿的每帧开销应为 0）",
+        f"task16 之后：上限({limit}) >= idle 帧数({frames}) → 日常播放真的走缓存",
+        limit >= frames,
+        f"上限={limit} 帧数={frames}（task16 之前这里是 64 < 90，必然每帧未命中）",
     )
 
-    # 反证：把上限临时放大，第二轮应当**全命中**（只验因果，不改产品）
-    probe = rendering.FrameRenderer(spec, limit=frames + 1, antialias=True)
+    # 反证（判据的分辨力）：把上限**调到比帧数小一张**，第二轮就应当全不命中。
+    # 没有这条对照，"hits == 帧数"证明不了判据真的在看缓存上限（§4.23 的教训）。
+    probe_tight = rendering.FrameRenderer(spec, limit=frames - 1, antialias=True)
+    for index in range(frames):
+        probe_tight.frame("idle", index, 6, False)
+    probe_tight.hits = probe_tight.misses = 0
+    for index in range(frames):
+        probe_tight.frame("idle", index, 6, False)
+    check(
+        f"[反证] 上限调到 {frames - 1}（比帧数少一张）时第二轮命中为 0",
+        probe_tight.hits == 0,
+        f"hits={probe_tight.hits}（上限只要小一张，LRU 就会把整轮冲洗干净）",
+    )
+
+    # 正证：产品默认上限下，第二轮应当**全命中**
+    probe = rendering.FrameRenderer(spec, antialias=True)
     for index in range(frames):
         probe.frame("idle", index, 6, False)
     probe.hits = probe.misses = 0
@@ -281,11 +311,11 @@ def _check_cache_behaviour(spec, size_mod) -> None:
         probe.frame("idle", index, 6, False)
     elapsed = (time.perf_counter() - start) * 1000
     note(
-        f"[反证] 上限临时设为 {frames + 1}：第二轮 {elapsed:7.1f} ms "
+        f"[正证] 产品默认上限 {probe.limit_for_level(6)}：第二轮 {elapsed:7.1f} ms "
         f"（{elapsed / max(1, frames):5.2f} ms/帧）hits={probe.hits} misses={probe.misses}"
     )
     check(
-        "上限够大时抗锯齿的每帧开销为 0（命中缓存 → 只算过一次）",
+        "默认上限下抗锯齿的每帧开销为 0（命中缓存 → 只算过一次）",
         probe.misses == 0 and probe.hits == frames,
         f"hits={probe.hits} misses={probe.misses}",
     )

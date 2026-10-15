@@ -728,10 +728,17 @@ def section_cache(app) -> None:
     for _ in range(3):
         for level in range(1, 11):
             renderer.frame("idle", 0, level, False)
+    # task16 起上限**不再是常量**：它按"这一档一张多大 + 内存预算"算，
+    # 所以判据改成问渲染器自己要（`renderer.limit`），别拿老常量去比。
     check(
-        f"切档 1→10 各 3 次后条目数不超过上限 {rendering.DEFAULT_CACHE_LIMIT}",
-        renderer.cached_count() <= rendering.DEFAULT_CACHE_LIMIT,
-        f"条目数={renderer.cached_count()}",
+        f"切档 1→10 各 3 次后条目数不超过**当前档**上限 {renderer.limit}",
+        renderer.cached_count() <= renderer.limit,
+        f"条目数={renderer.cached_count()} 上限={renderer.limit}",
+    )
+    check(
+        "上限不再等于老常量 64（task16：它比 idle 的 90 帧还小）",
+        renderer.limit != rendering.DEFAULT_CACHE_LIMIT,
+        f"renderer.limit={renderer.limit} DEFAULT_CACHE_LIMIT={rendering.DEFAULT_CACHE_LIMIT}",
     )
 
     section("§7b 单帧耗时（换档卡顿的判据）")

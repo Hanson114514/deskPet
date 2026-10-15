@@ -37,11 +37,32 @@
 （零重采样）也会经过抗锯齿**——它是台阶最硬、收益最大的一档。
 理由与位置见 `_render()` 里的注释（那段是硬要求，改动前先读 task15 §4）。
 
-## LRU 而不是"按档位保留"
+## 上限：内存预算说了算（task16）
 
-用 `OrderedDict` 做 LRU，上限 `DEFAULT_CACHE_LIMIT` 张。
-天然满足"当前档位 + 前一档"的保留需求（刚用过的档位在最前面），
-又不至于像"每档全留"那样在 10 个档位 × 大帧数下失控。
+**淘汰策略仍是纯 LRU**（`OrderedDict`，按使用顺序淘汰头部）；
+task16 改的只是"上限怎么定"。
+
+task04 定的 `DEFAULT_CACHE_LIMIT = 64` 是一个**拍脑袋的常量**，它比
+`weedy.idle` 的 **90 帧**还小 → 缓存被反复冲洗 → **每一帧都是未命中、
+每一帧都在重新缩放**（task15 实测：连播两轮 `hits=0 / misses=90`，
+与抗锯齿开关无关）。所以上限不能再是常量，必须与"当前动作有多少帧、
+这一档一张多大"挂钩。
+
+**上限 = `limit_for(action_frames, level)`**，规则两条（真值都在本文件）：
+
+1. **内存预算是硬顶**：`MEMORY_BUDGET_BYTES` 折算成"这一档最多放几张"
+   ——这是"内存必须有明确上限"那条验收的落点；
+2. **再夹到 `[MIN_CACHE_LIMIT, MAX_CACHE_LIMIT]`**：下限保证小动作
+   （`waving` 30 帧）与换档过渡也留得住几张，上限防"预算配错到天上去"。
+
+⚠ **实测纠正了 task16 卡里的两个数字**（2026 量出来，以实现为准）：
+卡里写"`weedy_sightseer` 有个 **600 帧**的动作"——**不存在**，
+它 6 个动作最大 180 帧（`rest`）；真正最大的是 **`weedy.waiting` 240 帧**。
+卡里的单张内存（第 6 级 0.44 MB）也偏小 **2.2 倍**，实测第 6 级
+500×500 的 `QImage.sizeInBytes()` = **1 000 000 B（0.954 MB）**、
+第 10 级 = **4 000 000 B（3.815 MB）**（都是 32 位 `ARGB32`）。
+于是"按动作帧数全留"在 `waiting` 上会吃到 229 MB（第 6 级）/
+916 MB（第 10 级）——**被预算挡住是设计意图**，不是 bug。
 
 > **缓存里存的是 `QPixmap`**，而 `QPixmap` **只能在 GUI 线程碰**（agent.md §2.6）。
 > 本阶段没有工作线程，所以这不是问题；将来若真的引线程解码，
@@ -57,9 +78,82 @@ from PySide6.QtGui import QImage, QPixmap
 from . import antialias, pet_loader, size
 from .pet_spec import PetSpec
 
-#: 缓存上限（张）。切档时"当前档 + 前一档"的帧都还在，来回切感觉不到重算；
-#: 10 档 × 上百帧的极端来回也不会把内存吃满（每张最大也就 level 10 的 1000×1000）。
+#: 缓存上限的**兜底默认值**（张）。
+#:
+#: ⚠ task16 起这个常量**不再是实际生效的上限**：真正生效的是
+#: `FrameRenderer.limit`（由 `limit_for(action_frames, level)` 算出来）。
+#: 留着它是因为 `FrameRenderer(limit=...)` 需要一个缺省参数，
+#: 而这个值同时是 `MIN_CACHE_LIMIT` 的来源——**别在别处再写一个 64**。
+#: task04 选它的理由是"够留当前档 + 前一档"，而 task15 实测证明
+#: 它比 `idle` 的 90 帧还小，反而把缓存打成了"永远不命中"。
 DEFAULT_CACHE_LIMIT: Final[int] = 64
+
+#: 缓存占用的**内存预算**（字节）。**这是"内存必须有明确上限"的真值**。
+#:
+#: 160 MiB 是用户 2026 拍板的数（task16 §4 的 D1）。它管的是**已经渲染好的
+#: `QPixmap` 的总量**，不含 Qt 内部的解码缓冲与源 PNG。
+#:
+#: ⚠ 折算时用**该档的满张大小**（`bytes_per_frame`），所以它是"最坏情况"的
+#: 上限：实际占用只可能更小（空帧不进缓存，见 `frame()`）。
+MEMORY_BUDGET_BYTES: Final[int] = 160 * 1024 * 1024
+
+#: 上限的**上限**（张）。防的是"预算或帧数被配到荒唐的值"这一种失控；
+#: 正常路径永远碰不到它（第 1 级的额度 2684 张，离它还有一截）。
+MAX_CACHE_LIMIT: Final[int] = 4096
+
+#: 每个像素占几个字节。**32 位 `ARGB32` = 4**（实测
+#: `QImage.sizeInBytes() == 宽 × 高 × 4`，与 `depth() == 32` 一致）。
+BYTES_PER_PIXEL: Final[int] = 4
+
+
+def bytes_per_frame(pixel_size_: tuple[int, int]) -> int:
+    """一张该尺寸的帧占多少字节（`宽 × 高 × 4`）。
+
+    这是**上界估算**，也是 `MEMORY_BUDGET_BYTES` 的折算依据：缓存里存的是
+    `QPixmap`，其内部格式与 `QImage` 同为 32 位，实测两者尺寸一致。
+
+    尺寸非正 → 返回 1（避免后面除零，永远给得出一个能用的数字）。
+    """
+    width = max(0, int(pixel_size_[0]))
+    height = max(0, int(pixel_size_[1]))
+    return max(1, width * height * BYTES_PER_PIXEL)
+
+
+def limit_for(action_frames: int, level: int, cell: tuple[int, int]) -> int:
+    """算这一档该留几张（task16 的**唯一**上限算法）。
+
+    ## 规则
+
+    1. 预算折算：`MEMORY_BUDGET_BYTES // bytes_per_frame(pixel_size(cell, level))`
+       —— 该档最多放得下几张。**这就是上限本身**（`MAX_CACHE_LIMIT` 只防
+       "预算被配到天上去"这种失控，正常路径碰不到）。
+
+    ## 为什么不直接"上限 = 动作帧数"（task16 §4 的方案 A 原样）
+
+    实测：`weedy.waiting` 有 **240 帧**，第 10 级一张 **3.815 MB** →
+    全留是 **916 MB**；第 6 级也有 **229 MB**。用户拍板"按 160 MB 硬预算卡住"，
+    于是**能全命中的动作就全命中**（`idle` 90 帧 × 0.954 MB = 86 MB < 160 MB ✓）、
+    **放不下的动作按预算截断**（`waiting` 第 6 级只留 167 张）。
+
+    `action_frames` **不参与**计算，只用来给调用方与日志一个说法：
+    上限与"当前动作有多少帧"无关，只与"这一档一张多大"有关——
+    这样换动作**不需要**通知渲染层（少一条状态，见 agent.md §A.2 的同一条理由）。
+    """
+    per_frame = bytes_per_frame(size.pixel_size(cell, level))
+    #: 这一档的额度（张）。**它就是上限**——不要再给它加"至少留 N 张"的下限：
+    #: 第 10 级一张 3.815 MB，额度只有 41 张；托底到 64 张就是 244 MB，
+    #: 比 160 MB 的预算还大 53%（task16 实测踩到的第一条，别改回去）。
+    limit = MEMORY_BUDGET_BYTES // per_frame
+    return max(1, min(MAX_CACHE_LIMIT, limit))
+
+
+def budget_for(action_frames: int, level: int, cell: tuple[int, int]) -> int:
+    """`limit_for()` 对应的**字节数**（自检断言"条目数 × 单张 ≤ 预算"用）。
+
+    单独提供一个函数是为了让那条断言与上限算法**共用同一个折算**，
+    而不是在自检里重算一遍（重算就等于第二份真值，迟早分叉）。
+    """
+    return limit_for(action_frames, level, cell) * bytes_per_frame(size.pixel_size(cell, level))
 
 
 class FrameRenderer:
@@ -75,12 +169,20 @@ class FrameRenderer:
         self,
         spec: PetSpec,
         dpi_scale: float = 1.0,
-        limit: int = DEFAULT_CACHE_LIMIT,
+        limit: int | None = None,
         antialias: bool = False,
     ) -> None:
         self.spec = spec
         self.dpi_scale = float(dpi_scale) if dpi_scale else 1.0
-        self._limit = max(1, int(limit))
+        #: 上限（张）。`None` = **按内存预算自动算**（task16 的默认行为，
+        #: 真实产品路径走这条）；显式给数 = 调用方自己说了算（自检里钉边界用）。
+        #:
+        #: ⚠ 自动模式下上限是**跟着档位走**的（第 1 级一张 0.06 MB 能放几千张、
+        #: 第 10 级一张 3.8 MB 只放得下 42 张），所以不是构造期算一次就完事——
+        #: 每次 `frame()` 都会按**这次请求的档位**重新问一次 `_limit_for_level()`。
+        self._explicit_limit: int | None = None if limit is None else max(1, int(limit))
+        #: 上一次算出来的上限（只为了让 `limit` 属性不必重复算；**不是真值**）。
+        self._limit_cache: dict[int, int] = {}
         #: 边缘抗锯齿开关（task15）。**默认 `False`**，守回归基线：
         #: 默认行为与 task15 之前**逐字节相同**（§0 / §2.8 / §4.9 / §4.12 那四条
         #: "锯齿是已接受的取舍"仍然成立）。
@@ -94,6 +196,11 @@ class FrameRenderer:
         #: 统计信息（自检看"有没有真的走缓存"用，不影响行为）。
         self.hits = 0
         self.misses = 0
+        #: 最近一次被请求的（动作, 档位）。**只用于诊断与 `limit` 属性**：
+        #: 上限的自动算法要问"现在这一档一张多大"，而档位不在构造期定死
+        #: （窗口会切档）。这两个值**不参与缓存键**，也不会让行为分叉。
+        self._last_action: str = ""
+        self._last_level: int = size.DEFAULT_LEVEL
 
     # ------------------------------------------------------------ 对外
 
@@ -108,6 +215,8 @@ class FrameRenderer:
         下次再问一次才有机会在用户补上文件后恢复。
         """
         key = self.cache_key(action, index, level, mirrored)
+        self._last_action = action
+        self._last_level = size.clamp_level(level)
 
         cached = self._cache.get(key)
         if cached is not None:
@@ -121,7 +230,7 @@ class FrameRenderer:
             return pixmap
 
         self._cache[key] = pixmap
-        self._evict()
+        self._evict(level)
         return pixmap
 
     def cache_key(
@@ -138,15 +247,61 @@ class FrameRenderer:
         """当前缓存里有几张图。"""
         return len(self._cache)
 
+    @property
+    def limit(self) -> int:
+        """**当前生效**的缓存上限（张）。
+
+        自动模式下跟着**最近一次请求的档位**走——这是唯一一处"上限是多少"
+        的对外说法，自检与诊断都读它，别再去猜 `DEFAULT_CACHE_LIMIT`
+        （那个常量 task16 起只是兜底参数了）。
+        """
+        return self._limit_for_level(self._last_level)
+
+    def limit_for_level(self, level: int) -> int:
+        """**指定档位**的上限（张）。换档过渡的账要按"两边档位"分别算时用它。"""
+        return self._limit_for_level(level)
+
     def clear(self) -> None:
         """清空缓存（换素材包 / 换 DPI 环境时调用）。"""
         self._cache.clear()
 
     # ------------------------------------------------------------ 内部
 
-    def _evict(self) -> None:
-        """超出上限时丢掉**最久没用过**的那些。"""
-        while len(self._cache) > self._limit:
+    def _limit_for_level(self, level: int) -> int:
+        """这一档的上限。显式给了 `limit` 就用它（自检钉边界用），否则按预算算。"""
+        if self._explicit_limit is not None:
+            return self._explicit_limit
+        level = size.clamp_level(level)
+        cached = self._limit_cache.get(level)
+        if cached is None:
+            cached = limit_for(self._current_action_frames(), level, self.spec.cell)
+            self._limit_cache[level] = cached
+        return cached
+
+    def _current_action_frames(self) -> int:
+        """当前动作有多少帧（**只进日志与诊断**，不参与上限计算）。
+
+        见 `limit_for()` 的说明：上限只与"这一档一张多大"有关，
+        与动作帧数无关——所以换动作**不需要**通知渲染层。
+        """
+        action = self.spec.action(self._last_action)
+        return action.frame_count if action is not None else 0
+
+    def _evict(self, level: int) -> None:
+        """超出**该档**上限时丢掉**最久没用过**的那些（纯 LRU，task16 未改策略）。
+
+        ## 为什么上限按"刚写进来的那一档"算
+
+        缓存的键是**跨档位共存**的（键里含档位）。但每张图的**大小**由档位决定，
+        差两个数量级（第 1 级 0.06 MB / 第 10 级 3.8 MB）。若按"最省的那一档"
+        定上限，来回切到高档就会把内存吃穿；按"最贵的那一档"定上限，
+        正常用低档时又白白浪费额度。
+
+        取"这次请求的档位"是最贴近真实占用的一侧：出现高档条目时按高档收紧，
+        只有低档条目时按低档放宽——**内存永远不超过预算**，而缓存尽可能留住。
+        """
+        limit = self._limit_for_level(level)
+        while len(self._cache) > limit:
             self._cache.popitem(last=False)
 
     def _render(self, action: str, index: int, level: int, mirrored: bool = False) -> QPixmap:
