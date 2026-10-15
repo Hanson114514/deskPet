@@ -149,14 +149,17 @@ def _run_checks() -> int:
     from deskpet import sounds
 
     check(
-        "FIELDS 有 5 行",
-        len(st.FIELDS) == 5,
+        # ⚠ 原值是 5；task15 在"行为"组加了 `边缘抗锯齿`（第 6 行）。
+        # 与 task10 更新 task07、task12/13/14 更新 task11 同理：
+        # 卡里写死的行数是被后续 task 合法推掉的边界，按事实更新。
+        "FIELDS 有 6 行（task15 加了「边缘抗锯齿」）",
+        len(st.FIELDS) == 6,
         f"实测 {len(st.FIELDS)}",
     )
     check(
-        "行顺序 = 角色 / 开机自启 / 呼出快捷键 / 音量 / 久置时间",
+        "行顺序 = 角色 / 开机自启 / 呼出快捷键 / 音量 / 久置时间 / 边缘抗锯齿",
         tuple(field.title for field in st.FIELDS)
-        == ("角色", "开机自启", "呼出快捷键", "音量", "久置时间"),
+        == ("角色", "开机自启", "呼出快捷键", "音量", "久置时间", "边缘抗锯齿"),
         "、".join(field.title for field in st.FIELDS),
     )
     check(
@@ -165,9 +168,9 @@ def _run_checks() -> int:
         f"key={st.FIELDS[1].key!r}",
     )
     check(
-        "分组归属 = 常规×3 / 声音×1 / 行为×1",
+        "分组归属 = 常规×3 / 声音×1 / 行为×2",
         tuple(field.group for field in st.FIELDS)
-        == ("常规", "常规", "常规", "声音", "行为"),
+        == ("常规", "常规", "常规", "声音", "行为", "行为"),
         "、".join(field.group for field in st.FIELDS),
     )
     check(
@@ -195,13 +198,13 @@ def _run_checks() -> int:
         "、".join(st.GROUP_ORDER),
     )
     check(
-        "五个行标题逐字一致",
+        "六个行标题逐字一致",
         tuple(field.title for field in st.FIELDS)
-        == ("角色", "开机自启", "呼出快捷键", "音量", "久置时间"),
+        == ("角色", "开机自启", "呼出快捷键", "音量", "久置时间", "边缘抗锯齿"),
         "、".join(field.title for field in st.FIELDS),
     )
     check(
-        "五句提示逐字一致",
+        "六句提示逐字一致",
         tuple(field.hint for field in st.FIELDS)
         == (
             "换一个形象；切换需要重启桌宠（会自动问你要不要现在重启）",
@@ -209,6 +212,7 @@ def _run_checks() -> int:
             "隐藏后按此键呼出；点右边按钮后按一次想要的组合",
             "点击互动与坐下时的音效音量",
             "鼠标静止这么久后开始张望，再过一半时间坐下",
+            "浅色背景下边缘更柔和；部分素材/档位可能变差，可随时关掉（重启后生效）",
         ),
         "、".join(field.hint[:6] for field in st.FIELDS),
     )
@@ -247,7 +251,7 @@ def _run_checks() -> int:
 
     kinds = tuple(field.kind for field in st.FIELDS)
     check(
-        "控件类型 = 下拉 / 勾选 / 录入 / 滑块 / 滑块",
+        "控件类型 = 下拉 / 勾选 / 录入 / 滑块 / 滑块 / 勾选（task15 补最后一行）",
         kinds
         == (
             st.FieldKind.COMBO,
@@ -255,6 +259,7 @@ def _run_checks() -> int:
             st.FieldKind.KEYSEQ,
             st.FieldKind.SLIDER,
             st.FieldKind.SLIDER,
+            st.FieldKind.CHECK,
         ),
         "、".join(kind.value for kind in kinds),
     )
@@ -561,15 +566,23 @@ def _window_sections() -> int:
         )
         del store._write
         vol.setValue(60)
+        # ⚠ 不能断言 `== "开机自启：未开启"`：状态栏那一段取自**只读查询**
+        # 系统启动文件夹的结果，而那是**随环境变的量**（§4.11 明写"别断言
+        # 随环境变化的量"）。实测在装了分发版之后，用户的启动文件夹里
+        # 确实有 `deskpet.lnk` 指向别处 → 文案变成
+        # `未开启［它指向的是别的地方：…］`，这条断言就会无辜地红掉。
+        # 判据改成"回到了**普通状态**那一段"：以 `STATUS_PREFIX` 开头，
+        # 且**不是**失败提示。
         check(
             "写成功之后状态栏回到状态本身",
-            window._status_label.text() == "开机自启：未开启",
+            window._status_label.text().startswith(st.STATUS_PREFIX),
             repr(window._status_label.text()),
         )
         vol.setValue(65)
         check(
             "**正常情况下**显示状态本身（不是失败原因）",
-            window._status_label.text() == "开机自启：未开启",
+            window._status_label.text().startswith(st.STATUS_PREFIX)
+            and not window._status_label.text().startswith(st.FAILED_PREFIX),
             repr(window._status_label.text()),
         )
 

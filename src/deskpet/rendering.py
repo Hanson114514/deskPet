@@ -27,6 +27,16 @@
 不动原 PNG（task06 §4 渲染契约）。镜像**不影响锚点与档位**——
 水平翻转折点对称，"右下角锚点不动"仍然成立。
 
+## 边缘抗锯齿是可选的第二步（task15）
+
+`FrameRenderer(..., antialias=True)` 时，**缩放之后**会再走一趟
+`antialias.smooth_edges()` 加一圈过渡像素。默认 `False`，此时本文件的行为
+与 task15 之前**完全一致**（那条"边缘台阶是已接受的取舍"的决策仍然成立）。
+
+调用点**在"缩放 or 短路"的 if/else 之外**，所以**第 6 级那条短路路径
+（零重采样）也会经过抗锯齿**——它是台阶最硬、收益最大的一档。
+理由与位置见 `_render()` 里的注释（那段是硬要求，改动前先读 task15 §4）。
+
 ## LRU 而不是"按档位保留"
 
 用 `OrderedDict` 做 LRU，上限 `DEFAULT_CACHE_LIMIT` 张。
@@ -44,7 +54,7 @@ from typing import Final
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 
-from . import pet_loader, size
+from . import antialias, pet_loader, size
 from .pet_spec import PetSpec
 
 #: 缓存上限（张）。切档时"当前档 + 前一档"的帧都还在，来回切感觉不到重算；
@@ -61,10 +71,24 @@ class FrameRenderer:
     本阶段由调用方重建 `FrameRenderer` 解决。
     """
 
-    def __init__(self, spec: PetSpec, dpi_scale: float = 1.0, limit: int = DEFAULT_CACHE_LIMIT) -> None:
+    def __init__(
+        self,
+        spec: PetSpec,
+        dpi_scale: float = 1.0,
+        limit: int = DEFAULT_CACHE_LIMIT,
+        antialias: bool = False,
+    ) -> None:
         self.spec = spec
         self.dpi_scale = float(dpi_scale) if dpi_scale else 1.0
         self._limit = max(1, int(limit))
+        #: 边缘抗锯齿开关（task15）。**默认 `False`**，守回归基线：
+        #: 默认行为与 task15 之前**逐字节相同**（§0 / §2.8 / §4.9 / §4.12 那四条
+        #: "锯齿是已接受的取舍"仍然成立）。
+        #:
+        #: ⚠ **不进缓存键**：生效方式是**重启生效**（用户拍板），
+        #: 于是开关在**一个进程的生命周期内恒定**，同一个键永远只对应一种渲染结果。
+        #: 少一个维度就少一处会分叉的地方（`cache_key()` 保持 4 维不动）。
+        self.antialias = bool(antialias)
         #: `键 -> QPixmap`；`OrderedDict` 的**尾部是最新**（LRU 淘汰头部）。
         self._cache: "OrderedDict[tuple[str, int, int, bool], QPixmap]" = OrderedDict()
         #: 统计信息（自检看"有没有真的走缓存"用，不影响行为）。
@@ -144,16 +168,35 @@ class FrameRenderer:
         if (image.width(), image.height()) == target:
             # 已经是目标尺寸（第 6 级 / 1.00×）就别走一趟缩放：
             # `SmoothTransformation` 对同尺寸也会拷一份，纯属浪费。
-            scaled = image
+            processed = image
         else:
-            scaled = image.scaled(
+            processed = image.scaled(
                 target[0],
                 target[1],
                 Qt.IgnoreAspectRatio,
                 Qt.SmoothTransformation,  # D3 的最终选择，理由见模块开头
             )
 
-        pixmap = QPixmap.fromImage(scaled)
+        # ---------------------------------------------------------- 边缘抗锯齿（task15）
+        #
+        # ⚠⚠ **调用点必须在上面那个 if/else 之"外"**（task15 §4 的硬要求）。
+        #
+        # 写成"两个分支各自处理"必然漏掉某一档：第 6 级走的是**短路分支**
+        # （零重采样、原图直接交出），把它写在 `else` 里就等于"6 档没有抗锯齿"
+        # ——而 6 档恰恰是台阶最硬、收益最大的那一档。
+        # 反过来写在 `if` 里则会漏掉其余 9 档。**只有放在分支之外，
+        # 全部 10 个档位才都流经同一个出口**（自检里用"每档结果都 != 关闭时"
+        # 盯着这个结构）。
+        #
+        # **位置在"缩放之后"**，理由有两条：
+        #   ① 放大档（7–10）本来就是 `SmoothTransformation` 产生的过渡像素，
+        #      放在缩放**之前**会让它们**被柔化两次**，细节损失比 6 档大得多；
+        #   ② 放在之后，过渡带宽度才与"最终看到的那张图"的像素一一对应
+        #      （放在之前，放大后过渡带会被一起放大成好几像素宽）。
+        if self.antialias:
+            processed = antialias.smooth_edges(processed)
+
+        pixmap = QPixmap.fromImage(processed)
         if pixmap.isNull():  # pragma: no cover - 只有显存/平台异常才会走到
             return pixmap
         return pixmap

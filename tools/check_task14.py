@@ -656,10 +656,17 @@ def section_readonly() -> None:
             f"before={real_before} after={_dir_snapshot(real_startup)}",
         )
         check(
-            "打开窗口后那里仍然没有我们的自启项（自检不该给用户装上自启）",
-            not (real_startup / autostart.SHORTCUT_NAME).exists()
-            and not (real_startup / autostart.FALLBACK_NAME).exists(),
-            str(sorted(p.name for p in real_startup.iterdir())),
+            # ⚠ 原文断言"那里**没有**我们的自启项"。那是**随环境变的量**
+            # （§4.11：别断言随环境变化的量）：用户装了分发版之后，
+            # 他的真启动文件夹里**本来就该有** `deskpet.lnk`，
+            # 这条断言于是无辜地红掉——而自检其实什么都没做错。
+            # 真正的意图是"**自检没有给用户装上或改掉任何自启项**"，
+            # 而那正是上一条**整个目录快照比对**在管的事；
+            # 这里改成只断言"我们这个进程没有新建文件"（mtime 也不许变），
+            # 环境里原本有没有都与本自检无关。
+            "打开窗口后启动文件夹内容一个字节都没变（自检不改用户的自启项）",
+            _dir_snapshot(real_startup) == real_before,
+            f"目录内容={str(sorted(p.name for p in real_startup.iterdir()))}",
         )
         check(
             "打开设置窗口也不该创建 config.json（读操作只读）",

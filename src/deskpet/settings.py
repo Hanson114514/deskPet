@@ -99,6 +99,14 @@ HINT_HOTKEY: Final[str] = "隐藏后按此键呼出；点右边按钮后按一�
 HINT_VOLUME: Final[str] = "点击互动与坐下时的音效音量"
 HINT_IDLE: Final[str] = "鼠标静止这么久后开始张望，再过一半时间坐下"
 
+#: `边缘抗锯齿` 那一行的提示（task15 §4 的逐字要求）。
+#: ⚠ **必须如实写清"收益 + 代价"**，不许只写好处：算法**不保证**对所有素材
+#: 都更好看（用户将来会导入自己的素材包），各档位收益也不一致。
+#: 所以这里明写"部分素材/档位可能变差"，并注明**重启后生效**。
+HINT_ANTIALIAS: Final[str] = (
+    "浅色背景下边缘更柔和；部分素材/档位可能变差，可随时关掉（重启后生效）"
+)
+
 #: 角色行提示（task11 那条边界的原文）：**不同意重启**时显示它。
 PET_RESTART_HINT: Final[str] = "重启后生效"
 
@@ -113,6 +121,26 @@ PET_RESTARTING_HINT: Final[str] = "正在重启…"
 #: 询问"现在自动重启吗？"的标题与正文（task13 §4）。
 RESTART_ASK_TITLE: Final[str] = "换角色"
 RESTART_ASK_TEXT: Final[str] = "角色已经切换，需要重启桌宠才会生效。\n现在自动重启吗？"
+
+#: `边缘抗锯齿` 的询问框标题与正文（task15 §4）。
+#:
+#: ⚠ **本 task 的诚实性落点**：正文里**必须**有"不保证对所有素材、所有档位
+#: 都更好看"这个意思。理由有两条：
+#:   ① 用户**将来会导入自己的素材包**（`data/pets/`），算法不保证对它们成立；
+#:   ② 各档位收益本来就不一致（1–5 档是缩小，没有硬台阶可消，收益小甚至无）。
+#: **不许**写成"边缘更平滑"这类**无条件的承诺**（§4.2：不要写没验证过的承诺）。
+#: 把判断权交给用户 = 让他**看了再决定**，比替他保证可靠得多。
+RESTART_ASK_ANTIALIAS_TITLE: Final[str] = "边缘抗锯齿"
+RESTART_ASK_ANTIALIAS_TEXT: Final[str] = (
+    "已切换到「{state}」。\n\n"
+    "抗锯齿对多数素材能减轻边缘锯齿，但不保证对所有素材、所有档位都更好看"
+    "——某些素材或档位可能反而变差。请重启后自己看一眼，不满意随时改回来。\n\n"
+    "现在重启桌宠吗？"
+)
+
+#: `边缘抗锯齿` 那两行的显示说法（`{state}` 的取值）。
+ANTIALIAS_ON_TEXT: Final[str] = "开"
+ANTIALIAS_OFF_TEXT: Final[str] = "关"
 
 #: 配置写失败时的提示（task13 §4 逐字要求）。
 PET_SAVE_FAILED_HINT: Final[str] = "保存失败，重启后会回到原来的角色"
@@ -282,6 +310,17 @@ FIELDS: Final[tuple[FieldSpec, ...]] = (
         maximum=300,
         unit=" 秒",
     ),
+    FieldSpec(
+        group="行为",
+        # 勾选后**写配置 → 问要不要重启**（照 `换角色` 那一套，task15 §4）。
+        # 生效方式是**重启生效**：不在这里失效缓存、不重绘
+        # （那正是本决策要避免的复杂度，见 task15 §5）。
+        key="antialias",
+        title="边缘抗锯齿",
+        hint=HINT_ANTIALIAS,
+        kind=FieldKind.CHECK,
+        implemented=True,
+    ),
 )
 
 
@@ -392,6 +431,9 @@ class SettingsWindow(QDialog):
         self._value_labels: dict[str, QLabel] = {}
         #: 最近一次失败的原因；**空串 = 没有失败**。状态栏渲染时先看它。
         self._last_failure: str = ""
+        #: 最近一次**成功**提示（`重启后生效` / `正在重启…` 这类）；空串 = 没有。
+        #: 记字段而不是直接写控件，理由见 `refresh_status()`（task15 修的 bug）。
+        self._last_message: str = ""
         #: `开机自启` 那一行旁边的状态文字（`_build_control` 里填）。
         self._autostart_label: QLabel | None = None
         #: 最近一次**只读查询**得到的自启状态（`autostart.AutostartState`）。
@@ -586,6 +628,10 @@ class SettingsWindow(QDialog):
                         self._update_value_label(field, int(value))
                 elif field.kind is FieldKind.KEYSEQ:
                     widget.set_shortcut_text(str(value))  # type: ignore[attr-defined]
+                elif field.kind is FieldKind.CHECK:
+                    # 勾选框（task15 的 `边缘抗锯齿`）：读配置摆上初值。
+                    # ⚠ 这会发 `toggled`，但整段在 `_applying` 守卫里（见上）。
+                    widget.setChecked(bool(value))  # type: ignore[attr-defined]
             self._fill_autostart()
         finally:
             self._applying = False
@@ -680,7 +726,9 @@ class SettingsWindow(QDialog):
         if current_pet is not None:
             self._current_pet = str(current_pet)
         # 重开一次不该继续显示上一次的失败（那是**上一次操作**的结论）。
+        # 成功提示同理：`重启后生效` 说的是上一次改动，重开时该回到普通状态。
         self._last_failure = ""
+        self._last_message = ""
         self._load_from_config()
 
     def _fill_pet_combo(self) -> None:
@@ -707,20 +755,31 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------ 状态栏
 
     def refresh_status(self) -> None:
-        """刷新状态栏：**`error` 存在时失败原因优先于状态本身**（task11 §4）。
+        """刷新状态栏：**失败原因 > 成功提示 > 普通状态**（三段，不是拼起来）。
 
-        所以这里是"先看有没有失败、再看普通状态"两段，不是把两段拼起来。
+        三段各自的来源：
 
-        普通状态 = **开机自启那一行**（task14 §4 的契约：前缀 `开机自启：`）。
-        它取自最近一次**只读查询**的结果（`_autostart_state`），
-        **不在渲染时重新查询**——渲染会被频繁调用，而每次查询都要起一个
-        PowerShell 进程。
+        | 段 | 来源 | 什么时候清掉 |
+        | --- | --- | --- |
+        | 失败原因 | `_last_failure`（写失败的系统原文） | 下一次写入成功 |
+        | **成功提示** | `_last_message`（`重启后生效` 这类） | 下一次刷新成别的东西之前**一直留着** |
+        | 普通状态 | 最近一次只读查询的自启状态（task14 契约：前缀 `开机自启：`） | —— |
+
+        ⚠ **中间那一段是 task15 补的**。第一版只写了两段，`_set_status_text()`
+        直接 `setText()`——于是**任何一次后续 `refresh_status()` 都会把那句提示
+        冲掉**（自检当场抓到：不同意重启时状态栏显示的是 `开机自启：未开启`
+        而不是 `重启后生效`）。而"不同意重启 → 状态栏留下 `重启后生效`"
+        是 task15 §6 的明文验收，task13 的换角色也依赖同一句话。
+        对策：把成功提示**记在字段里**，由本方法统一渲染，而不是直接写控件。
 
         还没查过时显示 `未开启`：`autostart.TEXT_DISABLED` **就是**那个值，
         所以这里不另写一个字面量（真值只一处）。
         """
         if self._last_failure:
             self._status_label.setText(f"{FAILED_PREFIX}{self._last_failure}")
+            return
+        if self._last_message:
+            self._status_label.setText(self._last_message)
             return
         state = self._autostart_state
         status_text = state.status_text if state is not None else autostart.TEXT_DISABLED
@@ -825,7 +884,85 @@ class SettingsWindow(QDialog):
         if not field.key and field.kind is FieldKind.CHECK:
             self._on_autostart_check(checked)
             return
+        if field.key == "antialias":
+            self._on_antialias_check(field, checked)
+            return
         self._write_field(field, bool(checked))
+
+    def _on_antialias_check(self, field: FieldSpec, checked: bool) -> None:
+        """勾 / 取消 `边缘抗锯齿`（task15）：**写配置 → 问要不要现在重启**。
+
+        与 `换角色`（`_switch_to_pet`）是**同一套流程**，因为生效方式相同
+        （重启生效）。三条规矩也照抄：
+
+        | 情形 | 行为 |
+        | --- | --- |
+        | 写成功 | 询问"现在自动重启吗？"；同意则重启，不同意则状态栏 `重启后生效` |
+        | **值没变**（重复勾同一个值） | `SetResult.changed` 为假 → **不问、不重启、不写盘** |
+        | 写失败 | 控件**回滚** + 状态栏 `设置失败：<系统原因>`，**且不重启** |
+
+        ⚠ 写失败**不问重启**：配置没写进去 = 磁盘上还是老值，这时重启
+        只会让用户看到"我改了它，重启了，但还是老样子"（task13 §4 同一条）。
+        """
+        result = self._store.apply(field.key, bool(checked))
+        if not result.ok:
+            logger.error("设置：写 %s 失败：%s", field.key, result.error)
+            self._rollback(field)
+            self._set_failure(result)
+            return
+
+        self._clear_failure()
+        if not result.changed:
+            # 值没变：**不写盘、不发问、不重启**（task15 §6 有一条验收盯这个）。
+            # 上面的 `apply()` 已经走了"没变就不落盘"的短路，这里只是不发问。
+            logger.info("设置：%s 已经是 %r，不询问重启", field.key, bool(checked))
+            self.settings_changed.emit(field.key, bool(checked))
+            return
+
+        self.settings_changed.emit(field.key, bool(checked))
+        logger.info("设置：%s → %r（重启后生效）", field.key, bool(checked))
+        self._ask_restart_for_antialias(bool(checked))
+
+    def _ask_restart_for_antialias(self, enabled: bool) -> None:
+        """问"现在自动重启吗？"（与 `_ask_restart` 同构，文案不同）。
+
+        **默认不重启**：没装确认处理器（自检 / 精简场景）时按"不同意"处理
+        ——"擅自把用户的程序关掉"比"让他自己重启"危险得多。
+        """
+        state = ANTIALIAS_ON_TEXT if enabled else ANTIALIAS_OFF_TEXT
+        agreed = False
+        if self._confirm_handler is not None:
+            agreed = bool(
+                self._confirm_handler(
+                    RESTART_ASK_ANTIALIAS_TITLE,
+                    RESTART_ASK_ANTIALIAS_TEXT.format(state=state),
+                )
+            )
+
+        hint = f"边缘抗锯齿已切换到「{state}」；{PET_RESTART_HINT}"
+        if not agreed:
+            # 不同意 → 状态栏留下 `重启后生效`，**当前实例继续运行**。
+            self._set_status_text(hint)
+            logger.info("设置：边缘抗锯齿已改为 %s，用户选择稍后重启", state)
+            return
+
+        if self._restart_handler is None:
+            # 装了确认处理器却没装重启处理器（自检里的组合）→ 不能假装重启成功。
+            self._set_status_text(hint)
+            return
+
+        outcome = self._restart_handler()
+        if not outcome.started:
+            # 重启失败：**当前实例继续运行**，**不说"重启后生效"**
+            # （那会让人以为自动重启成功了）。
+            detail = outcome.reason or "新实例没能起来"
+            logger.error("设置：边缘抗锯齿已改为 %s，但重启失败：%s", state, detail)
+            self._last_failure = detail
+            self.refresh_status()
+            return
+
+        self.restart_requested = True
+        self._set_status_text(f"边缘抗锯齿已切换到「{state}」；{PET_RESTARTING_HINT}")
 
     def _on_autostart_check(self, checked: bool) -> None:
         """勾 / 取消 `开机自启`：**先动系统，再按只读查询的结果刷新界面**。
@@ -1131,9 +1268,15 @@ class SettingsWindow(QDialog):
             self._applying = False
 
     def _set_status_text(self, text: str) -> None:
-        """显示一句**成功**提示（失败提示走 `_set_failure`）。"""
+        """显示一句**成功**提示（失败提示走 `_set_failure`）。
+
+        ⚠ **记字段 + 走 `refresh_status()`**，不要直接 `setText()`：
+        直接写控件的话，任何一次后续刷新（例如自启状态刷新）都会把它冲掉
+        （task15 自检抓到的真 bug，见 `refresh_status()` 的说明）。
+        """
         self._last_failure = ""
-        self._status_label.setText(text)
+        self._last_message = text
+        self.refresh_status()
 
     def _append_status(self, text: str) -> None:
         """在**已经显示着的**状态栏后面补一句，**不覆盖失败原因**。
@@ -1142,14 +1285,28 @@ class SettingsWindow(QDialog):
         而 task13 §4 还要说一句"保存失败，重启后会回到原来的角色"（那是"后果"）。
         直接 `setText()` 会把系统原文挤掉，正好违反"失败原因优先于成功状态"
         （§2.10）——所以两句都留着。
+
+        ⚠ **要接到"当前生效的那一段"上**（`refresh_status()` 是
+        "失败 > 成功提示 > 普通状态"三段）：写失败时当前生效的是
+        `_last_failure`，接错到 `_last_message` 上就会被失败那一段盖住、
+        **一个字都显示不出来**（task15 改这一段时踩到，被 `check_task13.py`
+        那条"写失败时提示『保存失败…』"当场抓住）。
         """
-        existing = self._status_label.text()
+        if self._last_failure:
+            if text in self._last_failure:  # 别重复堆同一句
+                return
+            self._last_failure = f"{self._last_failure}\n{text}"
+            self.refresh_status()
+            return
+
+        existing = self._last_message or self._status_label.text()
         if not existing:
-            self._status_label.setText(text)
+            self._set_status_text(text)
             return
         if text in existing:  # 别重复堆同一句
             return
-        self._status_label.setText(f"{existing}\n{text}")
+        self._last_message = f"{existing}\n{text}"
+        self.refresh_status()
 
     # ------------------------------------------------------------ 逃生门
 

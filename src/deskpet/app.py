@@ -1194,7 +1194,8 @@ def _print_startup_line(window: PetWindow, level_source: str, position_source: s
     source = action.fps_source.label if action is not None else "（未知）"
     _logger.info(
         "%s %s | pet=%s action=%s %s mode=%s frames=%d frame_ms=%.4f fps_source=%s "
-        "pos=(%d, %d)(%s) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s dpr=%.2f",
+        "pos=(%d, %d)(%s) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s "
+        "antialias=%s dpr=%.2f",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
@@ -1215,6 +1216,10 @@ def _print_startup_line(window: PetWindow, level_source: str, position_source: s
         mask_state,
         # 镜像这一栏是 task06 加的：翻转是不是**记住了**只看这一行。
         "on" if window.mirrored else "off",
+        # 抗锯齿这一栏是 task15 加的：验收要能从启动行直接读出 `antialias=on/off`
+        # （开关是**重启生效**，所以每次启动都得看得见它当时是什么值）。
+        # 值取自**渲染器**而不是配置：以"真正作用到出图上"的那个为准。
+        "on" if window.antialias else "off",
         window.devicePixelRatioF(),
     )
 
@@ -1539,6 +1544,10 @@ def run(argv: list[str] | None = None) -> int:
         idle_state=idle_state,
         config=store,
         sounds=sound_player,
+        # 边缘抗锯齿（task15）：**启动时读一次**配置。
+        # 生效方式是**重启生效**，所以这里没有"开关变了要重绘"的通道
+        # （用户拍板，见 task15 §1/§5：少一条动态通道就少一处会对不上的状态）。
+        antialias=bool(store.get("antialias")),
     )
     window.play_action(action)
     if position is None:

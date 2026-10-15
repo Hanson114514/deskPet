@@ -229,6 +229,7 @@ class PetWindow(QWidget):
         idle_state: IdleStateMachine | None = None,
         config: ConfigStore | None = None,
         sounds: SoundPlayer | None = None,
+        antialias: bool = False,
     ) -> None:
         super().__init__(parent)
 
@@ -316,7 +317,13 @@ class PetWindow(QWidget):
             self._idle.stage_changed.connect(self._on_stage_changed)
 
         #: 渲染器（帧 → 目标尺寸 + 缓存）。缓存键含档位**与镜像**（task06 已补齐）。
-        self._renderer = FrameRenderer(pet, self._device_pixel_ratio())
+        #:
+        #: `antialias` 由 `app.py` 在**启动时读一次配置**传进来（task15）。
+        #: ⚠ 生效方式是**重启生效**：本类**没有**"开关变了"的通道，
+        #: 运行期状态与 task15 之前完全相同（用户拍板，见 task15 §1 与 §5）。
+        self._renderer = FrameRenderer(
+            pet, self._device_pixel_ratio(), antialias=antialias
+        )
         #: 当前档位。`None` 表示还没定（构造时要么给 level、要么自适应）。
         self._level = 0
 
@@ -409,6 +416,16 @@ class PetWindow(QWidget):
     def size_level(self) -> int:
         """`level` 的别名（说"档位"时两种叫法都有人用，统一指同一个值）。"""
         return self._level
+
+    @property
+    def antialias(self) -> bool:
+        """边缘抗锯齿开没开（task15）。
+
+        **取渲染器上的那个值**，不是再读一遍配置：启动行要打印的是
+        "真正作用到出图上的"状态，两者万一不一致时以渲染器为准
+        （这正是"不要有第二份真值"的意思）。
+        """
+        return self._renderer.antialias
 
     def _apply_level(self, level: int) -> None:
         """**切档的唯一入口**：先把该档的帧渲染好，再改窗口尺寸、再重设遮罩。
@@ -639,6 +656,15 @@ class PetWindow(QWidget):
         没有第二个布尔开关（agent.md §2.13："还在播吗就是 `isActive()`"）。
         """
         return self._driver.running
+
+    @property
+    def animation_driver(self) -> AnimationDriver:
+        """帧推进器（只读；**改播放状态请用 `play_action()` / `hold_frame()`**）。
+
+        与 `animation` 属性同一个用意：自检要能挂 `frame_due` 观察真实帧节奏
+        （task15 的真平台节奏就是靠它量的——探针定时器的间隔不代表帧间隔）。
+        """
+        return self._driver
 
     def hold_frame(self, index: int) -> None:
         """定格在第 ``index`` 帧；**画面完全不动，也不再排下一次换帧**。
@@ -1277,6 +1303,12 @@ class PetWindow(QWidget):
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         try:
+            # DPI≠100% 时 Qt 会把逻辑尺寸的位图**再补放大一次**（窗口的逻辑尺寸
+            # 与 `_frame_image` 的像素尺寸本来一致，但设备像素更多）。
+            # 默认的 `SmoothPixmapTransform` 是 **关**的，那次补放大走**最近邻**，
+            # 于是边缘又冒出等比放大的粗台阶——task15 §2 第 8 条点名的现象。
+            # 这一行是**独立的真修复**：与抗锯齿开关无关、任何设置下都生效。
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             # `_frame_image` 是**按当前档位缩放后**的图，尺寸与窗口一致，按 (0, 0) 摆放。
             # 它未标注 DPR（见 pet_loader.load_frame_image / rendering 的说明），
             # 所以这里也**不要**自己乘 devicePixelRatio —— 那是缩放两次（agent.md §4.9）。

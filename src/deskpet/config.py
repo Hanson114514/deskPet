@@ -51,6 +51,12 @@ def _build_defaults() -> dict[str, Any]:
         "size_level": DEFAULT_SIZE_LEVEL,
         "position": "",
         "mirror": {},
+        # 边缘抗锯齿（task15）。**默认必须是 `False`**：默认行为要与 task15 之前
+        # **逐字节相同**，这样 §0 / §2.8 / §4.9 / §4.12 那四条
+        # "锯齿是已接受的取舍"的决策仍然成立。
+        # ⚠ 生效方式是**重启生效**：开关只在启动时读一次，
+        # 运行期没有"开关变了要失效缓存"的动态逻辑（用户拍板，见 task15 §1）。
+        "antialias": False,
     }
 
 
@@ -220,6 +226,8 @@ class Config:
     #: 用 `default_factory` 而不是可变默认值 —— 默认值必须与 `DEFAULTS["mirror"]`
     #: （空对象）一致，下面模块级那组断言会盯着这一点。
     mirror: dict[str, bool] = field(default_factory=dict)
+    #: 边缘抗锯齿（task15）。默认 `False` = 与 task15 之前逐字节相同。
+    antialias: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mirror", dict(self.mirror or {}))
@@ -469,12 +477,28 @@ class ConfigStore(QObject):
 
         `set()` 本身仍是布尔接口（`pet_window` / `mirror` / 自检都在用它），
         两者共用同一份实现，**不会分叉**。
+
+        ## `changed` 是怎么算出来的（task15 修的）
+
+        第一版在成功时**无条件写 `changed=True`**，注释里说"值没变时它照样是
+        '这次写入被接受了'，界面不需要区分"。**task15 证明这个说法不成立**：
+        边缘抗锯齿那一行要的是"**配置真的改了**才问要不要重启"，
+        而无条件为真意味着"重复勾同一个值 → 又问一次重启、还说改成功了"
+        ——正是本项目最忌讳的**假成功**。
+
+        `set()` 只回布尔，确实分不出"改了"与"本来就一样"，所以这里
+        **在调用前后各读一次内存值**比出来。判据是内存快照
+        （`_values`），它由 `set()` 维护、写失败还会回滚，所以：
+        写失败 → 提前返回，比不到；值没变 → 前后相等 → `changed=False`。
         """
+        before = self._values.get(key, _MISSING)
         ok = self.set(key, value)
         if ok:
-            # `changed` 无从判断（`set()` 只回布尔）——按"确认过"算真：
-            # 值没变时它照样是"这次写入被接受了"，界面不需要区分这两个。
-            return SetResult(True, True, "", "")
+            after = self._values.get(key, _MISSING)
+            # `_MISSING` 只可能出现在未知键上，而未知键根本进不来（`set` 会拒收）；
+            # 真出现时按"变了"算，偏向"多问一次重启"这一安全侧。
+            changed = before is _MISSING or before != after
+            return SetResult(True, changed, "", "")
 
         # **未知键**也是"我们拒收"，不是系统的写盘错误（task11 §4 的分类
         # 直接决定状态栏措辞，所以判据要收在这里一处）。
