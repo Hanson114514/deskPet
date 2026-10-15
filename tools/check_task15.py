@@ -47,6 +47,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint  # noqa: E402
 from PySide6.QtGui import QGuiApplication, QImage  # noqa: E402
 
 RESULT_FILE = ROOT / "data" / "task15_check.txt"
@@ -76,6 +77,16 @@ def section(title: str) -> None:
     _LINES.append("")
     _LINES.append(f"== {title} ==")
     print(f"\n== {title} ==")
+
+
+def note(text: str) -> None:
+    """记一条**只有数据、没有结论**的观察（不参与 PASS/FAIL）。
+
+    与 `check()` 分开：有些数值是"解释现象用的"，硬套一个成功条件
+    反而会把判据写歪（§4.11：别把成功条件写反）。
+    """
+    _LINES.append(f"    {text}")
+    print(f"    {text}")
 
 
 def _source_of(name: str) -> str:
@@ -483,6 +494,141 @@ def section_ghosting(app) -> None:
                 float(values.min()) < 200.0,
                 f"边缘合成亮度最小值={values.min():.1f}",
             )
+
+
+def section_on_screen(app) -> None:
+    """§5b **过渡像素真的上屏了吗**（task15 补：这是最容易自欺的一条）。
+
+    ## 为什么必须有这一节
+
+    第一版的验收**只看了渲染层的 `QImage`**（`frame_image.save()`），
+    于是"算法产生了 2074 个过渡像素"被当成了"用户能看到效果"。
+    实际上 `setMask` 是**二值**的（`createAlphaMask()` 阈值 `alpha >= 128`），
+    那 2074 个像素的 alpha 大多在 **32~96**，**只有 53 个能上屏**，
+    其余被系统级穿透裁掉 —— **用户看到的是"几乎没变化"**，
+    而自检却全绿。这是"拿算法输出当验收对象"的典型翻车。
+
+    所以这一节**必须用"遮罩之后的画面"当判据**，不许再用渲染层的图。
+    """
+    section("§5b 过渡像素真的上屏了吗（用遮罩之后的画面当判据）")
+    from deskpet import antialias, hit_test, rendering
+
+    spec, _image = _load_image()
+    if spec is None:  # pragma: no cover
+        check("素材可用", False, "拿不到素材包")
+        return
+
+    import numpy as np
+
+    level = 6
+    off = rendering.FrameRenderer(spec, antialias=False).frame("idle", 0, level)
+    on = rendering.FrameRenderer(spec, antialias=True).frame("idle", 0, level)
+
+    def alpha_of(pixmap):
+        img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
+        height, width = img.height(), img.width()
+        flat = np.frombuffer(bytes(img.constBits()), dtype=np.uint8)
+        return (
+            flat[: img.bytesPerLine() * height]
+            .reshape(height, img.bytesPerLine() // 4, 4)[:, :width, :][:, :, 3]
+            .copy()
+        )
+
+    a_off = alpha_of(off)
+    a_on = alpha_of(on)
+    new_pixels = (a_off == 0) & (a_on > 0)
+    count_new = int(np.sum(new_pixels))
+    check("抗锯齿确实产生了过渡像素", count_new > 0, f"共 {count_new} 个")
+
+    # ① 默认阈值（关抗锯齿）下能上屏几个 —— 这就是用户抱怨的根源
+    visible_default = int(np.sum(new_pixels & (a_on >= hit_test.DEFAULT_ALPHA_THRESHOLD)))
+    note(
+        f"若用默认阈值 {hit_test.DEFAULT_ALPHA_THRESHOLD}："
+        f"{count_new} 个过渡像素里只有 {visible_default} 个能上屏"
+        f"（{visible_default / max(1, count_new) * 100:.1f}%）"
+    )
+    check(
+        "默认阈值确实会吃掉绝大多数过渡像素（这条解释了「看不出变化」）",
+        visible_default < count_new * 0.1,
+        f"{visible_default}/{count_new} 能上屏",
+    )
+
+    # ② 抗锯齿阈值下应当**全部**能上屏
+    visible_aliased = int(
+        np.sum(new_pixels & (a_on >= hit_test.ALIASED_ALPHA_THRESHOLD))
+    )
+    note(
+        f"用抗锯齿阈值 {hit_test.ALIASED_ALPHA_THRESHOLD}："
+        f"{visible_aliased}/{count_new} 能上屏"
+    )
+    check(
+        "抗锯齿阈值下**全部**过渡像素都能上屏",
+        visible_aliased == count_new,
+        f"{visible_aliased}/{count_new}",
+    )
+
+    # ③ 阈值必须是"够用的最小值"：再往下降不该多出任何像素
+    for lower in (8, 4, 2, 1):
+        more = int(np.sum(new_pixels & (a_on >= lower)))
+        if more != visible_aliased:
+            check(
+                f"阈值 {lower} 与 {hit_test.ALIASED_ALPHA_THRESHOLD} 效果相同（16 已是最小够用值）",
+                False,
+                f"{lower} 能上屏 {more} 个，与 16 的 {visible_aliased} 不同",
+            )
+            break
+    else:
+        check(
+            f"阈值 {hit_test.ALIASED_ALPHA_THRESHOLD} 已是最小够用值（再降不多出像素）",
+            True,
+            "8/4/2/1 都是同一个结果",
+        )
+
+    # ④ **端到端**：拿真窗口实际会用的那个阈值算区域，确认可点范围没有失控
+    region_off = hit_test.region_for_frame(
+        off.toImage(), alpha_threshold=hit_test.DEFAULT_ALPHA_THRESHOLD
+    )
+    region_on = hit_test.region_for_frame(
+        on.toImage(), alpha_threshold=hit_test.ALIASED_ALPHA_THRESHOLD
+    )
+    check("关抗锯齿时算得出区域", region_off is not None)
+    check("开抗锯齿时算得出区域", region_on is not None)
+    if region_off is not None and region_on is not None:
+        note(
+            f"外接矩形：关闭 {region_off.boundingRect().width()}×"
+            f"{region_off.boundingRect().height()} → 开启 "
+            f"{region_on.boundingRect().width()}×{region_on.boundingRect().height()}"
+        )
+        grow_w = region_on.boundingRect().width() - region_off.boundingRect().width()
+        grow_h = region_on.boundingRect().height() - region_off.boundingRect().height()
+        check(
+            "可点范围沿轮廓外扩是**克制**的（外接矩形每边不超过 4 像素）",
+            grow_w <= 4 and grow_h <= 4,
+            f"宽 {grow_w:+d}、高 {grow_h:+d}",
+        )
+        # 不得退化成整帧可点
+        width, height = on.width(), on.height()
+        check(
+            "没有退化成整帧可点（四角仍穿透）",
+            not all(
+                region_on.contains(QPoint(x, y))
+                for x, y in (
+                    (0, 0),
+                    (width - 1, 0),
+                    (0, height - 1),
+                    (width - 1, height - 1),
+                )
+            ),
+            "四角至少有一个在区域外",
+        )
+
+    # ⑤ 源码级：`apply_mask` 必须**按开关**选阈值（写死任何一边都是 bug）
+    code = _squashed("pet_window.py")
+    check(
+        "apply_mask 走的阈值跟着抗锯齿开关（不是一个写死的常量）",
+        "ALIASED_ALPHA_THRESHOLD" in code and "_mask_threshold" in code,
+        "判据：pet_window 里同时出现两个阈值常量与选择逻辑",
+    )
 
 
 def section_degrade(app) -> None:
@@ -936,6 +1082,7 @@ def main() -> int:
     section_structure(app)
     section_all_levels(app)
     section_ghosting(app)
+    section_on_screen(app)
     section_degrade(app)
     section_cache(app)
     section_settings(app)

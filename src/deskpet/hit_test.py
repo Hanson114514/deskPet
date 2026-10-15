@@ -29,12 +29,45 @@ D2 定案是 `setMask(QRegion)`：区域外的点击由**系统级穿透**，窗
 **窗口的事件处理器不重复调用它**——那会在遮罩之外再造一份判定真值。
 """
 
+from typing import Final
+
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QBitmap, QGuiApplication, QImage, QRegion
 
-#: 判定用的不透明阈值说明：走 Qt 自带的 `QImage.createAlphaMask()`（约 `alpha >= 128`）。
+#: 遮罩的默认不透明阈值：走 Qt 自带的 `QImage.createAlphaMask()`。
+#: 实测（用一张 `alpha = 0..255` 的单行图探出来）它的判据**恰好是 `alpha >= 128`**。
 #: 真实素材的源 GIF 是 1 位 alpha（只有 0 / 255），这个阈值不影响结果（§4.12）。
 #: 本模块**不自己数像素**——"按 alpha 判定"会失去真穿透（§4.9 写过理由）。
+DEFAULT_ALPHA_THRESHOLD: Final[int] = 128
+
+#: 开了边缘抗锯齿之后要用的**低阈值**（task15 §6 的"可点范围允许沿轮廓扩大"）。
+#:
+#: ## 为什么必须降（这是 task15 实测出来的一条硬事实）
+#:
+#: `createAlphaMask()` 是**二值**的（`alpha >= 128`）。而抗锯齿的本质就是
+#: 产生**半透明**的过渡像素——实测那 2074 个新像素的 alpha 分布是
+#: `1–32: 27%` / `33–64: 42%` / `65–96: 26%` / `97–127: 2%`，
+#: **绝大多数落在 32~96 之间**。于是用 128 去筛，**只有 53 个能上屏**，
+#: 其余 2021 个被系统级穿透直接裁掉 —— **抗锯齿等于白做，肉眼完全看不出**。
+#: （这不是推理：用户先反馈"感觉没什么变化"，随后按上面的方式量出来的。）
+#:
+#: ## 为什么是 16
+#:
+#: 实测（`idle` 第 0 帧 / 第 6 级 / 500×500，先与真实现校准过）：
+#:
+#: | 阈值 | 能上屏的过渡像素 | 可点范围 |
+#: | --- | --- | --- |
+#: | 128（默认） | **53** | 基线 6.74% |
+#: | 64 | 1123 | +0.40 个百分点 |
+#: | 32 | 1546 | +0.56 |
+#: | **16** | **2074（全部）** | **+0.81** |
+#: | 8 / 4 / 2 / 1 | 2074（与 16 完全相同） | +0.81 |
+#:
+#: **16 是"全部过渡像素都上屏"的最小阈值**：再往下降结果一模一样，
+#: 而代价固定为"可点范围沿轮廓外扩约 0.8 个百分点、外接矩形 157×226 → 159×228"。
+#: 这个代价**用户明确接受**（task15 §1："允许可点范围沿轮廓适当扩大"；
+#: 凹陷小结构不穿透是**预期行为**，不要求修复）。
+ALIASED_ALPHA_THRESHOLD: Final[int] = 16
 
 
 def can_build_region() -> bool:
@@ -57,14 +90,20 @@ def can_build_region() -> bool:
     return QGuiApplication.instance() is not None
 
 
-def region_for_frame(frame_image: QImage | None, mirrored: bool = False) -> QRegion | None:
+def region_for_frame(
+    frame_image: QImage | None,
+    mirrored: bool = False,
+    alpha_threshold: int = DEFAULT_ALPHA_THRESHOLD,
+) -> QRegion | None:
     """按 ``frame_image`` 的**不透明像素**生成窗口区域。
 
     返回 ``None`` 表示"**算不出来**"，调用方必须退化成**不设遮罩**（整帧可点）：
 
     - ``None`` / 空图 / 尺寸非正 → ``None``；
     - **没有 alpha 通道** = 整块不透明 → 返回整幅区域；
-    - 不透明阈值取 Qt 自带的 ``QImage.createAlphaMask()``（约 ``alpha >= 128``）。
+    - 不透明阈值：``alpha_threshold`` 默认是 Qt ``createAlphaMask()`` 的
+      ``128``；开了边缘抗锯齿的调用方应传 ``ALIASED_ALPHA_THRESHOLD``（``16``），
+      否则抗锯齿产生的半透明像素会被**全部裁掉**（理由与实测数据见那个常量）。
 
     ``mirrored=True``：图**已经翻过**时不要再翻一次——区域由"看到的这张图"
     算出来，于是"能点到的范围"与"看到的画面"永远一致（agent.md §2.14）。
@@ -73,6 +112,14 @@ def region_for_frame(frame_image: QImage | None, mirrored: bool = False) -> QReg
     **带 `devicePixelRatio` 的图先折回逻辑尺寸**再生成区域：遮罩坐标是窗口内的
     逻辑像素，不折回的话区域会整体放大 ``ratio`` 倍（人物能点到的范围比看到的
     大一圈，高 DPI 下必现，task01 已有实现，别改回去）。
+
+    ## 低阈值是怎么实现的（**不自己数像素**）
+
+    ⚠ §4.9 那条"不自己按 alpha 判定，否则失去真穿透"**仍然成立**。
+    所以这里**不自己造 `QBitmap`**：做法是先把"不达标的像素"的 alpha **改成 0**、
+    达标的改成 255，然后再交给 Qt 的 ``createAlphaMask()`` 去二值化。
+    阈值由我们定，**"怎么算不透明"仍然是 Qt 说了算**——没有第二份实现。
+    阈值等于 128（默认）时走的就是原来那条路径，行为**逐字节不变**。
 
     本函数**永不抛异常**（agent.md §2.8 的降级约定）；没有 `QGuiApplication`
     实例时返回 ``None``（**不是**崩掉，理由见 `can_build_region()`）。
@@ -101,6 +148,12 @@ def region_for_frame(frame_image: QImage | None, mirrored: bool = False) -> QReg
         if not source.hasAlphaChannel():
             return QRegion(0, 0, width, height)
 
+        threshold = int(alpha_threshold)
+        if threshold < DEFAULT_ALPHA_THRESHOLD:
+            source = _clamp_alpha(source, threshold)
+            if source is None:  # pragma: no cover - 只有平台异常才会走到
+                return None
+
         alpha_mask = source.createAlphaMask()
         if alpha_mask.isNull():
             return None
@@ -110,11 +163,53 @@ def region_for_frame(frame_image: QImage | None, mirrored: bool = False) -> QReg
         return None
 
 
+def _clamp_alpha(image: QImage, threshold: int) -> QImage | None:
+    """把 alpha **按阈值硬化**成 0 / 255，交给 Qt 去二值化。
+
+    这就是"降低 `createAlphaMask()` 阈值"的实现方式：先改 alpha，
+    再让 Qt 用**它自己**的规则（`alpha >= 128`）筛一遍。
+    于是"哪些像素算不透明"这件事**始终只有 Qt 一个真值**（§4.9）。
+
+    用 numpy 做（渲染层已经因为抗锯齿引入了它，不是新依赖；
+    纯 Python 逐像素在 1000×1000 上要几百毫秒，会拖慢换档）。
+    """
+    try:
+        import numpy as np
+
+        converted = image.convertToFormat(QImage.Format_ARGB32)
+        if converted.isNull():  # pragma: no cover
+            return None
+        height = converted.height()
+        width = converted.width()
+        flat = np.frombuffer(
+            bytes(converted.constBits()), dtype=np.uint8
+        )
+        expected = converted.bytesPerLine() * height
+        if flat.size < expected:  # pragma: no cover
+            return None
+        # 必须按 `bytesPerLine()` 切行再截到 `width()`：Qt 的扫描行有 4 字节
+        # 对齐填充，直接按 width*4 重塑会让图斜着错位（宽度非 4 倍数时必现）。
+        pixels = flat[:expected].reshape(height, converted.bytesPerLine() // 4, 4)[
+            :, :width, :
+        ].copy()
+        alpha = pixels[:, :, 3]
+        pixels[:, :, 3] = np.where(alpha >= threshold, 255, 0).astype(np.uint8)
+        buffer = np.ascontiguousarray(pixels).tobytes()
+        # ⚠ `QImage(bytes, ...)` 不拷贝缓冲区：`buffer` 必须活到 `.copy()` 之后。
+        rebuilt = QImage(buffer, width, height, QImage.Format_ARGB32).copy()
+        if rebuilt.isNull():  # pragma: no cover
+            return None
+        return rebuilt
+    except Exception:
+        return None
+
+
 def hit_test(
     frame_image: QImage | None,
     pos: QPoint,
     rendered_size: tuple[int, int] | None = None,
     mirrored: bool = False,
+    alpha_threshold: int = DEFAULT_ALPHA_THRESHOLD,
 ) -> bool:
     """``pos``（**窗口内**逻辑坐标）是不是落在 ``frame_image`` 的不透明像素上。
 
@@ -156,7 +251,7 @@ def hit_test(
             # 查询点镜像（等价于把图左右翻过来，见 docstring）。
             x = width - 1 - x
 
-        region = region_for_frame(image)
+        region = region_for_frame(image, alpha_threshold=alpha_threshold)
         if region is None or region.isEmpty():
             # 算不出来 → 整帧可点（降级，不是"判不中"）。
             return True

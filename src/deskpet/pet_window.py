@@ -1290,13 +1290,33 @@ class PetWindow(QWidget):
         实现转发给 `hit_test.region_for_frame()`（**区域生成的唯一入口**）。
         收进来的图**已经翻过**（镜像在渲染层做），所以"能点到的范围"
         与"看到的画面"永远一致，这里不需要再管镜像（agent.md §2.14）。
+
+        ## ⚠ 阈值跟着抗锯齿开关走（task15 实测补上的一半）
+
+        开了抗锯齿时必须用**低阈值**（`hit_test.ALIASED_ALPHA_THRESHOLD`），
+        否则抗锯齿**等于白做**：过渡像素的 alpha 大多在 32~96，
+        而 `createAlphaMask()` 的阈值是 128 → 实测 2074 个新像素里
+        **只有 53 个能上屏**，肉眼看不出任何变化（用户先反馈"感觉没变化"，
+        随后量出这条因果）。
+
+        关着的时候**必须用默认阈值**：那是 task15 之前的既有行为，
+        改它会动到"关掉就与以前一模一样"那条基线（§0/§2.8/§4.9/§4.12）。
         """
-        region = hit_test.region_for_frame(image)
+        region = hit_test.region_for_frame(
+            image, alpha_threshold=self._mask_threshold
+        )
         if region is None or region.isEmpty():
             self.clearMask()
             return False
         self.setMask(region)
         return True
+
+    @property
+    def _mask_threshold(self) -> int:
+        """当前该用的遮罩 alpha 阈值（**真值只有这一处**）。"""
+        if self._renderer.antialias:
+            return hit_test.ALIASED_ALPHA_THRESHOLD
+        return hit_test.DEFAULT_ALPHA_THRESHOLD
 
     # ------------------------------------------------------------ 事件
 
