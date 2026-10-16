@@ -27,3 +27,22 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 工作过程文件（只留在本地 main 上，不进开源仓库）
+agent.md
+requests.md
+tasks/
+
+# 素材源与第三方参考工程
+# `assets/` 里已经是抽好帧的成品；`raw/` 只是构建期的输入，不进开源仓库。
+raw/
+
+# 与"主体功能测试"无关的工具（开源仓库只保留 check_task*.py 与两个自启 .ps1）
+#   extract_gif_frames / make_kv_package —— 素材处理，且依赖已被排除的 raw/
+#   check_dist / check_dist_autostart    —— 测的是打包产物，不是源码功能
+#   probe_task15_perf                    —— 性能探针（量耗时），不是功能断言
+tools/extract_gif_frames.py
+tools/make_kv_package.py
+tools/check_dist.py
+tools/check_dist_autostart.py
+tools/probe_task15_perf.py
