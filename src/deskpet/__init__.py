@@ -10,7 +10,7 @@
 PROGRAM_NAME = "deskPet"
 
 #: 版本号。打包与 ``--version`` 用。
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["PROGRAM_NAME", "__version__"]
 

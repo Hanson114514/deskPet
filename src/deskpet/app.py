@@ -1660,6 +1660,12 @@ class KeyListenerController:
         )
         #: **临时挂起**（task19 录入用）。与形态 / 可见性分开，恢复时各还各的。
         self._suspended = False
+        #: 上一次同步出来的轮询结论（**只为"变了才记日志"服务**，不是第二份真值）。
+        self._last_polling: bool | None = None
+        #: 自愈定时器（见 `reconcile()`）。**默认不转**，由 `start_reconcile()` 起。
+        self._reconcile_timer = QTimer()
+        self._reconcile_timer.setTimerType(Qt.PreciseTimer)
+        self._reconcile_timer.timeout.connect(self.reconcile)
         window.set_key_listener(self.listener)
         # 窗口的可见性变化驱动启停（隐藏 = 没人看，白烧 CPU，2.13 同一条纪律）。
         window.visibility_changed.connect(lambda _visible: self.sync())
@@ -1694,11 +1700,68 @@ class KeyListenerController:
         停下来时监听器自己会**清空 `pressed`**（`KeyListener._sync`），
         于是回来时不会带着一个"陈旧的按下"（task18 8 第 3 条）。
         """
-        self.listener.set_enabled(self.should_poll())
+        want = self.should_poll()
+        changed = want != self._last_polling
+        self.listener.set_enabled(want)
+        if changed:
+            self._last_polling = want
+            _logger.info(
+                "按键联动：%s（形态=%s 窗口可见=%s 挂起=%s）",
+                "开始轮询" if want else "停止轮询",
+                # ⚠ 形态的空串就是「宠物形态」（`FORM_PET = ""`）。
+                # 直接打出来会变成 `形态=`，看着像"取不到值"，
+                # 排查时极易误判 —— 这里显式写成 pet。
+                self.window.form or "pet",
+                self.window.isVisible(),
+                self._suspended,
+            )
+
+    def reconcile(self) -> None:
+        """**自愈**：重判一次该不该轮询，不一致就纠回来（task20）。
+
+        ## 为什么需要它
+
+        `sync()` 只在**被叫到**时才跑，而它的调用点只有三个（切形态 /
+        窗口可见性 / 挂起）。只要有一条路径改变了启用条件却**没叫 sync()**，
+        那个判断就永远是旧的 —— 表现成"按什么都没反应"，且**不会自愈**。
+        用户 2026 实测分发版："只要窗口失焦 KV 就失效，点一下桌宠让焦点
+        回来才恢复" —— 正是"状态陈旧且没人来纠正"的典型症状。
+
+        本方法由一条 1 秒的定时器驱动，把"当前启用条件"与"监听器实际状态"
+        对齐。它是**兜底**、不是第二份真值：真值仍是 `should_poll()`，
+        这里只做"定期去问一次，不对就改"。
+
+        ⚠ 只有**真的不一致**时才动监听器：`set_enabled()` 会清空 `pressed`
+        （本来就是为"切走再切回不带陈旧按键"设计的），每秒无脑调一次会把
+        用户正按着的键反复抹掉。
+        """
+        want = self.should_poll()
+        if want == self.listener.enabled:
+            return
+        _logger.warning(
+            "按键联动自愈：启用条件=%s，监听器实际=%s -> 纠正（这行说明有路径漏调了 sync）",
+            want,
+            self.listener.enabled,
+        )
+        self.listener.set_enabled(want)
+
+    def start_reconcile(self, interval_ms: int = 1000) -> None:
+        """起一条自愈定时器（`app.py` 装配时调一次）。
+
+        与其它驱动一样由调用方在退出时 `stop_reconcile()`。
+        单元自检里不调它 —— 那样就没有"凭空多一条定时器"的干扰。
+        """
+        self._reconcile_timer.setInterval(max(50, int(interval_ms)))
+        self._reconcile_timer.start()
+
+    def stop_reconcile(self) -> None:
+        """停自愈定时器（幂等；退出收尾调）。"""
+        self._reconcile_timer.stop()
 
     def stop(self) -> None:
         """退出收尾：停表（与其它驱动一样，`finally` 里做）。"""
         self.listener.stop()
+
 
 def _report_resolution_problems(issues: tuple, fell_back: bool, config_pet: str | None) -> None:
     """把解析素材包时攒下的问题**一次性全部**写进日志（§2.10 第三类）。"""
