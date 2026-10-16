@@ -95,6 +95,34 @@ _VK_BY_KEY["Left"] = (0x25, "Left")
 _VK_BY_KEY["Up"] = (0x26, "Up")
 _VK_BY_KEY["Right"] = (0x27, "Right")
 _VK_BY_KEY["Down"] = (0x28, "Down")
+# 标点符号区（键盘形态要能映射它们，task20）：VK 取 OEM 码（与 Win32 的 VK_OEM_* 一致）。
+_VK_BY_KEY["Minus"] = (0xBD, "Minus")
+_VK_BY_KEY["Equal"] = (0xBB, "Equal")
+_VK_BY_KEY["BracketLeft"] = (0xDB, "BracketLeft")
+_VK_BY_KEY["BracketRight"] = (0xDD, "BracketRight")
+_VK_BY_KEY["Backslash"] = (0xDC, "Backslash")
+_VK_BY_KEY["Semicolon"] = (0xBA, "Semicolon")
+_VK_BY_KEY["Apostrophe"] = (0xDE, "Apostrophe")
+_VK_BY_KEY["Grave"] = (0xC0, "Grave")
+_VK_BY_KEY["Comma"] = (0xBC, "Comma")
+_VK_BY_KEY["Period"] = (0xBE, "Period")
+_VK_BY_KEY["Slash"] = (0xBF, "Slash")
+_VK_BY_KEY["CapsLock"] = (0x14, "CapsLock")
+_VK_BY_KEY["NumLock"] = (0x90, "NumLock")
+_VK_BY_KEY["ScrollLock"] = (0x91, "ScrollLock")
+_VK_BY_KEY["PrintScreen"] = (0x2C, "PrintScreen")
+_VK_BY_KEY["Pause"] = (0x13, "Pause")
+# 修饰键本身也能作为一个键被映射（键位映射要；快捷键组合仍然不要，两条路分开）。
+_VK_BY_KEY["Ctrl"] = (0x11, "Ctrl")
+_VK_BY_KEY["Shift"] = (0x10, "Shift")
+_VK_BY_KEY["Alt"] = (0x12, "Alt")
+_VK_BY_KEY["Win"] = (0x5B, "Win")
+# 鼠标五键（键位映射支持；"当成特殊的键盘按键"，task20 用户要求）。
+_VK_BY_KEY["MouseLeft"] = (0x01, "MouseLeft")
+_VK_BY_KEY["MouseRight"] = (0x02, "MouseRight")
+_VK_BY_KEY["MouseMiddle"] = (0x04, "MouseMiddle")
+_VK_BY_KEY["MouseX1"] = (0x05, "MouseX1")
+_VK_BY_KEY["MouseX2"] = (0x06, "MouseX2")
 
 #: 展示文字 → 虚拟键码（注册用）。同一个键的多种写法都在这里收口。
 _VK_BY_NAME: Final[dict[str, int]] = {}
@@ -125,8 +153,28 @@ _QT_KEY_ALIASES: Final[dict[int, str]] = {
     0x01000015: "Down",
     0x01000012: "Left",
     0x01000014: "Right",
-    0x01000020: "Space",    # Qt.Key_Space
+    0x01000020: "Shift",    # Qt.Key_Shift  ⚠ 曾经误写成 "Space"
+    0x01000021: "Ctrl",     # Qt.Key_Control
+    0x01000022: "Win",      # Qt.Key_Meta
+    0x01000023: "Alt",      # Qt.Key_Alt
+    0x01000024: "CapsLock",
+    0x01000025: "NumLock",
+    0x01000026: "ScrollLock",
+    0x0100002C: "PrintScreen",
+    0x01000008: "Pause",
 }
+for _number in range(1, 13):  # Qt.Key_F1 = 0x01000030
+    _QT_KEY_ALIASES[0x01000030 + _number - 1] = f"F{_number}"
+
+#: **标点区**：Qt 对这些键用的是 ASCII 值，而那几个数在 VK 表里另有含义
+#: （`0x2E` 既是 `Qt.Key_Period` 又是 `VK_DELETE`；`0x2D` 既是 `Qt.Key_Minus`
+#: 又是 `VK_INSERT`……）。所以必须**显式登记**，靠"两边数值相同"那条经验会译错。
+#: ⚠ 这张表在 `format_qt_key()` 里**先于** VK 表查，正是为了压住这些碰撞。
+_QT_KEY_ALIASES.update({
+    0x2C: "Comma", 0x2E: "Period", 0x2D: "Minus", 0x3D: "Equal",
+    0x3B: "Semicolon", 0x27: "Apostrophe", 0x2F: "Slash", 0x5C: "Backslash",
+    0x5B: "BracketLeft", 0x5D: "BracketRight", 0x60: "Grave",
+})
 
 #: 非法说法的统一报错文字（task12 §4 逐字）。
 REASON_NEED_MODIFIER: Final[str] = "快捷键必须包含 Ctrl / Alt / Shift / Win 之一"
@@ -201,11 +249,29 @@ def format_qt_key(qt_key: int) -> str | None:
 
     这是"录入控件看到的键"与"注册要用的键"之间**唯一**的翻译口
     （`keycapture` 只调它，不自己拼字母表——拼表会在小键盘、功能键上出错）。
+
+    ## ⚠ 两套键值**不能混着查**（task20 修掉的一个真 bug）
+
+    Qt 把"带前缀的特殊键"编码成 `0x01000000 | n`，而 Win32 的虚拟键码是小整数。
+    第一版查完 `_QT_KEY_ALIASES` 没命中时**又去查了 `_SHOWN_BY_VK`**（那张表按 VK 建），
+    于是"低字节偶然相等"就翻译出一个**完全无关的名字**：
+
+    | 实际按键 | Qt 码低字节 | 撞上的 VK | 错译成 |
+    | --- | --- | --- | --- |
+    | 句号 Period | `0x2E` | `VK_DELETE` | `Delete` |
+    | 减号 Minus | `0x2D` | `VK_INSERT` | `Insert` |
+    | 引号 Apostrophe | `0x27` | `VK_RIGHT` | `Right` |
+
+    规则：**大于 `0xFF` 的码只查 `_QT_KEY_ALIASES`，绝不碰 VK 表**。
+    （小于等于 `0xFF` 的才是"两边数值相同"那批：`Key_A == 0x41 == VK_A`。）
     """
     key = int(qt_key)
     alias = _QT_KEY_ALIASES.get(key)
     if alias is not None:
         return alias
+    if key > 0xFF:
+        # 带 Qt 前缀但表里没有：**不认识就是不认识**，不许拿去撞 VK 表。
+        return None
     shown = _SHOWN_BY_VK.get(key)
     if shown is not None:
         return shown

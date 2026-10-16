@@ -217,11 +217,18 @@ class SingleKeyCaptureButton(QPushButton):
         | 按下的是 | 结果 |
         | --- | --- |
         | Esc | **取消**，保留原值（不是"绑成 Esc"） |
-        | 单独一个修饰键（Ctrl/Shift/Alt/Win） | **无效**，留在录入态等下一个键 |
-        | 其它任意键（含没有修饰键的字母 `F`） | 录下来 |
+        | 其它任意键（字母 / 空格 / 方向键 / **修饰键本身**） | 录下来 |
 
-        ⚠ 只按修饰键时不退出录入态（用户 2026 的明确要求）：
-        否则"想录 `Ctrl` 却发现录不了、还得重点一次"就是一次白费。
+        ## ⚠ 修饰键**单独按下也算**（task20 改；与组合录入正好相反）
+
+        键位映射要的是"这个格子对应哪个物理键"，而 `Ctrl` / `Shift` 本身就是
+        合法的物理键（音游里常有人把 `Ctrl` 当键位用）。第一版照抄了组合录入
+        的"单独按修饰键无效"，于是**这四个键根本录不进去**——用户 2026 实测
+        反馈后改掉。
+
+        ⚠ **组合录入（`KeyCaptureEdit`）的规矩不变**：热键那边仍然要求
+        "至少一个修饰键 + 恰好一个主键"，单独按修饰键依然不成立。两条路
+        的要求本来就不同，不要因为这里改了就去动那边（见模块开头第 2 条）。
         """
         if not self._listening:
             super().keyPressEvent(event)
@@ -234,8 +241,8 @@ class SingleKeyCaptureButton(QPushButton):
             return
 
         vk = native_virtual_key(event)
-        if not vk or int(event.key()) in MODIFIER_QT_KEYS or vk in MODIFIER_NATIVE_VKS:
-            # 修饰键**单独按下不算一次录入**：不动状态，继续等。
+        if not vk:
+            # 连 VK 都取不到（非 Windows / 合成事件）：这一下不算数，继续等。
             event.accept()
             return
 

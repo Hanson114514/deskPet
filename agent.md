@@ -730,6 +730,37 @@ GUI 线程创建/使用）。**不要**为了"看起来专业"提前引入 `QThr
 | 装配 | `app.KeyviewController`：**可调用**（`settings.KeyviewChanger`，收布局名）+ **有 `set_suspended()`**（界面用 `getattr` 取那个可选钩子）。⚠ 与热键/重启/自启同一条：`SettingsController.open()` 里**每个新窗口都要重装** |
 | 即时生效的回调 | `SettingsController.set_settings_handler()`（挂在 `settings_changed` 上，**不是**每窗口重装那种处理器）：只有 `keyview_keys` 走它 |
 
+### 2.25 键位映射的视角、特殊键与鼠标（task20 定案）
+
+用户 2026 实测反馈三条，**全部落定**：
+
+| 项 | 约定 |
+| --- | --- |
+| **网格按谁看** | 设置界面用 `LayoutSpec.display_rows`（= `rows` **旋转 180°**），**不是** `rows`。理由：`rows` 是**画面口径**（与渲染图逐格对应），而界面是给人看的；角色面朝观众低头看键盘，她的"左右"与观众相反、"近排"在画面另一头 —— 两个轴同时反 = 旋转 180°。⚠ **只换显示顺序**：键 id / 坐标 / 渲染 / 配置**一个字节都不动**（键身份与"摆第几格"本来就解耦） |
+| **修饰键能单独录** | `SingleKeyCaptureButton`（键位映射）**接受** Ctrl / Shift / Alt / Win 单独成键。⚠ **组合录入 `KeyCaptureEdit`（热键）的规矩不变**：仍要求"至少一个修饰键 + 恰好一个主键"，单独按修饰键依然不成立。**两条路要求不同，别互相"统一"** |
+| **鼠标五键** | `MouseLeft`/`MouseRight`/`MouseMiddle`/`MouseX1`/`MouseX2` = VK `0x01`/`0x02`/`0x04`/`0x05`/`0x06`，**当成普通键**走同一条链路（`GetAsyncKeyState` 实测能读，无需换机制）。真值在 `hotkey_spec._VK_BY_KEY` |
+
+#### ⚠ 两套键值**绝不能混着查**（task20 修掉的一个真 bug）
+
+Qt 的特殊键是 `0x01000000` 段，Win32 的 VK 是**小整数**。`format_qt_key()` 第一版
+查完 `_QT_KEY_ALIASES` 没命中时**又去查了按 VK 建的 `_SHOWN_BY_VK`**，于是低字节偶然
+相等就译出一个**完全无关的名字**：`Qt.Key_Period(0x2E)` → `Delete`、`Qt.Key_Minus(0x2D)`
+→ `Insert`、`Qt.Key_Apostrophe(0x27)` → `Right`；而 `_QT_KEY_ALIASES` 里
+`0x01000020` 还**误写成 `"Space"`**（真身是 `Qt.Key_Shift`；`Qt.Key_Space` 是 `0x20`）。
+
+**修法（两条铁律，别再犯）**：
+
+1. **> `0xFF` 的码只查 `_QT_KEY_ALIASES`**，查不到就是"不认识"（返回 `None`），**绝不**拿去撞 VK 表；
+2. **标点区必须显式登记**（`Comma 0x2C` / `Period 0x2E` / `Minus 0x2D` / `Equal 0x3D` 等）——
+   它们 ≤ `0xFF` 且**与 VK 码同值不同义**，靠"两边数值相同"那条经验必然译错。
+
+#### 自检
+
+`tools/check_task20.py`（48 项）：网格方向 / 特殊键与修饰键录入 / 组合录入**仍然拒绝**
+单独修饰键（反证）/ 鼠标五键绑定与点亮 / `assets/` 哈希不变。
+⚠ `tools/check_task11.py` 有 **9 项过期断言**（它盯 `settings.FIELDS` 的行数与分组，
+而 task15/19 各加过行）——与本节改动**无关**，是历史遗留，未动。
+
 
 ### 2.24 按键监听（task18 定案）
 

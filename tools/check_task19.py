@@ -12,7 +12,7 @@
 1. **布局下拉只列素材包里真的有的**；没有 `keyview 的包 → 整组禁用 + 提示；
 2. **网格行内顺序 == 画面左→右**（2 行 8 列，逐格比对键 id）；
 3. **录入**：按 `F → 该键位显示 `F；再点 → `Esc → 值不变；
-4. **单独按 Ctrl** → 不接受，仍等在录入态；
+4. **单独按 Ctrl** → **接受**（task20 改：键位映射支持修饰键单独成键；组合录入那边仍然拒绝）；
 5. **同一个键绑到两个键位** → 两个都亮，且不互相解绑；
 6. **重置**：确认 → `keyview_keys 变空对象、网格全变「未设置」；取消 → 什么都不变；
 7. **空映射时重置按钮禁用**；
@@ -359,25 +359,34 @@ def section_grid_order(app) -> None:
         window.close()
         return
 
-    # ---- 按钮的**界面坐标**（QGridLayout 的行列）必须与 layout.rows 一致
+    # ---- 按钮的**界面坐标**（QGridLayout 的行列）必须与 `display_rows` 一致
+    # ⚠ task20 起用的是 `display_rows`（= `rows` 旋转 180°）：设置界面是给人看的，
+    # 而人的视角与渲染画面**上下左右都相反**（理由见 `LayoutSpec.display_rows`）。
     layout = grid.layout
     mismatches: list[str] = []
-    for row_index, row in enumerate(layout.rows):
+    for row_index, row in enumerate(layout.display_rows):
         for column_index, key_id in enumerate(row):
             item = grid._grid.itemAtPosition(row_index, column_index)
             widget = item.widget() if item is not None else None
             if widget is None or grid._buttons.get(key_id) is not widget:
                 mismatches.append(f"({row_index},{column_index}) 期望 {key_id}")
     check(
-        "**每一格**摆的按钮就是 layout.rows 里那个键（2 行 8 列，16 格逐格比对）",
+        "**每一格**摆的按钮就是 layout.display_rows 里那个键（2 行 8 列，16 格逐格比对）",
         not mismatches,
         f"不符的格={len(mismatches)}" + (f" 首个={mismatches[0]}" if mismatches else ""),
     )
 
-    first_row = [grid._buttons[key].toolTip() for key in layout.rows[0]]
     check(
-        "第一行左→右是 7 5 3 1 2 4 6 8（**中间往外**，与 §2.23 逐字一致）",
-        first_row == [f"r1k{n}" for n in (7, 5, 3, 1, 2, 4, 6, 8)],
+        "网格用的是 display_rows（= rows 转 180°），不是 rows 原样",
+        tuple(layout.display_rows) != tuple(layout.rows)
+        and tuple(layout.display_rows) == tuple(tuple(reversed(r)) for r in reversed(layout.rows)),
+        f"display_rows={layout.display_rows}",
+    )
+
+    first_row = [grid._buttons[key].toolTip() for key in layout.display_rows[0]]
+    check(
+        "第一行左→右是 8 6 4 2 1 3 5 7（旋转 180° 后**中间往外**，与 §2.23 一致）",
+        first_row == [f"r2k{n}" for n in (8, 6, 4, 2, 1, 3, 5, 7)],
         f"实际={first_row}",
     )
 
@@ -474,31 +483,45 @@ def section_capture(app) -> None:
         f"配置={store.get('keyview_keys')}",
     )
 
-    # ---- (3) 单独按 Ctrl → **不接受**，仍等在录入态
+    # ---- (3) 单独按 Ctrl → **接受**（task20 改；键位映射要它）
+    # 用户 2026 明确要求：键位映射支持 Ctrl/Shift/Alt/Win 单独成键。
+    # ⚠ 组合录入（`KeyCaptureEdit`，热键那条路）的"单独按修饰键不成立"**不变**，
+    # 下面 §3b 那一段专门守它。
     check("进录入态（第二个键位）", grid.begin_capture("r1k2"), "r1k2")
     press(grid.button("r1k2"), Qt.Key_Control, 0x11)
     check(
-        "单独按 Ctrl → **不接受**，仍在录入态",
-        grid.capturing and grid.button("r1k2").display_text == "按下按键…",
-        f"文字={grid.button('r1k2').display_text!r}",
-    )
-    press(grid.button("r1k2"), Qt.Key_Shift, 0x10)
-    check(
-        "接着按 Shift（另一个修饰键）→ 仍然不接受",
-        grid.capturing and grid.button("r1k2").display_text == "按下按键…",
-        f"文字={grid.button('r1k2').display_text!r}",
-    )
-    check(
-        "修饰键**没被写进配置**",
-        "r1k2" not in store.get("keyview_keys"),
-        f"配置={store.get('keyview_keys')}",
-    )
-    press(grid.button("r1k2"), Qt.Key_K, 0x4B, "k")
-    check(
-        "修饰键之后按 K → 这次录上（修饰键不干扰后面的真键）",
-        grid.button("r1k2").display_text == "K"
-        and store.get("keyview_keys").get("r1k2") == {"vk": 0x4B, "name": "K"},
+        "单独按 Ctrl → **录上了**（task20 起支持修饰键单独成键）",
+        grid.button("r1k2").display_text == "Ctrl"
+        and store.get("keyview_keys").get("r1k2") == {"vk": 0x11, "name": "Ctrl"},
         f"文字={grid.button('r1k2').display_text!r} 配置={store.get('keyview_keys')}",
+    )
+    check("录完之后**退出录入态**（不是继续等）", not grid.capturing,
+          f"capturing={grid.capturing}")
+
+    # Shift 也能单独录（换一个键位）
+    check("进录入态（Shift 那个键位）", grid.begin_capture("r1k4"), "r1k4")
+    press(grid.button("r1k4"), Qt.Key_Shift, 0x10)
+    check(
+        "单独按 Shift 也录得上",
+        grid.button("r1k4").display_text == "Shift"
+        and store.get("keyview_keys").get("r1k4") == {"vk": 0x10, "name": "Shift"},
+        f"文字={grid.button('r1k4').display_text!r}",
+    )
+
+    # ⚠ 反向：组合录入（热键）那边**必须仍然拒绝**单独修饰键
+    # 判据看源码：`KeyCaptureEdit.keyPressEvent` 里仍有"只有修饰键 → rejected"那条。
+    cap_src = (ROOT / "src" / "deskpet" / "keycapture.py").read_text(encoding="utf-8")
+    edit_body = cap_src.split("class KeyCaptureEdit", 1)[-1]
+    check(
+        "组合录入（热键）仍然拒绝单独修饰键（两条路要求不同）",
+        "REASON_NEED_MODIFIER" in edit_body or "rejected" in edit_body,
+        "KeyCaptureEdit 里仍有修饰键拒绝逻辑",
+    )
+    single_body = cap_src.split("class SingleKeyCaptureButton", 1)[-1].split("class KeyCaptureEdit", 1)[0]
+    check(
+        "单键录入**不再**把修饰键排除在外（task20）",
+        "MODIFIER_QT_KEYS" not in single_body.split("def keyPressEvent", 1)[-1].split("def ", 1)[0],
+        "SingleKeyCaptureButton.keyPressEvent 里已无修饰键排除",
     )
 
     # ---- (4) 没有修饰键的键照样能录（这正是不能复用组合录入的原因）
@@ -512,8 +535,8 @@ def section_capture(app) -> None:
     )
 
     check(
-        "三个键位都留着（互不覆盖）",
-        set(store.get("keyview_keys")) == {"r1k1", "r1k2", "r1k3"},
+        "录过的键位都留着（互不覆盖）",
+        set(store.get("keyview_keys")) == {"r1k1", "r1k2", "r1k3", "r1k4"},
         f"配置={sorted(store.get('keyview_keys'))}",
     )
     window.close()

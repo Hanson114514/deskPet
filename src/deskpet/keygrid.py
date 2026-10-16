@@ -201,8 +201,12 @@ class KeyGrid(QWidget):
             self._reset_button.setEnabled(False)
             return
 
-        # **外层行、内层列**：行内顺序就是画面里的左→右（见模块开头）。
-        for row_index, row in enumerate(layout.rows):
+        # **外层行、内层列**。用 `display_rows`（= `rows` 旋转 180°）而不是 `rows`：
+        # 网格是给人看的，而人（与低头看键盘的角色本人）的视角与渲染画面
+        # **上下左右都相反** —— 两个轴一起反就是旋转 180°，理由写在
+        # `LayoutSpec.display_rows` 那儿。照 `rows` 摆会"上下左右完全反了"
+        # （用户 2026 实测反馈）。⚠ 只改显示顺序，键 id 一个都不动。
+        for row_index, row in enumerate(layout.display_rows):
             for column_index, key_id in enumerate(row):
                 button = keycapture.SingleKeyCaptureButton()
                 button.setToolTip(key_id)
