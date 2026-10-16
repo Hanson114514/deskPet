@@ -62,13 +62,27 @@ LISTENING: Final[str] = "按下按键…"
 #: 取不到可读名字时的兜底（**绝不给空串**：按钮上总得有点东西）。
 UNNAMED_KEY: Final[str] = "按键"
 
-#: 修饰键的**虚拟键码**：键位录入态下单独按下它们**不算一次录入**
-#: （用户 2026 明确要求"单独按 Ctrl 不接受、仍等在录入态"）。
+#: Qt 的鼠标键 → **虚拟键码 + 展示名**（task20：鼠标五键当成普通键位录）。
 #:
-#: ⚠ 这张表**是 Win32 的说法**（`VK_SHIFT` / `VK_CONTROL` / `VK_MENU` / 左右 Win），
-#: 与上面那份 Qt 键值表管的是**同一件事的两个名字空间**（`event.key()` vs
-#: `nativeVirtualKey()`）。⚠ 两套**不是同一个数字**：实测 Qt 的 `Key_Control` 是
-#: `0x1000021`，而 `VK_CONTROL` 是 `0x11`——所以判据里**两套都要查**。
+#: ⚠ 鼠标**不产生 `QKeyEvent`**，走的是 `mousePressEvent`；所以这张表按
+#: `Qt.MouseButton` 建，与键盘那条路分开查。真值的另一半（VK ↔ 名字）在
+#: `hotkey_spec._VK_BY_KEY`——两处对不上就会"录上了却不亮"，有模块级断言守着。
+MOUSE_BUTTONS: Final[dict[int, tuple[int, str]]] = {
+    int(Qt.LeftButton.value): (0x01, "MouseLeft"),
+    int(Qt.RightButton.value): (0x02, "MouseRight"),
+    int(Qt.MiddleButton.value): (0x04, "MouseMiddle"),
+    int(Qt.BackButton.value): (0x05, "MouseX1"),
+    int(Qt.ForwardButton.value): (0x06, "MouseX2"),
+}
+
+#: 修饰键的**虚拟键码**（Win32 说法：`VK_SHIFT` / `VK_CONTROL` / `VK_MENU` / 左右 Win）。
+#:
+#: ⚠ 与上面那份 Qt 键值表管的是**同一件事的两个名字空间**（`event.key()` vs
+#: `nativeVirtualKey()`），两套**不是同一个数字**：实测 Qt 的 `Key_Control` 是
+#: `0x1000021`，而 `VK_CONTROL` 是 `0x11`。
+#:
+#: ⚠ task20 起**单键录入态下它们不再被排除**（修饰键本身就是合法键位）；
+#: 这张表现在只剩"两条路互相对得上"的断言在用（见文件末尾）。
 MODIFIER_NATIVE_VKS: Final[frozenset[int]] = frozenset(
     {
         0x10,  # VK_SHIFT
@@ -166,6 +180,14 @@ class SingleKeyCaptureButton(QPushButton):
 
     captured = Signal(int, str)
     cancelled = Signal()
+    #: **进了录入态**（task20 补）。
+    #:
+    #: ⚠ 为什么需要它：按钮的 `clicked` 直接连着 `begin_capture()`，于是"点一下"
+    #: **绕过了** `KeyGrid.begin_capture()` —— 网格根本不知道有按钮进了录入态。
+    #: 症状：录入中途点另一个键位，上一个的标签**卡在 `按下按键…`**
+    #: （网格的 `_capturing` 还是空的，没人去收尾它）。
+    #: 有了这条信号，**谁触发的不重要**，网格都收得到。
+    capture_started = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -197,12 +219,19 @@ class SingleKeyCaptureButton(QPushButton):
     # ------------------------------------------------------------ 录入
 
     def begin_capture(self) -> None:
-        """进入录入态：抢焦点、显示 `按下按键…`。"""
+        """进入录入态：抢焦点、显示 `按下按键…`，并发 `capture_started`。
+
+        ⚠ 信号**必须在这里发**，不能只在 `KeyGrid.begin_capture()` 里发：
+        按钮的 `clicked` 直接连的就是本方法（见 `__init__`），用户**点按钮**
+        进来的这条路根本不经过网格。不发信号的话网格永远不知道有人进了
+        录入态 → 上一个卡在 `按下按键…` 收不掉（task20 修的 bug）。
+        """
         if not self.isEnabled() or self._listening:
             return
         self._listening = True
         self.setFocus(Qt.OtherFocusReason)
         self._apply_text()
+        self.capture_started.emit()
 
     def cancel_capture(self) -> None:
         """退出录入态（Esc / 窗口关闭）：**保留原值**。"""
@@ -210,6 +239,38 @@ class SingleKeyCaptureButton(QPushButton):
             return
         self._listening = False
         self._apply_text()
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001 - Qt 签名
+        """录入态的**鼠标**处理：左/右/中/侧键都能当一个键位（task20）。
+
+        ## 为什么必须重写它
+
+        鼠标**不产生 `QKeyEvent`**，所以只重写 `keyPressEvent` 时，录入态下点
+        鼠标走的是"普通按钮点击"——不但录不上，还会**再次触发 `clicked`**
+        （用户 2026 实测："鼠标键位都还不能录入"）。
+
+        ## 录入态下鼠标事件**全部吃掉**（不 `super()`）
+
+        四条后果都是想要的：① 不再触发 `clicked`（不会自己点自己）；
+        ② 不把点击透给网格（不会顺带切到别的键位）；③ 录完就收尾；
+        ④ 右键**不是**上下文菜单，而是"录 MouseRight"。
+
+        ⚠ 只认**按下**（本就只有 `MouseButtonPress` 会走到这里）：否则录完一次
+        之后紧接着的抬起又会被当成一次输入。
+        """
+        if not self._listening:
+            super().mousePressEvent(event)
+            return
+
+        mapped = MOUSE_BUTTONS.get(int(event.button().value))
+        if mapped is None:
+            # 认不出的鼠标键（某些驱动报的第 6 个键）：不算一次录入，继续等。
+            event.accept()
+            return
+
+        vk, name = mapped
+        self._finish_capture(vk, name)
+        event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001 - Qt 签名
         """录入态的按键处理。
@@ -246,12 +307,19 @@ class SingleKeyCaptureButton(QPushButton):
             event.accept()
             return
 
-        name = key_name(event)
+        self._finish_capture(vk, key_name(event))
+        event.accept()
+
+    def _finish_capture(self, vk: int, name: str) -> None:
+        """录到了一个键（键盘与鼠标**共用这一条收尾**）。
+
+        两件事必须一起做，顺序也有意义：先退出录入态 + 改文字（用户当场看到
+        结果），再发 `captured`（调用方据此写配置，可能慢、可能弹提示）。
+        """
         self._listening = False
         self._text = name
         self._apply_text()
-        self.captured.emit(vk, name)
-        event.accept()
+        self.captured.emit(int(vk), str(name))
 
     # ------------------------------------------------------------ 内部
 

@@ -32,8 +32,9 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Final
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QEvent, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -113,6 +114,8 @@ class KeyGrid(QWidget):
         self._capturing: keycapture.SingleKeyCaptureButton | None = None
         #: 当前生效的绑定（显示的真值来源；由 `apply_bindings()` 写）。
         self._bindings: dict[str, KeyBinding] = {}
+        #: 录入期间装了**应用级**事件过滤器（见 `_install_mouse_grab`）。
+        self._mouse_grabbed = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -220,6 +223,14 @@ class KeyGrid(QWidget):
                 button.cancelled.connect(
                     lambda kid=key_id: self._on_cancelled(kid)
                 )
+                # ⚠ **进录入态也要通知网格**（task20 修的 bug）：按钮的 `clicked`
+                # 直接连着它自己的 `begin_capture()`，用户点按钮那条路**绕过**了
+                # `KeyGrid.begin_capture()`。只听 `cancelled` 是不够的——
+                # 网格的 `_capturing` 会一直空着，于是"录入中途点另一个键位"时
+                # 上一个的标签**卡在 `按下按键…`**。
+                button.capture_started.connect(
+                    lambda kid=key_id: self._on_capture_started(kid)
+                )
                 self._buttons[key_id] = button
                 self._grid.addWidget(button, row_index, column_index)
 
@@ -231,7 +242,13 @@ class KeyGrid(QWidget):
         调用方用它做三件事：初值填充 / 写成功后回填 / 写失败后**回滚**
         （回滚时传的是配置里的真值，不是"改之前那个值"——与设置窗口同一条规矩）。
         不在这个布局里的键位**照样留着**：键 id 跨布局通用，换个布局就会重现。
+
+        ⚠ **先收掉录入态**（task20 修的 bug）：重置（写 `keyview_keys = {}`）
+        之后调用方会调本方法回填，而正在录入的那个按钮**拒绝**在录入态下改
+        文字（见 `SingleKeyCaptureButton.set_key_text`）—— 不收尾的话它的标签
+        就**卡在 `按下按键…`**，而且监听也一直挂着。
         """
+        self._end_capture()
         self._bindings = dict(bindings)
         for key_id, button in self._buttons.items():
             binding = self._bindings.get(key_id)
@@ -300,6 +317,8 @@ class KeyGrid(QWidget):
         if button is None or not button.isEnabled():
             return False
         self._begin_capture(button)
+        # `begin_capture()` 会发 `capture_started` —— 但网格这边**已经在**
+        # `_begin_capture` 里把它记下了，所以槽函数再来一次是幂等的（见那儿）。
         button.begin_capture()
         return button.listening
 
@@ -341,6 +360,8 @@ class KeyGrid(QWidget):
         """
         button = self._capturing
         self._capturing = None
+        # 撤鼠标抓取**先于**改按钮文字：撤晚了会把下面这次 `clicked` 也吃掉。
+        self._remove_mouse_grab()
         if button is not None:
             button.cancel_capture()
         # 恢复监听**不看有没有按钮**：挂起状态是"我们"置的，收尾就得还回去。
@@ -357,6 +378,80 @@ class KeyGrid(QWidget):
         self._end_capture()
         self._capturing = button
         self._suspend_listener()
+        # 抓住全窗口的鼠标按下：录入期间点任何地方都算"按下鼠标键"。
+        self._install_mouse_grab()
+
+    def _on_capture_started(self, key_id: str) -> None:
+        """某个按钮**进了录入态**（不管是网格叫的，还是用户直接点的）。
+
+        ⚠ 这里**不能**再调 `button.begin_capture()`：信号就是它发出来的，
+        再调一次会被 `if self._listening: return` 挡掉（无害），但真正要做的是
+        **把上一个收尾** —— 这正是"录入中途改点别的键位"要的行为。
+        """
+        button = self._buttons.get(key_id)
+        if button is None:
+            return
+        # 按钮**已经**在录入态了（信号是它发的），所以这里只做网格这一半：
+        # 收掉上一个 + 挂起监听。`_begin_capture` 里那步 `button.begin_capture()`
+        # 不在这里重复调（它在 `KeyGrid.begin_capture()` 那条路上才需要）。
+        self._begin_capture(button)
+
+    # ------------------------------------------------------- 录入期的鼠标抓取
+
+    def _install_mouse_grab(self) -> None:
+        """录入期间**抓住全窗口的鼠标按下**（task20）。
+
+        ## 为什么是应用级过滤器，而不是重写按钮的 `mousePressEvent`
+
+        用户 2026 明确要求：**B 键位录入中时点 A，这一下算"按下鼠标左键"**
+        （录给 B），而不是"切到 A"。只重写按钮自己的 `mousePressEvent`
+        做不到这一点 —— 点 A 时事件先落到 **A 按钮**上，A 会说"我要进录入态"，
+        于是变成切换，B 什么也录不到（实测就是这个结果）。
+
+        装到 `QApplication` 上之后，**任何位置**的左键按下都先经过这里，
+        统一记到当前正在录入的那个键位上，`return True` 把事件吃掉
+        —— A 收不到点击，也就不会切成录入态。
+
+        ⚠ **成对**：`_remove_mouse_grab()` 收在 `_end_capture()` 里，
+        四条退出路径（录成 / Esc / 换布局 / 窗口关闭）全都汇到那儿。
+        """
+        if self._mouse_grabbed:
+            return
+        app = QApplication.instance()
+        if app is None:  # pragma: no cover - 正常路径一定有 QApplication
+            return
+        app.installEventFilter(self)
+        self._mouse_grabbed = True
+
+    def _remove_mouse_grab(self) -> None:
+        """撤掉录入期的鼠标抓取（**幂等**）。"""
+        if not self._mouse_grabbed:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._mouse_grabbed = False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001 - Qt 签名
+        """录入期间的鼠标按下：**一律**记到正在录入的那个键位上。
+
+        只处理 `MouseButtonPress`，其余（抬起 / 移动 / 键盘）**原样放行**：
+        抬起放行是必须的，否则按钮的 `clicked` 永远不触发（Qt 要 press+release
+        配对），"非录入态下点按钮进录入态"这条就坏了。
+        """
+        if not self._mouse_grabbed or self._capturing is None:
+            return super().eventFilter(obj, event)
+        if event.type() != QEvent.Type.MouseButtonPress:
+            return super().eventFilter(obj, event)
+
+        mapped = keycapture.MOUSE_BUTTONS.get(int(event.button().value))
+        if mapped is None:
+            return super().eventFilter(obj, event)
+
+        vk, name = mapped
+        self._capturing._finish_capture(vk, name)
+        # 事件**吃掉**：被点的那个按钮收不到点击，也就不会切成录入态。
+        return True
 
     def _suspend_listener(self) -> None:
         if self._suspend is None or self._suspended_by_us:
@@ -378,7 +473,13 @@ class KeyGrid(QWidget):
 
         取消 → 什么都不做（不写配置、不改界面、不发信号）。
         确认 → 发 `reset_requested`，由调用方写 `keyview_keys = {}`。
+
+        ⚠ **任何一条路都先收掉录入态**（task20）：确认框弹出来的那一刻，
+        那个按钮就不该再显示 `按下按键…`（用户看到的是一句过期提示）。
+        在**问之前**收，是因为"取消"也要收 —— 用户已经用鼠标点了别处，
+        录入态早就该结束了。
         """
+        self._end_capture()
         if not self._reset_button.isEnabled():
             return
         answer = QMessageBox.question(

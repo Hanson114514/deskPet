@@ -21,8 +21,8 @@ def check(name, ok, detail=""):
     return ok
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QEvent
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import Qt, QEvent, QPointF
+from PySide6.QtGui import QKeyEvent, QMouseEvent
 app = QApplication.instance() or QApplication([])
 
 from deskpet import keyview_spec, hotkey_spec, keycapture, key_listener, keygrid, size
@@ -151,8 +151,72 @@ for name, vk in mouse:
     check(f"名字往返 {name}", hotkey_spec._SHOWN_BY_VK.get(vk) == name,
           f"vk=0x{vk:02X} -> {hotkey_spec._SHOWN_BY_VK.get(vk)!r}")
 
-# 录入鼠标键（Qt 里鼠标不走 keyPressEvent，但 VK 表要认识它们）
+# ---- 录入鼠标键（task20：鼠标**不产生 QKeyEvent**，走 mousePressEvent）
 check("MouseLeft 的 VK 是 0x01", hotkey_spec._VK_BY_NAME.get("mouseleft") == 1, "0x01")
+
+def mouse_press(widget, button):
+    ev = QMouseEvent(QEvent.MouseButtonPress, QPointF(5, 5), QPointF(5, 5),
+                     button, button, Qt.NoModifier)
+    QApplication.sendEvent(widget, ev)
+
+gm = keygrid.KeyGrid(); gm.set_layout(kv.layout("2*8")); gm.apply_bindings({})
+rec = []
+gm.binding_requested.connect(lambda k, v, n: rec.append((k, v, n)))
+mouse_cases = [
+    ("r1k1", Qt.LeftButton, "MouseLeft", 0x01),
+    ("r1k2", Qt.RightButton, "MouseRight", 0x02),
+    ("r1k3", Qt.MiddleButton, "MouseMiddle", 0x04),
+    ("r1k4", Qt.BackButton, "MouseX1", 0x05),
+    ("r1k5", Qt.ForwardButton, "MouseX2", 0x06),
+]
+for kid, btn_enum, want, want_vk in mouse_cases:
+    gm.begin_capture(kid)
+    mouse_press(gm.button(kid), btn_enum)
+    check(f"录入 {want} -> {kid}", gm.button(kid).display_text == want and not gm.capturing,
+          f"文字={gm.button(kid).display_text!r} capturing={gm.capturing}")
+check("鼠标五键都发出了正确的 (键位, vk, 名字)",
+      sorted(rec) == sorted((k, v, n) for k, _, n, v in mouse_cases), str(rec))
+
+# ---- ⭐ 录入中点到**别的键位** = 录 MouseLeft 给原来那个（用户 2026 明确要求）
+gm2 = keygrid.KeyGrid(); gm2.set_layout(kv.layout("2*8")); gm2.apply_bindings({})
+rec2 = []
+gm2.binding_requested.connect(lambda k, v, n: rec2.append((k, v, n)))
+gm2.begin_capture("r1k6")
+mouse_press(gm2.button("r1k7"), Qt.LeftButton)   # 点的是**另一个**键位
+check("录入中点到别的键位 -> 录 MouseLeft 给**原来那个**（不是切换）",
+      rec2 == [("r1k6", 0x01, "MouseLeft")] and gm2.button("r1k6").display_text == "MouseLeft",
+      f"rec={rec2} r1k6={gm2.button('r1k6').display_text!r}")
+check("被点到的那个键位**没被切成录入态**（事件被吃掉）",
+      not gm2.capturing and gm2.button("r1k7").display_text == "未设置",
+      f"r1k7={gm2.button('r1k7').display_text!r}")
+
+# ---- ⭐ 录入中**再点自己** = 录 MouseLeft（不是"取消"）
+gm3 = keygrid.KeyGrid(); gm3.set_layout(kv.layout("2*8")); gm3.apply_bindings({})
+rec3 = []
+gm3.binding_requested.connect(lambda k, v, n: rec3.append((k, v, n)))
+gm3.begin_capture("r2k1")
+mouse_press(gm3.button("r2k1"), Qt.LeftButton)
+check("录入中再点自己 -> 录 MouseLeft（不是取消、不是卡住）",
+      rec3 == [("r2k1", 0x01, "MouseLeft")] and gm3.button("r2k1").display_text == "MouseLeft",
+      f"rec={rec3}")
+
+# ---- ⭐ 标签不再卡住：录入中改点别的键位 / 走重置
+gm4 = keygrid.KeyGrid(); gm4.set_layout(kv.layout("2*8")); gm4.apply_bindings({})
+gm4.button("r1k7").click()                  # 真实点击路径（clicked -> begin_capture）
+check("真实点击 -> 进录入态且网格知道", gm4.capturing, f"capturing={gm4.capturing}")
+gm4.button("r1k8").click()                  # 录入中改点别的（这一下会被吃掉=录 MouseLeft）
+check("录入中改点别的键位 -> 上一个**不再卡在 `按下按键…`**",
+      gm4.button("r1k7").display_text != "按下按键…",
+      f"r1k7={gm4.button('r1k7').display_text!r}")
+
+gm5 = keygrid.KeyGrid(); gm5.set_layout(kv.layout("2*8"));
+gm5.apply_bindings({"r2k2": keyview_spec.KeyBinding(vk=0x46, name="F")})
+gm5.button("r2k2").click()
+check("重置前先进入录入态", gm5.capturing, f"capturing={gm5.capturing}")
+gm5.apply_bindings({})                      # 模拟重置后回填
+check("重置（apply_bindings 回填）后标签**不再卡住**、也退出录入态",
+      gm5.button("r2k2").display_text == "未设置" and not gm5.capturing,
+      f"文字={gm5.button('r2k2').display_text!r} capturing={gm5.capturing}")
 
 # =================== 纪律 ===================
 L.append("")
