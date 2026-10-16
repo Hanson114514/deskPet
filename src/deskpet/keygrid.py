@@ -441,9 +441,10 @@ class KeyGrid(QWidget):
         抬起放行是必须的，否则按钮的 `clicked` 永远不触发（Qt 要 press+release
         配对），"非录入态下点按钮进录入态"这条就坏了。
 
-        ## ⚠ 失活：**本程序**被切到后台 -> 必须收掉录入态（task20 修的严重 bug）
+        ## ⚠ 失活：焦点离开 -> 必须收掉录入态（task20 修的严重 bug）
 
-        用户 2026 实测："在窗口失焦时按下按键 KV 就不生效"。成因是一条链：
+        用户 2026 实测："在窗口失焦时按下按键 KV 就不生效"（**分发版**必现、
+        开发时看不出来）。成因是一条链：
 
         ```text
         录入态下点别的程序   -> 我们**收不到任何鼠标事件**（窗口失焦）
@@ -453,19 +454,40 @@ class KeyGrid(QWidget):
         ```
 
         关键点是第二节：点**本程序之外**的窗口不会给我们送鼠标事件，所以
-        靠"点击"收尾是收不到的 —— 必须监听"整个应用失活"这件事本身。
-        `ApplicationDeactivate` 一发就收尾，于是切走再回来一定是好的。
+        靠"点击"收尾是收不到的 —— 必须监听"焦点离开"这件事本身。
 
-        ⚠ **不**在这里处理 `WindowDeactivate`（单个窗口失活）：在本程序内部
-        换窗口（点到宠物窗口）时它也会发，而那一下按用户要求应当**录成
-        鼠标左键**（由上面的 `MouseButtonPress` 分支处理）。两者用不同的
-        事件区分开，就不会互相打架。
+        ## ⚠ 为什么**两个**失活事件都要收（只收一个在分发版上不管用）
+
+        | 事件 | 什么时候发 | 单独用它够不够 |
+        | --- | --- | --- |
+        | `ApplicationDeactivate` | **程序从"激活"变成"未激活"**时 | ❌ |
+        | `WindowDeactivate` | 本窗口失去激活时 | ✅ 兜底 |
+
+        第一版只收了 `ApplicationDeactivate`，**开发时好了、分发版仍然坏**。
+        实测原因是：Qt 只在"激活 -> 未激活"**这个转变**上发它，而分发版
+        （双击 exe 启动、窗口是 `Qt.Tool` 且 `WA_ShowWithoutActivating`）
+        **整个生命周期都处于 `ApplicationInactive`** —— 从来没有"激活"过，
+        也就永远等不到那个转变，事件一次都不发。开发时从控制台/IDE 启动
+        会先激活一次，所以掩盖了这个 bug。
+
+        `WindowDeactivate` 是**窗口级**的，只要有焦点转移就会发，与
+        "程序整体是否激活过"无关，所以在两种启动方式下都可靠。
+
+        ⚠ **顺序保证**了它不会抢掉"点别的键位录鼠标左键"那条：
+        点本程序**内部**的按钮时，`MouseButtonPress` **先**到（上面那个分支
+        当场录完并 `_end_capture()`），随后即使再来 `WindowDeactivate`，
+        此时 `_capturing` 已经是 `None`，本函数开头就返回了（实测确认顺序）。
         """
         if not self._mouse_grabbed or self._capturing is None:
             return super().eventFilter(obj, event)
 
-        if event.type() == QEvent.Type.ApplicationDeactivate:
-            # 整个程序被切到后台：这一下不可能再等到用户按鼠标了，收尾。
+        if event.type() in (
+            QEvent.Type.ApplicationDeactivate,
+            QEvent.Type.WindowDeactivate,
+        ):
+            # 焦点离开我们的窗口：不可能再等到用户按鼠标了，收尾。
+            # 收尾只做"退录入态 + 恢复监听"，**不记录任何键**
+            # （真正的点击记录在上面那条 `MouseButtonPress` 分支里）。
             self._end_capture()
             return super().eventFilter(obj, event)
 

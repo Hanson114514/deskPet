@@ -229,6 +229,23 @@ mouse_press(gm7.button("r2k4"), Qt.LeftButton)
 check("程序内点别的键位 -> 录 MouseLeft（不是被当成失活收掉）",
       rec7 == [("r2k3", 0x01, "MouseLeft")], f"rec={rec7}")
 
+# ---- ⭐ 分发版专属：应用**从未激活**时，收尾仍然必须生效
+#
+# 这是上一轮只修了一半的原因：第一版只收 ApplicationDeactivate，而 Qt 只在
+# "激活 -> 未激活"这个**转变**上发它。分发版（双击 exe、Qt.Tool +
+# WA_ShowWithoutActivating）整个生命周期都是 ApplicationInactive，
+# 从来等不到那个转变 -> 事件一次不发 -> 录入态永远挂着 -> KV 失效。
+# 开发时从控制台启动会先激活一次，所以掩盖了它（用户实测：开发板好、分发版坏）。
+gm8 = keygrid.KeyGrid(); gm8.set_layout(kv.layout("2*8")); gm8.apply_bindings({})
+log8 = []
+gm8.set_suspend_hook(lambda on: log8.append(on))
+gm8.begin_capture("r1k1")
+check("从未激活场景：录入态已挂起监听", log8 == [True] and gm8.capturing, f"log={log8}")
+# 只发窗口级失活（应用级那个在这种场景下根本不会来）
+app.sendEvent(gm8, QEvent(QEvent.WindowDeactivate))
+check("从未激活场景：WindowDeactivate 也能收尾（分发版不再卡死）",
+      not gm8.capturing and log8 == [True, False], f"capturing={gm8.capturing} log={log8}")
+
 # ---- ⭐ 标签不再卡住：录入中改点别的键位 / 走重置
 gm4 = keygrid.KeyGrid(); gm4.set_layout(kv.layout("2*8")); gm4.apply_bindings({})
 gm4.button("r1k7").click()                  # 真实点击路径（clicked -> begin_capture）
