@@ -571,5 +571,153 @@
       "rest_01.wav",
       "rest_02.wav"
     ]
+  },
+  "keyview": {
+    "cell": [
+      540,
+      420
+    ],
+    "background": {
+      "normal": [
+        "figure.png",
+        "piano.png"
+      ]
+    },
+    "keys": {
+      "r1k7": {
+        "x": 158,
+        "y": 215,
+        "down": "key_r1k7.png"
+      },
+      "r1k5": {
+        "x": 185,
+        "y": 221,
+        "down": "key_r1k5.png"
+      },
+      "r1k3": {
+        "x": 215,
+        "y": 227,
+        "down": "key_r1k3.png"
+      },
+      "r1k1": {
+        "x": 244,
+        "y": 234,
+        "down": "key_r1k1.png"
+      },
+      "r1k2": {
+        "x": 273,
+        "y": 240,
+        "down": "key_r1k2.png"
+      },
+      "r1k4": {
+        "x": 301,
+        "y": 247,
+        "down": "key_r1k4.png"
+      },
+      "r1k6": {
+        "x": 330,
+        "y": 254,
+        "down": "key_r1k6.png"
+      },
+      "r1k8": {
+        "x": 359,
+        "y": 261,
+        "down": "key_r1k8.png"
+      },
+      "r2k7": {
+        "x": 117,
+        "y": 232,
+        "down": "key_r2k7.png"
+      },
+      "r2k5": {
+        "x": 151,
+        "y": 239,
+        "down": "key_r2k5.png"
+      },
+      "r2k3": {
+        "x": 186,
+        "y": 246,
+        "down": "key_r2k3.png"
+      },
+      "r2k1": {
+        "x": 217,
+        "y": 254,
+        "down": "key_r2k1.png"
+      },
+      "r2k2": {
+        "x": 247,
+        "y": 262,
+        "down": "key_r2k2.png"
+      },
+      "r2k4": {
+        "x": 277,
+        "y": 269,
+        "down": "key_r2k4.png"
+      },
+      "r2k6": {
+        "x": 307,
+        "y": 275,
+        "down": "key_r2k6.png"
+      },
+      "r2k8": {
+        "x": 336,
+        "y": 283,
+        "down": "key_r2k8.png"
+      }
+    },
+    "hands": [
+      {
+        "up": "hand_l_up.png",
+        "down": {
+          "r1k7": "hand_l_r1k7.png",
+          "r1k5": "hand_l_r1k5.png",
+          "r1k3": "hand_l_r1k3.png",
+          "r1k1": "hand_l_r1k1.png",
+          "r2k7": "hand_l_r2k7.png",
+          "r2k5": "hand_l_r2k5.png",
+          "r2k3": "hand_l_r2k3.png",
+          "r2k1": "hand_l_r2k1.png"
+        }
+      },
+      {
+        "up": "hand_r_up.png",
+        "down": {
+          "r1k2": "hand_r_r1k2.png",
+          "r1k4": "hand_r_r1k4.png",
+          "r1k6": "hand_r_r1k6.png",
+          "r1k8": "hand_r_r1k8.png",
+          "r2k2": "hand_r_r2k2.png",
+          "r2k4": "hand_r_r2k4.png",
+          "r2k6": "hand_r_r2k6.png",
+          "r2k8": "hand_r_r2k8.png"
+        }
+      }
+    ],
+    "layouts": {
+      "2*8": {
+        "rows": [
+          [
+            "r1k7",
+            "r1k5",
+            "r1k3",
+            "r1k1",
+            "r1k2",
+            "r1k4",
+            "r1k6",
+            "r1k8"
+          ],
+          [
+            "r2k7",
+            "r2k5",
+            "r2k3",
+            "r2k1",
+            "r2k2",
+            "r2k4",
+            "r2k6",
+            "r2k8"
+          ]
+        ]
+      }
+    }
   }
 }

@@ -21,7 +21,9 @@
 ## 文字的真值
 
 菜单文字必须与**附录 B** 完全一致，因此它们是本文件里的常量（**只写一处**）：
-`调整大小…` / `坐下休息` / `站起来` / `镜像翻转` / `设置…` / `隐藏宠物` / `退出`。
+`调整大小…` / `坐下休息` / `站起来` / `开启KV` / `退出KV` / `镜像翻转` / `设置…` / `隐藏宠物` / `退出`。
+`开启KV` 与 `退出KV` 也是**同一个菜单项**（id 恒为 `form`）的两种说法，
+由当前形态决定（task17 §4.3）；`镜像翻转` 那条的勾选态也是现算的（task06）。
 `坐下休息` 与 `站起来` 是**同一个菜单项**（id 恒为 `action`）的两种说法，
 由当前是不是"手动休息"决定用哪个（task06 §4 文字切换）。
 """
@@ -38,6 +40,10 @@ TEXT_RESIZE: Final[str] = "调整大小…"
 TEXT_REST: Final[str] = "坐下休息"
 TEXT_STAND_UP: Final[str] = "站起来"
 TEXT_MIRROR: Final[str] = "镜像翻转"
+#: 键盘形态（task17 §1.3 第 4 条）：**同一个菜单项**的两种说法，
+#: 由当前形态决定用哪个（与 `坐下休息` / `站起来` 完全同一个模式）。
+TEXT_KV_ON: Final[str] = "开启KV"
+TEXT_KV_OFF: Final[str] = "退出KV"
 TEXT_SETTINGS: Final[str] = "设置…"
 TEXT_VISIBILITY: Final[str] = "隐藏宠物"
 TEXT_QUIT: Final[str] = "退出"
@@ -47,10 +53,20 @@ TEXT_QUIT: Final[str] = "退出"
 #: 稳定 id（`QAction.setData()` 的取值）。**接线只看这些**，不看文字。
 ID_RESIZE: Final[str] = "resize"
 ID_ACTION: Final[str] = "action"
+ID_FORM: Final[str] = "form"
 ID_MIRROR: Final[str] = "mirror"
 ID_SETTINGS: Final[str] = "settings"
 ID_VISIBILITY: Final[str] = "visibility"
 ID_QUIT: Final[str] = "quit"
+
+#: **形态名的真值**（全项目只允许存在这一处）。
+#: `""` = 宠物形态（= 配置里"没表态"的值），`"keyview"` = 键盘形态。
+#:
+#: 放在本模块而不是 `pet_window` 的理由是**依赖方向**：`pet_window` 在模块级
+#: import `context_menu`，反向 import 会成环。而 `config.DEFAULTS["form"]` 的
+#: 默认值（空串）与 `FORM_PET` 必须一致，模块级断言盯着这一点。
+FORM_PET: Final[str] = ""
+FORM_KEYVIEW: Final[str] = "keyview"
 
 #: 分隔线在 `MENU_ORDER` 里的占位（它不是一个可点的项，没有 QAction）。
 SEPARATOR: Final[str] = "(separator)"
@@ -59,6 +75,8 @@ SEPARATOR: Final[str] = "(separator)"
 MENU_ORDER: Final[tuple[str, ...]] = (
     ID_RESIZE,
     ID_ACTION,
+    # 形态项放在 `action` 与 `mirror` **之间**（task17 §4.3 明写的位置）。
+    ID_FORM,
     ID_MIRROR,
     ID_SETTINGS,
     ID_VISIBILITY,
@@ -91,6 +109,8 @@ class MenuState:
     | `can_mirror` | 当前动作在不在镜像适用范围内 |
     | `can_rest` | 素材里有没有 `rest`（缺动作时那一项点了也没用，灰掉） |
     | `resize_available` / `settings_available` / `visibility_available` | 那三项接上了没有（各自看"装没装处理器"） |
+    | `form` | 当前形态：`""` = 宠物形态，`"keyview"` = 键盘形态（决定文字） |
+    | `kv_available` | 键盘形态这项接上了没有（**装没装处理器 且 至少一个可用布局**） |
     | `visibility_reason` | `隐藏宠物` 不可用时的原因（挂到提示条上）；可用时是空串 |
 
     `mirror_on` 与 `can_mirror` **分开**：适用范围外"没有勾选"与"勾选了但无效"
@@ -110,10 +130,20 @@ class MenuState:
     settings_available: bool = False
     visibility_available: bool = False
     visibility_reason: str = ""
+    form: str = ""
+    kv_available: bool = False
 
     def action_text(self) -> str:
         """`action` 项当前该显示的文字。"""
         return TEXT_STAND_UP if self.manual_rest else TEXT_REST
+
+    def form_text(self) -> str:
+        """`form` 项当前该显示的文字（**同一个 id 的两种说法**）。
+
+        判据是"现在是不是键盘形态"：是 → 给的是**退出**那个说法。
+        与 `action_text()` 一样，文字**按当前状态现算**，不留跨次状态。
+        """
+        return TEXT_KV_OFF if self.form == FORM_KEYVIEW else TEXT_KV_ON
 
 
 def action_id(action: QAction | None) -> str:
@@ -153,6 +183,8 @@ def _text_for(item_id: str, state: MenuState) -> str:
         return TEXT_RESIZE
     if item_id == ID_ACTION:
         return state.action_text()
+    if item_id == ID_FORM:
+        return state.form_text()
     if item_id == ID_MIRROR:
         return TEXT_MIRROR
     if item_id == ID_SETTINGS:
@@ -166,6 +198,12 @@ def _text_for(item_id: str, state: MenuState) -> str:
 
 def _apply_state(action: QAction, item_id: str, state: MenuState) -> None:
     """勾选态与可用性（**唯一**决定"灰不灰、勾不勾"的地方）。"""
+    if item_id == ID_FORM:
+        # 键盘形态：没装处理器 / 这个包没有可用布局 → **灰掉不是隐藏**
+        # （与 `调整大小…` 等项同一条约定，§2.14）。
+        action.setEnabled(state.kv_available)
+        return
+
     if item_id == ID_MIRROR:
         # 适用范围外 → 灰色不可点（task06 §2 第 8 条）。
         action.setEnabled(state.can_mirror)
@@ -201,3 +239,22 @@ def _availability(item_id: str, state: MenuState) -> bool:
     if item_id == ID_VISIBILITY:
         return state.visibility_available
     return False  # pragma: no cover - 调用方只会传上面这三个
+
+
+# ------------------------------------------------------------------ 模块级断言
+
+# 约定：模块级调用一律写在函数定义之后（曾经写反导致 NameError）。
+# 形态名的真值只在本模块一处，而 `config.DEFAULTS["form"]` 的默认值必须与
+# `FORM_PET` 一致（"没表态 = 宠物形态"）。这里**用函数内导入**规避循环依赖：
+# `config` 是"基础"层，导入期不该被 `context_menu` 拉进 Qt 的视图层。
+def _assert_form_default_matches() -> None:  # pragma: no cover - 只有改歪了才走到
+    from .config import DEFAULTS
+
+    if DEFAULTS["form"] != FORM_PET:
+        raise RuntimeError(
+            f"config.DEFAULTS['form'] = {DEFAULTS['form']!r} 与 "
+            f"context_menu.FORM_PET = {FORM_PET!r} 分叉了（真值只允许一处）"
+        )
+
+
+_assert_form_default_matches()

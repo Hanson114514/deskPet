@@ -57,6 +57,18 @@ def _build_defaults() -> dict[str, Any]:
         # ⚠ 生效方式是**重启生效**：开关只在启动时读一次，
         # 运行期没有"开关变了要失效缓存"的动态逻辑（用户拍板，见 task15 §1）。
         "antialias": False,
+        # ---------------------------------------------------------- 形态（task17）
+        # 形态名。`""` = 宠物形态（"没表态"），`"keyview"` = 键盘形态。
+        # **记忆上次用的**——与档位 / 镜像同一种做法（task17 §4.2 / §8 第 1 条）。
+        # ⚠ 空串是"用户还没表态"，不是"宠物形态这个名字叫空串"：
+        # 真值判断请用 `keyview_spec` 与 `pet_window.FORM_*`，别在这里再写一份。
+        "form": "",
+        # 键盘形态用哪个布局。空串 = 用清单里的**第一个**布局（§3.3）。
+        "keyview_layout": "",
+        # 键 id → `{"vk": 74, "name": "J"}`。⚠ **不带布局前缀**：
+        # 键 id 在所有布局里指同一个键，所以**配置一次、所有布局通用**。
+        # 没配的键**永远不亮**（用户 2026 的"置空"）。顺序无关。
+        "keyview_keys": {},
     }
 
 
@@ -228,9 +240,18 @@ class Config:
     mirror: dict[str, bool] = field(default_factory=dict)
     #: 边缘抗锯齿（task15）。默认 `False` = 与 task15 之前逐字节相同。
     antialias: bool = False
+    #: 形态（task17）：`""` = 宠物形态，`"keyview"` = 键盘形态。
+    form: str = ""
+    #: 键盘形态用哪个布局；空串 = 清单里的第一个布局。
+    keyview_layout: str = ""
+    #: 键 id → `{"vk": …, "name": …}`；**不带布局前缀**，所有布局通用。
+    #: 用 `default_factory` 的理由与 `mirror` 完全一样：可变默认值会让
+    #: 所有实例共享同一个字典，而模块级断言盯着它与 `DEFAULTS` 一致。
+    keyview_keys: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mirror", dict(self.mirror or {}))
+        object.__setattr__(self, "keyview_keys", dict(self.keyview_keys or {}))
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "Config":
@@ -242,6 +263,7 @@ class Config:
         """展开成普通字典（写盘与比对用）。`mirror` 单独拷一份。"""
         data = {field.name: getattr(self, field.name) for field in fields(self)}
         data["mirror"] = dict(self.mirror)
+        data["keyview_keys"] = dict(self.keyview_keys)
         return data
 
 

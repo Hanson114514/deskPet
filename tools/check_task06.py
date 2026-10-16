@@ -152,9 +152,13 @@ def _check_menu_contract() -> None:
 
     section("1. 菜单契约：顺序 / 文字 / 稳定 id")
 
+    # ⚠ task17 在 `action` 与 `mirror` **之间**插了一项 `form`（开启KV / 退出KV，
+    # task17 §4.3 明写的位置），所以这条基线跟着更新。
+    # 顺序本身仍是契约，只是契约**长了一项**——不是把断言放松。
     expected_order = (
         "resize",
         "action",
+        "form",
         "mirror",
         "settings",
         "visibility",
@@ -203,13 +207,13 @@ def _check_menu_contract() -> None:
     actions = [a for a in menu.actions() if not a.isSeparator()]
     ids = [CM.action_id(a) for a in actions]
     check(
-        "菜单共 6 个可点项（+1 条分隔线）",
-        len(actions) == 6 and len(menu.actions()) == 7,
+        "菜单共 7 个可点项（+1 条分隔线）——task17 加了 `form` 那一项",
+        len(actions) == 7 and len(menu.actions()) == 8,
         f"可点 {len(actions)} / 全部 {len(menu.actions())}",
     )
     check(
-        "可点项的 id 顺序 = resize/action/mirror/settings/visibility/quit",
-        ids == ["resize", "action", "mirror", "settings", "visibility", "quit"],
+        "可点项的 id 顺序 = resize/action/form/mirror/settings/visibility/quit",
+        ids == ["resize", "action", "form", "mirror", "settings", "visibility", "quit"],
         f"实际 {ids}",
     )
     check(
@@ -218,33 +222,43 @@ def _check_menu_contract() -> None:
         f"实际 parent={menu.parent()!r}",
     )
 
-    texts = [a.text() for a in actions]
+    # ⚠ 下面几条**按 id 取项，不按下标**：task17 插了一项之后，"第 2 个"变了，
+    #    按下标写的断言会因为"菜单长了一项"而红——那是**用例脆**，不是行为错。
+    def _by_id(menu_obj, item_id):
+        """按稳定 id 取菜单项（**不按下标**）。"""
+        for candidate in menu_obj.actions():
+            if CM.action_id(candidate) == item_id:
+                return candidate
+        return None
+
+    action_item = _by_id(menu, "action")
     check(
         "rest 态下 action 项文字是『坐下休息』",
-        texts[1] == "坐下休息",
-        f"实际 {texts[1]}",
+        action_item is not None and action_item.text() == "坐下休息",
+        f"实际 {None if action_item is None else action_item.text()!r}",
     )
     resting = CM.build_menu(parent, CM.MenuState(action="rest", manual_rest=True, can_rest=True))
-    rest_texts = [a.text() for a in resting.actions() if not a.isSeparator()]
+    rest_item = _by_id(resting, "action")
     check(
         "休息中点出来的菜单 action 项文字变成『站起来』",
-        rest_texts[1] == "站起来",
-        f"实际 {rest_texts[1]}",
+        rest_item is not None and rest_item.text() == "站起来",
+        f"实际 {None if rest_item is None else rest_item.text()!r}",
     )
     check(
         "文字变了但 id 不变（接线靠 id 不靠文字）",
-        CM.action_id(resting.actions()[1]) == "action",
-        f"实际 {CM.action_id(resting.actions()[1])!r}",
+        rest_item is not None and CM.action_id(rest_item) == "action",
+        f"实际 {None if rest_item is None else CM.action_id(rest_item)!r}",
     )
     check(
         "id 存在 QAction.setData 里（不是靠文字反查）",
-        resting.actions()[1].data() == "action",
-        f"实际 data={resting.actions()[1].data()!r}",
+        rest_item is not None and rest_item.data() == "action",
+        f"实际 data={None if rest_item is None else rest_item.data()!r}",
     )
 
     # 演示"改文字不影响接线"：直接把文字换掉，id 仍然取得到。
     odd = CM.build_menu(parent, CM.MenuState(action="idle", can_mirror=True))
-    mirror_action = odd.actions()[2]
+    mirror_action = _by_id(odd, "mirror")
+    assert mirror_action is not None
     mirror_action.setText("翻转")
     check(
         "把『镜像翻转』改成『翻转』后 id 仍然是 mirror",

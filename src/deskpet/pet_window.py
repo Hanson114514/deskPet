@@ -75,12 +75,13 @@ from PySide6.QtWidgets import QWidget
 from typing import Callable, Final
 
 from . import PROGRAM_NAME, geometry, hit_test, size
-from . import context_menu
+from . import context_menu, keyview_render
 from .animation import MAX_DT_MS, Animation
 from .config import ConfigStore
-from .context_menu import MenuState
+from .context_menu import FORM_KEYVIEW, FORM_PET, MenuState
 from .drag import DEFAULT_DIRECTION, DragController
 from .idle_state import IdleStateMachine
+from .keyview_spec import KeyViewSpec
 from .mirror import MirrorState
 from .pet_spec import PetSpec
 from .rendering import FrameRenderer
@@ -110,6 +111,93 @@ WAVING_ACTION = "waving"
 #: 双击手势的片段写法：整段一次（等价 `("loop", 1)`）。
 #: **不裁帧**——首帧是抬手（起势）、末帧是收手（收势），衔接 `idle` 更自然。
 WAVING_SEGMENT = ((WAVING_ACTION, None, ("loop", 1)),)
+
+
+class _Content:
+    """**形态接缝**（task17 §4.1）：一个形态要回答的三件事。
+
+    用户 2026 定案的是**方案 B**：同一个 `PetWindow`，"当前画面"抽成 content，
+    加"形态（form）"概念——**不新开窗口**（`KeyViewWindow` 那条不要实现）。
+
+    三个问题的答案就是全部接缝：
+
+    | 问题 | 宠物形态 | 键盘形态 |
+    | --- | --- | --- |
+    | 画布多大（`cell`）？ | `pet.cell` | `keyview.cell` |
+    | 这一档该画哪张图？ | `renderer.frame(动作, 帧号, 档位, 镜像)` | `compose(档位, pressed)` |
+    | 该不该镜像？ | 按状态记忆 | **永不**（镜像只作用于 idle/waiting/rest） |
+
+    ⚠ **尺寸与位置共用**宠物形态那一套：切形态**不重置档位、不重置位置**
+    （用户 2026 定案第 3 条）。所以这两个属性**都不含档位决策**，
+    档位仍然只由 `PetWindow._apply_level()` 一处说了算。
+    """
+
+    #: 形态名（`context_menu.FORM_PET` / `FORM_KEYVIEW`）。
+    form: str = FORM_PET
+
+    #: 画布尺寸（**所有布局共用**）。
+    cell: tuple[int, int] = (0, 0)
+
+    def image(self, level: int, mirrored: bool) -> QImage:
+        """这一档、这个镜像态下该显示的图。**空图 = 没有图可画**（降级）。"""
+        raise NotImplementedError
+
+    def mirrored_for(self, action: str) -> bool:
+        """这个形态下 `action` 该不该镜像。**键盘形态恒为 `False`**。"""
+        return False
+
+
+class PetContent(_Content):
+    """宠物形态的画源：就是原来的 `FrameRenderer` 那一套（行为一个字没改）。
+
+    ⚠ 它**持有** `FrameRenderer` 与 `Animation`（帧号从动画来），
+    所以"切回宠物形态从原来那一帧接着播"是天然的：
+    动画状态从未被切形态动过（只停表，见 `PetWindow.set_form()`）。
+    """
+
+    def __init__(self, pet: PetSpec, renderer: FrameRenderer, animation: Animation) -> None:
+        self.form = FORM_PET
+        self.pet = pet
+        self.renderer = renderer
+        self.animation = animation
+        self.cell = pet.cell
+
+    def image(self, level: int, mirrored: bool) -> QImage:
+        pixmap = self.renderer.frame(
+            self.animation.render_action, self.animation.index, level, mirrored
+        )
+        if pixmap.isNull():
+            return QImage()
+        return pixmap.toImage()
+
+
+class KeyViewContent(_Content):
+    """键盘形态的画源：`keyview_render.KeyViewRenderer` 的分层合成。
+
+    ## 尺寸与镜像是怎么被"共用"的
+
+    - **尺寸**：`cell` 是 `keyview.cell`（所有布局共用一份）→ 切形态/切布局
+      **都不改窗口尺寸**，于是锚点与控制栏零风险（task17 §3.3）；
+    - **镜像**：恒为假。镜像只作用于 `idle` / `waiting` / `rest`（agent.md §0），
+      键盘形态没有"状态"这回事，**翻转它没有任何意义**。
+      ⚠ 这不是"暂不支持"，是**语义上不该有**——所以是硬 `False`，不是配置项。
+    """
+
+    def __init__(self, spec: KeyViewSpec, level: int | None = None) -> None:
+        self.form = FORM_KEYVIEW
+        self.spec = spec
+        self.renderer = keyview_render.KeyViewRenderer(spec, level)
+        self.cell = spec.cell
+        #: **当前按下的键 id，按按下顺序**（最早在前）。
+        #: ⚠ K1 只到这里为止："物理键 → 这个元组"是 **task18** 的事。
+        self.pressed: tuple[str, ...] = ()
+
+    def image(self, level: int, mirrored: bool) -> QImage:
+        return self.renderer.image(level, self.pressed)
+
+    def layout_names(self) -> tuple[str, ...]:
+        """这个包有哪些可用布局（菜单项灰不灰、回退到哪个都看它）。"""
+        return self.spec.layout_names
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
@@ -230,6 +318,7 @@ class PetWindow(QWidget):
         config: ConfigStore | None = None,
         sounds: SoundPlayer | None = None,
         antialias: bool = False,
+        keyview: KeyViewSpec | None = None,
     ) -> None:
         super().__init__(parent)
 
@@ -330,6 +419,23 @@ class PetWindow(QWidget):
         #: 帧推进器（纯逻辑）+ 驱动它的定时器（本文件唯一的调度点）。
         self._animation = Animation(pet, self._action)
         self._driver = AnimationDriver(self._animation, self)
+
+        # ---------------------------------------------------------- 形态（task17）
+        #: 键盘形态的素材（`None` = 这个包没有可用的 KV → 菜单项灰掉）。
+        self._keyview = keyview
+        #: `退出KV` 的处理函数（`app.py` 装进来，负责写配置 + 切形态）。
+        #: 与 `_resize_handler` 等同一个模式：**没装就灰掉**。
+        self._form_handler: Callable[[str], None] | None = None
+        #: 宠物形态的画源（**永远存在**，即使 KV 可用——切回来就是它）。
+        self._pet_content = PetContent(pet, self._renderer, self._animation)
+        #: KV 形态的画源（可缺）。构造放在**渲染器之后**：它要按档位预合成。
+        self._keyview_content = (
+            KeyViewContent(keyview) if keyview is not None else None
+        )
+        #: **当前画源**。默认是宠物形态；`set_form()` 是唯一改它的地方。
+        #: ⚠ `_content.cell` 是尺寸的真值（宠物 = `pet.cell`，KV = `keyview.cell`），
+        #: 而档位仍然只由 `_apply_level()` 一处决定——两条别混。
+        self._content: _Content = self._pet_content
         self._driver.frame_due.connect(self._on_frame_due)
         #: 片段序列播完 → 收尾（双击挥手播完回 `idle`，task10 §2 第 4 条）。
         self._animation.sequence_done.connect(self._on_sequence_done)
@@ -409,8 +515,13 @@ class PetWindow(QWidget):
 
     @property
     def pixel_size(self) -> tuple[int, int]:
-        """当前档位下的内容像素尺寸（= 窗口尺寸）。"""
-        return size.pixel_size(self.pet.cell, self._level)
+        """当前档位下的内容像素尺寸（= 窗口尺寸）。
+
+        ⚠ **尺寸来源是 `self._content.cell`，不是 `self.pet.cell`**（task17 §4.1
+        的第 1 处接缝）：宠物形态 = `pet.cell`，KV 形态 = `keyview.cell`。
+        档位本身**不重置**——两个形态共用同一档（用户 2026 定案第 3 条）。
+        """
+        return size.pixel_size(self._content.cell, self._level)
 
     @property
     def size_level(self) -> int:
@@ -447,13 +558,17 @@ class PetWindow(QWidget):
         # **按动画当前那一帧**重新渲染（不是 `self._frame_index` 快照）：
         # 动画正在播时帧号一直在动，切档必须跟上动画的当前帧，
         # 否则会出现"换了档但画面停在旧帧"。
-        pixmap = self._renderer.frame(
-            self._animation.render_action, self._animation.index, self._level, mirrored
-        )
-        if not pixmap.isNull():
-            # 缓存里的 QPixmap 是**共享**的，转成 QImage 时 Qt 会做一次深拷贝，
-            # 于是 `_frame_image` 与缓存互不影响（后续要画/要算遮罩）。
-            self._frame_image = pixmap.toImage()
+        #
+        # ⚠ task17 起画面来源是 **`self._content.image()`**（第 2 处接缝）：
+        # 宠物形态走 `FrameRenderer`（与原来逐字节相同），
+        # KV 形态走 `KeyViewRenderer.compose()`。
+        image = self._content.image(self._level, mirrored)
+        if not image.isNull():
+            # 宠物形态那条路径：渲染器返回的是**共享的** `QPixmap`，
+            # 转成 `QImage` 时 Qt 会做一次深拷贝，于是 `_frame_image`
+            # 与缓存互不影响（后续要画/要算遮罩）。
+            # KV 形态返回的本来就是新合成的 `QImage`，同样可以安全持有。
+            self._frame_image = image
             self._frame_index = self._animation.index
             self._action = self._animation.render_action
             self._shown_index = self._animation.index
@@ -538,6 +653,173 @@ class PetWindow(QWidget):
         """当前显示的帧（**已缩放、已按需镜像**；只读，空图 = 没有图可画）。"""
         return self._frame_image
 
+    # ------------------------------------------------------------ 形态（task17）
+
+    @property
+    def form(self) -> str:
+        """当前形态（`""` = 宠物，`"keyview"` = 键盘）。**取画源上的值**。
+
+        "取画源"而不是"再记一个字符串"：多一个字段就多一处会对不上的状态
+        （agent.md §2.13 "不另设布尔开关"是同一条理由）。
+        """
+        return self._content.form
+
+    @property
+    def content(self) -> "_Content":
+        """当前画源（只读；**切形态请用 `set_form()`**）。"""
+        return self._content
+
+    @property
+    def keyview(self) -> KeyViewSpec | None:
+        """这个包的键盘形态素材；`None` = 没有可用的 KV（菜单项灰掉）。"""
+        return self._keyview
+
+    @property
+    def keyview_renderer(self) -> "keyview_render.KeyViewRenderer | None":
+        """KV 合成器（只读；**改按键状态请用 `set_pressed()`**）。"""
+        content = self._keyview_content
+        return content.renderer if content is not None else None
+
+    @property
+    def keyview_available(self) -> bool:
+        """现在**能不能**切到键盘形态（能切过去吗）。
+
+        判据两条，**都要成立**：
+
+        1. 这个包有可用的 KV 素材（有至少一个可用布局）；
+        2. 装了切形态的处理器（`set_form_handler()`）——与 `调整大小…` 等项
+           完全同一个模式：**没装处理器就是灰的**，不给用户一个点了没反应的项。
+
+        ⚠ 它是"**能不能切**"，不是"**现在是不是**"：判断当前形态请读 `form`。
+        """
+        return self._keyview_content is not None and self._form_handler is not None
+
+    def set_form_handler(self, handler: Callable[[str], None] | None) -> None:
+        """装上 `开启KV` / `退出KV` 的处理函数（`app.py` 用）。
+
+        `None` 卸下 → 菜单项重新灰掉。处理器收的是**目标形态名**，
+        于是"开启"与"退出"走同一个函数（菜单项本来就只有一个 id）。
+        """
+        self._form_handler = handler
+
+    def set_form(self, form: str) -> bool:
+        """切形态；返回**是不是真的切了**（已经是这个形态 → `False`）。
+
+        ## 三件事，顺序有意义
+
+        1. **换画源**（`_content`）；
+        2. **进 KV 停表、回宠物接着播**：`set_form()` **只动定时器，不动动画状态**
+           ——`Animation` 的帧号从未被碰过，所以"从原来那一帧接着播"是天然的。
+           ⚠ "还在播吗"仍然只由 `timer.isActive()` 表达（§2.13），
+           **不许**另设布尔开关；
+        3. **重画 + 重算遮罩**：走 `_apply_level()`（它会按新画源重新取图、
+           重设窗口尺寸、重算 `QRegion`）。
+
+        ⚠ **档位与位置都不重置**（用户 2026 定案第 3 条）：
+        `_apply_level()` 收的是**当前**档位，窗口位置一个字都没动。
+        两个形态的 `cell` 不同（540×420 vs 500×500）会让像素尺寸变，
+        但**锚点是右下角**，所以脚底与右边不动（§2.12）——正是控制栏不动的前提。
+
+        ⚠ 切不过去（KV 不可用）时**什么都不做**并返回 `False`：
+        菜单项本来就是灰的，这里再兜一层，绝不显示假成功。
+        """
+        if form == self._content.form:
+            return False
+        if form == FORM_PET:
+            target: _Content = self._pet_content
+        elif form == FORM_KEYVIEW:
+            if self._keyview_content is None:
+                logger.warning("这个素材包没有可用的键盘形态，拒绝切换")
+                return False
+            target = self._keyview_content
+        else:  # pragma: no cover - 形态名只有那两个，真到了也只是拒绝
+            logger.warning("未知形态 %r，拒绝切换", form)
+            return False
+
+        # ⚠ **锚点必须在换画源之前取**（task17 实测踩到的第一号坑）：
+        # `anchor_of()` 要的是**旧形态**的右下角，而 `self.pixel_size` 读的是
+        # `self._content.cell` —— 先换画源再取锚点，拿到的是**新尺寸**算出的
+        # "旧左上角 + 新尺寸"，于是 `top_left_for()` 反推出来的还是原来的左上角
+        # （实测：切过去位置一动不动，锚点漂了 30~60 px）。
+        # 真平台自检当场抓到这一幕（宠物(775,675) → KV(805,615)）。
+        anchor = size.anchor_of(
+            self._base_pos.x(), self._base_pos.y(), *self.pixel_size
+        )
+        self._content = target
+        if target.form == FORM_KEYVIEW:
+            # 进 KV：停表（KV 没有帧推进这回事），但**不动动画状态**。
+            self._driver.stop()
+            # 画面状态（`_shown_index` 等）全部作废：两个形态的画面来源不同，
+            # 留着旧值会让下一次 `_on_frame_due` 误判"没变、不用重绘"。
+            self._shown_index = None
+            self._shown_mirrored = None
+        else:
+            self._shown_index = None
+            self._shown_mirrored = None
+
+        # 重取图 + 改窗口尺寸 + 重算遮罩，**一处都不另写**。
+        #
+        # ## ⚠ 必须做锚点保护（task17 §6：「切形态后右下角锚点漂移 = 0」）
+        #
+        # 两个形态的 `cell` 不同（`weedy` 500×500 vs KV 540×420），所以切形态**必然**
+        # 改变窗口像素尺寸。`_apply_level()` 只改尺寸**不动位置** —— 那是
+        # "切档"的语义（位置由 `set_size_level()` 单独做锚点保护）。
+        # 真平台自检当场抓到：不做保护的话左上角不动、**右下角会漂**
+        # （实测 宠物(775,675) → KV(805,615)）。
+        #
+        # 所以这里照抄 `set_size_level()` 那三步：**切之前取锚点 → 切完反推左上角
+        # → 夹取后写权威位置**。夹取在 `_move_clamped()` 里、**早于**写权威位置
+        # （§4.5）。「右下角锚点不动」是 §2.12 的硬约定，形态之间同样成立。
+        # （锚点已在上面、**换画源之前**取好了，见那儿的说明。）
+        self._apply_level(self._level)
+        left, top = anchor.top_left_for(*self.pixel_size)
+        self._move_clamped(left, top)
+        if target.form == FORM_PET:
+            # 回宠物：从**原来那一帧**接着播（动画状态没被动过，§2.13）。
+            self._driver.start()
+        logger.info(
+            "形态已切到 %s（档位 %d 保留，尺寸 %dx%d）",
+            target.form or "宠物",
+            self._level,
+            *self.pixel_size,
+        )
+        return True
+
+    def toggle_form(self) -> bool:
+        """在两个形态之间切一次（菜单项的动作）；返回是不是真的切了。
+
+        ⚠ **不写配置**：持久化由 `app.py` 装的处理器负责。
+        本方法只做"切过去"这一件事，于是自检可以不起 `app.py` 就验它。
+        """
+        target = FORM_PET if self._content.form == FORM_KEYVIEW else FORM_KEYVIEW
+        return self.set_form(target)
+
+    def set_pressed(self, pressed: object = ()) -> bool:
+        """设置键盘形态的按键状态（**K1 的对外入口**）；返回画面变没变。
+
+        `pressed` 是**已按下的键 id，按按下顺序**（最早在前）。
+        "物理键 → 这个元组"是 **task18** 的事，本方法只接受结果。
+
+        不在 KV 形态时**只记住状态、不重绘**：切过去时 `_apply_level()`
+        会按新状态出一张图，不需要在后台白画一张没人看的图。
+        """
+        content = self._keyview_content
+        if content is None:
+            return False
+        state = keyview_render.pressed_tuple(pressed)
+        if state == content.pressed:
+            return False
+        content.pressed = state
+        if self._content.form != FORM_KEYVIEW:
+            return False
+        return self._repaint_current()
+
+    @property
+    def pressed(self) -> tuple[str, ...]:
+        """当前按下的键 id（**只读**；改它请用 `set_pressed()`）。"""
+        content = self._keyview_content
+        return content.pressed if content is not None else ()
+
     # ------------------------------------------------------------ 镜像
 
     @property
@@ -554,6 +836,11 @@ class PetWindow(QWidget):
         """
         if self._mirror is None:
             return False
+        # ⚠ 键盘形态**永不**镜像（第 3 处接缝的语义部分，见 `KeyViewContent`）：
+        # 镜像只作用于 idle / waiting / rest（agent.md §0），
+        # KV 没有"状态"这回事，翻转它没有任何意义。
+        if self._content.form == FORM_KEYVIEW:
+            return False
         return self._mirror.is_on(self._animation.render_action)
 
     def _on_mirror_changed(self, action: str, on: bool) -> None:
@@ -569,13 +856,30 @@ class PetWindow(QWidget):
             return
         self._repaint_current()
 
-    def _repaint_current(self) -> None:
-        """按**当前动作 / 当前帧 / 当前档位 / 当前镜像**重取帧并重设遮罩。
+    def _repaint_current(self) -> bool:
+        """按**当前形态 / 当前画面状态 / 当前档位**重取图并重设遮罩。
 
-        换镜像后必须走这一条：`show_action_frame` 会重新问渲染层要图
-        （键含镜像，所以拿到的确实是翻过的那张），并顺带重算遮罩。
+        两条路径：
+
+        - **宠物形态**：`show_action_frame()` 重新问渲染层要图
+          （键含镜像，所以拿到的确实是翻过的那张）；
+        - **键盘形态**：直接问 `_content.image()`——那里会带上 `pressed`
+          （task18 改 `pressed` 之后调的就是这一条）。
+
+        返回**是否真的换上了新图**（与 `show_action_frame()` 同一个语义）。
         """
-        self.show_action_frame(self._animation.render_action, self._animation.index)
+        if self._content.form == FORM_KEYVIEW:
+            image = self._content.image(self._level, False)
+            if image.isNull():
+                return False
+            self._frame_image = image
+            self._shown_mirrored = False
+            # 换画面 = 衍生数据必须失效重算（agent.md §4.7）：遮罩是上一张图的
+            # 形状就会出现"画面变了但可点区域没变"。
+            self.apply_mask(self._frame_image)
+            self.update()
+            return True
+        return self.show_action_frame(self._animation.render_action, self._animation.index)
 
     def show_action_frame(self, action: str, index: int) -> bool:
         """显示 ``action`` 的第 ``index`` 帧（按当前档位缩放 + **按需镜像**），并重设窗口遮罩。
@@ -592,14 +896,20 @@ class PetWindow(QWidget):
         帧的实际像素尺寸与 `cell` 不一致时（只是个警告，§2.5），
         渲染层按**真实图**的尺寸缩放，所以窗口尺寸仍以 `cell` 的档位换算为准。
         """
+        if self._content.form == FORM_KEYVIEW:
+            # 键盘形态没有"第几帧"这回事：画面由 `pressed` 与档位决定。
+            # 走 `_repaint_current()` 而不是这里（`_on_frame_due` 在 KV 形态下
+            # 永远不会被触发——切换形态时表已经停了，见 `set_form()`）。
+            return self._repaint_current(),
+
         mirrored = self.mirrored
-        pixmap = self._renderer.frame(action, index, self._level, mirrored)
-        if pixmap.isNull():
+        image = self._content.image(self._level, mirrored)
+        if image.isNull():
             return False
 
         self._frame_index = int(index)
         self._action = action
-        self._frame_image = pixmap.toImage()
+        self._frame_image = image
         self._shown_mirrored = mirrored
         # 换帧之后**衍生数据必须失效重算**（agent.md §4.7）：遮罩是上一帧的形状
         # 就会出现"人物变了但可点区域没变"。
@@ -989,9 +1299,14 @@ class PetWindow(QWidget):
         self.set_action_suspended(True)
         # 拖动开始就先摆好 idle 的姿势：还没位移时"该播什么"没有依据，
         # 与其停在 `rest` 的躺姿上，不如从 `idle` 起（松手也是回 `idle`）。
-        self.exit_manual_rest()
-        if self.pet.has_action(IDLE_ACTION):
-            self.play_action(IDLE_ACTION)
+        #
+        # ⚠ **键盘形态下不碰动作**（task17）：KV 没有"当前动作"这回事，
+        # `play_action()` 会切到宠物形态的动作上——而那个动作在 KV 里根本看不见，
+        # 等切回来时会莫名其妙地换了个姿势。拖动本身照常可用（形态无关）。
+        if self._content.form != FORM_KEYVIEW:
+            self.exit_manual_rest()
+            if self.pet.has_action(IDLE_ACTION):
+                self.play_action(IDLE_ACTION)
         self.drag_controller.begin(local_pos, global_pos, self._base_pos)
         self.setCursor(Qt.SizeAllCursor)
         return True
@@ -1022,8 +1337,8 @@ class PetWindow(QWidget):
         state = self.drag_controller.state
         final = state.target_position(global_pos)
         self._move_clamped(final.x(), final.y())
-        # 松手回 `idle`（task08 §2 第 3 条）。
-        if self.pet.has_action(IDLE_ACTION):
+        # 松手回 `idle`（task08 §2 第 3 条）。键盘形态下不碰动作（见 `_start_drag`）。
+        if self._content.form != FORM_KEYVIEW and self.pet.has_action(IDLE_ACTION):
             self.play_action(IDLE_ACTION)
 
         self._user_positioned = True
@@ -1113,6 +1428,12 @@ class PetWindow(QWidget):
         action = str(getattr(new, "value", new))
         if not self.pet.has_action(action):
             return
+        # ⚠ 键盘形态下不切动作（task17）：久置状态机照常在跑（计时与阶段都更新），
+        # 但**画面归 KV 管**。等切回宠物形态时，`_on_frame_due` 会按动画当前动作
+        # 出图，于是"回宠物形态时动作是对的"这条自动成立。
+        # ⚠ 音效也不响：休息音效属于"切到休息这个动作"，KV 里没有这个动作。
+        if self._content.form == FORM_KEYVIEW:
+            return
         self.play_action(action)
         if action == REST_ACTION:
             self._play_sound(SOUND_REST)
@@ -1169,19 +1490,32 @@ class PetWindow(QWidget):
         藏起来就叫不回来了（`hide_pet()` 也会再拦一道）。
         """
         action = self._animation.render_action
-        can_mirror = self._mirror is not None and self._mirror.can_mirror(action)
+        # 键盘形态下不镜像（见 `mirrored` 属性）：`can_mirror` 是"这一项能不能点"，
+        # 所以在 KV 里它必须是假。
+        can_mirror = (
+            self._mirror is not None
+            and self._content.form != FORM_KEYVIEW
+            and self._mirror.can_mirror(action)
+        )
+        in_keyview = self._content.form == FORM_KEYVIEW
         return MenuState(
             action=action,
             manual_rest=self.manual_rest,
             mirror_on=can_mirror and self.mirrored,
             can_mirror=can_mirror,
-            can_rest=self.can_rest(),
+            # ⚠ 键盘形态下 `坐下休息` / `镜像翻转` 都**没有意义**（KV 没有动作、
+            # 也不镜像）→ 两项都灰掉。不这么做的话，用户在 KV 里点一次"坐下"
+            # 会切到宠物形态的动作上——那是个**跨形态的假动作**，
+            # 与"绝不显示假成功"直接冲突。
+            can_rest=self.can_rest() and not in_keyview,
             resize_available=self._resize_handler is not None,
             settings_available=self._settings_handler is not None,
             visibility_available=(
                 self._visibility_handler is not None and self._hotkey_available
             ),
             visibility_reason="" if self._hotkey_available else context_menu.REASON_NO_HOTKEY,
+            form=self._content.form,
+            kv_available=self.keyview_available,
         )
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
@@ -1215,7 +1549,18 @@ class PetWindow(QWidget):
         """
         if not item_id:
             return
-        if item_id == context_menu.ID_MIRROR:
+        if item_id == context_menu.ID_FORM:
+            # task17：`开启KV` / `退出KV` 交给 `app.py` 装的处理器
+            # （它负责**写配置** + 调 `toggle_form()`）。
+            # 没装（自检）时菜单项本来就是灰的，到不了这里；真到了也什么都不做。
+            if self._form_handler is not None:
+                target = (
+                    FORM_PET
+                    if self._content.form == FORM_KEYVIEW
+                    else FORM_KEYVIEW,
+                )
+                self._form_handler(target)
+        elif item_id == context_menu.ID_MIRROR:
             self.toggle_mirror()
         elif item_id == context_menu.ID_ACTION:
             self.toggle_rest()

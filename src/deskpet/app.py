@@ -61,8 +61,10 @@ from .cursor_watch import CursorWatch
 from .errors import DataDirError
 from .idle_state import IdleStateMachine, normalize_idle_seconds
 from .mirror import MirrorState
-from .pet_loader import PetLoadError, list_reports, resolve_pet
+from .pet_loader import PetLoadError, list_reports, load_keyview, resolve_pet
 from .pet_spec import DEFAULT_PET_NAMESPACE, PetSpec
+from .context_menu import FORM_KEYVIEW, FORM_PET
+from .keyview_spec import KeyViewSpec  # noqa: F401  （打包静态分析要收全数据层）
 from .pet_window import PetWindow
 from .rendering import FrameRenderer  # noqa: F401  （打包静态分析要收全渲染层）
 from .settings import (
@@ -1164,7 +1166,12 @@ def _install_sigint_handler(app: QApplication) -> QTimer | None:
     return heartbeat
 
 
-def _print_startup_line(window: PetWindow, level_source: str, position_source: str) -> None:
+def _print_startup_line(
+    window: PetWindow,
+    level_source: str,
+    position_source: str,
+    form_layout: str = "",
+) -> None:
     """记一行启动状态：素材包 + 动作 + 帧率来源 + 位置/来源 + 档位/来源 + 遮罩 + DPI。
 
     位置取自窗口的**权威位置**（不是回读窗口坐标）。
@@ -1195,7 +1202,7 @@ def _print_startup_line(window: PetWindow, level_source: str, position_source: s
     _logger.info(
         "%s %s | pet=%s action=%s %s mode=%s frames=%d frame_ms=%.4f fps_source=%s "
         "pos=(%d, %d)(%s) level=%d/%d(%s) size=%dx%d mask=%s mirror=%s "
-        "antialias=%s dpr=%.2f",
+        "antialias=%s dpr=%.2f form=%s layout=%s",
         PROGRAM_NAME,
         __version__,
         window.pet.namespace,
@@ -1221,6 +1228,11 @@ def _print_startup_line(window: PetWindow, level_source: str, position_source: s
         # 值取自**渲染器**而不是配置：以"真正作用到出图上"的那个为准。
         "on" if window.antialias else "off",
         window.devicePixelRatioF(),
+        # 形态与布局这一栏是 task17 加的：验收要能从启动行直接读出
+        # "这次起的是哪个形态、用的是哪个布局"——"宠物怎么变成键盘了"
+        # 与"布局怎么不是我设的那个"靠它一眼分辨。
+        window.form or "宠物",
+        form_layout or "（宠物形态没有布局）",
     )
 
 
@@ -1270,6 +1282,143 @@ def _log_sound_summary(player: SoundPlayer) -> None:
             len(report.undeclared),
             "、".join(report.undeclared),
         )
+
+
+def _log_keyview_summary(keyview: "KeyViewSpec | None", namespace: str) -> None:
+    """把键盘形态的状况**一次说清**（与 `_log_sound_summary` 同一个模式）。
+
+    **只记日志、不弹窗**：KV 不可用是"用户无需行动的内部退化"
+    （agent.md §2.10 第三类），菜单项灰掉本身就是给用户的信号。
+
+    ⚠ 段缺失时**一条日志都不记**：那与"没有 `sounds`"完全同义，
+    记一句"这个包没有键盘形态"只会让日志变噪音（task17 §6 有一条验收
+    专门盯"段缺失时日志里既没有错误也没有警告"）。
+    """
+    if keyview is None:
+        return
+    _logger.info(
+        "键盘形态：%d 个键位、%d 个可用布局（%s）、%d 只手、%d 个头，画布 %dx%d",
+        len(keyview.keys),
+        len(keyview.layout_names),
+        "、".join(keyview.layout_names),
+        len(keyview.hands),
+        len(keyview.heads),
+        keyview.cell[0],
+        keyview.cell[1],
+    )
+    unused = [
+        key_id
+        for key_id in keyview.keys
+        if not any(key_id in layout.key_ids for layout in keyview.layouts.values())
+    ]
+    if unused:
+        # 不参与任何布局的键位是**潜在的问题**：素材里写了、配置也可能配了，
+        # 但画面里根本没有它（多半是 `layouts` 漏了）。**只记日志**。
+        _logger.info(
+            "键盘形态：这些键位不在任何布局里（配了也不会亮）：%s", "、".join(unused)
+        )
+
+
+class FormController:
+    """把**形态切换**接到配置上（task17 的组装层，`app.py` 独有）。
+
+    ## 它要串起来的三件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | 切形态 | 调 `window.set_form()`（真正切画面的那一步） |
+    | 记住 | **切成功才写** `config.form`（写失败如实报错，绝不显示假成功） |
+    | 布局回退 | 当前布局不可用时**回退到可用那个 + 一条日志**，不是直接灰掉 |
+
+    ## 布局回退为什么在这里
+
+    "可用性按布局判"这条规则（task17 §3.1）需要"哪些布局可用"这个信息，
+    而它只有 `KeyViewSpec` 有（`pet_loader` 已经按图在不在筛过一遍）。
+    `pet_window` 不该知道"配置里那个布局名还在不在"——那是装配层的事。
+    """
+
+    def __init__(self, window: PetWindow, store: ConfigStore) -> None:
+        self.window = window
+        self.store = store
+        #: 启动时定下来的布局名（**已经在可用集合里**）。
+        self.layout: str = ""
+
+    def resolve_layout(self) -> str:
+        """定下用哪个布局：配置里的 > 清单里的第一个；配的那个不可用则**回退**。
+
+        返回最终采用的布局名（KV 不可用时是空串）。**只读，不写盘**
+        ——"改完立刻生效"由调用方按需写回。
+        """
+        keyview = self.window.keyview
+        if keyview is None:
+            return ""
+        available = keyview.layout_names
+        if not available:  # pragma: no cover - KeyViewSpec 的非空由解析保证
+            return ""
+
+        configured = str(self.store.get("keyview_layout") or "").strip()
+        if configured and configured in available:
+            return configured
+        if configured:
+            # ⚠ **回退到可用那个 + 一条日志**，不是直接灰掉（task17 §6 明写）。
+            _logger.warning(
+                "配置里的键盘布局 %r 不可用（可用：%s），已回退到 %r",
+                configured,
+                "、".join(available),
+                available[0],
+            )
+        return available[0]
+
+    def restore(self) -> str:
+        """启动时按配置恢复上次的形态；返回**实际生效**的形态名。
+
+        ⚠ 恢复是**读操作**：配置里写着 `keyview` 但素材包换了、KV 不可用时，
+        这里**只记日志并留在宠物形态**，**不写盘**（读操作只读，§2.10）。
+        """
+        self.layout = self.resolve_layout()
+        configured = str(self.store.get("form") or "").strip()
+        if not configured:
+            return FORM_PET
+        if configured != FORM_KEYVIEW:
+            # 未知形态名：按"没表态"处理（配置是"读取永不致命"的那一类）。
+            _logger.warning("配置里的形态 %r 不认识，按宠物形态继续", configured)
+            return FORM_PET
+        if not self.window.set_form(FORM_KEYVIEW):
+            _logger.warning(
+                "配置里的形态是键盘形态，但这个素材包没有可用的 KV，留在宠物形态"
+            )
+            return FORM_PET
+        _logger.info("已按配置恢复到键盘形态（布局 %s）", self.layout)
+        return FORM_KEYVIEW
+
+    def switch(self, form: str) -> bool:
+        """菜单项的动作：**先切、切成功了再记住**；返回是不是真的切了。
+
+        ## 为什么写配置放在切成功之后
+
+        反过来的话，配置里会留下一个"下次启动要恢复、但这次没生效"的形态
+        ——正是本项目最忌讳的那种**状态分叉**。切失败（KV 不可用）时
+        `set_form()` 返回假，这里直接返回，**一个字节都不写**。
+        """
+        if not self.window.set_form(form):
+            return False
+        self.persist(form)
+        return True
+
+    def persist(self, form: str) -> None:
+        """把形态写进配置（**只在真的切了之后调**）。
+
+        写失败按 §2.10 第二类处理：这是**用户明确要求的操作**，
+        没记住就必须让他知道（`ERROR` 日志 + 系统原文）。
+        `ConfigStore.set()` 自己不抛异常，所以这里不会炸。
+        """
+        if not self.store.set("form", form):
+            reason = self.store.last_error("form") or "未知原因"
+            _logger.error(
+                "记住形态失败（%s）：%s（本次仍然切过去了，只是下次启动不会恢复）",
+                form or "宠物",
+                reason,
+            )
 
 
 def _report_resolution_problems(issues: tuple, fell_back: bool, config_pet: str | None) -> None:
@@ -1537,6 +1686,16 @@ def run(argv: list[str] | None = None) -> int:
     # 本进程**不建任何音频线程**，播放全部经由 `SoundPlayer.play()` 这一条路径。
     sound_player = SoundPlayer(pet, normalize_volume(store.get("volume")))
 
+    # 键盘形态（task17）：**与 sounds 同级的可选段**。没有 / 坏掉都只让
+    # 菜单项灰掉，**绝不阻止启动**（§2.10 第三类：可恢复 → 记日志 + 退化）。
+    # ⚠ 段缺失 / 为 `null` 时既不报错也不警告（`load_keyview` 返回空列表对）。
+    keyview, kv_issues, kv_warnings = load_keyview(pet.root)
+    for issue in kv_issues:
+        _logger.warning("键盘形态不可用：%s", issue)
+    for warning in kv_warnings:
+        _logger.info("键盘形态：%s", warning)
+    _log_keyview_summary(keyview, pet.namespace)
+
     window = PetWindow(
         pet,
         level,
@@ -1548,6 +1707,8 @@ def run(argv: list[str] | None = None) -> int:
         # 生效方式是**重启生效**，所以这里没有"开关变了要重绘"的通道
         # （用户拍板，见 task15 §1/§5：少一条动态通道就少一处会对不上的状态）。
         antialias=bool(store.get("antialias")),
+        # 键盘形态（task17 §4.1 的形态接缝）。`None` = 没有可用的 KV。
+        keyview=keyview,
     )
     window.play_action(action)
     if position is None:
@@ -1560,9 +1721,19 @@ def run(argv: list[str] | None = None) -> int:
         # 于是缩放不会把它弹回右下角缺省落点（task08 §4 硬规则），
         # 底部预留机制也不生效（task09 §4）。
         window.show_at(position[0], position[1], user_positioned=True)
+    # 形态（task17）：**在 show() 之前恢复**，于是用户看到的第一眼就是他上次的形态
+    # （先 show 再切会白闪一下宠物形态）。
+    #
+    # ⚠ 恢复顺序在**播放动作之后**：`play_action()` 定的是"宠物形态显示哪个动作"，
+    # 与形态无关（KV 形态下它只是把动画状态摆好，切回来时接着播）。
+    form_controller = FormController(window, store)
+    form_controller.restore()
+    # `开启KV` / `退出KV` 的动作 = 切形态 + **切成功了才记住**（见 `switch()`）。
+    window.set_form_handler(form_controller.switch)
+
     window.show()
 
-    _print_startup_line(window, level_source, position_source)
+    _print_startup_line(window, level_source, position_source, form_controller.layout)
 
     # ------------------------------------------------------------ 音效预热与启动音（task10）
     #

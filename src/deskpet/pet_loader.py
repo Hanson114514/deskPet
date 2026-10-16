@@ -27,8 +27,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Final
 
-from . import nsrules, paths
+from . import keyview_spec, nsrules, paths
 from .errors import DeskPetError
+from .keyview_spec import KeyViewSpec
+from .keyview_spec import parse_keyview as _parse_keyview
 from .pet_spec import (
     DEFAULT_PET_NAMESPACE,
     PetSpec,
@@ -69,6 +71,16 @@ class IssueKind(Enum):
     FPS_INVALID = "fps_invalid"
     SOUND_INVALID = "sound_invalid"
     CELL_MISMATCH = "cell_mismatch"
+    # --- 键盘形态（keyview，task17）---
+    #
+    # ⚠ 这些**全部只属于 keyview 段**：段坏掉只让键盘形态不可用，
+    # **绝不影响宠物形态的加载**（与"sounds 坏掉不影响画面"同一条纪律）。
+    # 它们进的是 keyview 自己的问题列表，**不进** PetReport.issues。
+    KEYVIEW_ROOT_INVALID = "keyview_root_invalid"
+    KEYVIEW_INVALID = "keyview_invalid"
+    KEYVIEW_LAYOUT_UNKNOWN = "keyview_layout_unknown"
+    KEYVIEW_NO_LAYOUT = "keyview_no_layout"
+    KEYVIEW_KEY_NUMBERING = "keyview_key_numbering"
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,11 @@ class PetReport:
     spec: PetSpec | None
     issues: tuple[PetIssue, ...]
     warnings: tuple[PetIssue, ...]
+    #: 键盘形态（task17）。`None` = **这个包没有可用的键盘形态**——
+    #: 三种来源都归到这里：段缺失 / 段坏掉 / 全部布局都不可用。
+    #: ⚠ 它的任何问题**都不进 `issues`**：KV 坏掉只让菜单项灰掉，
+    #: **绝不影响宠物形态的加载**（与"sounds 坏掉不影响画面"同一条纪律）。
+    keyview: "KeyViewSpec | None" = None
 
     @property
     def ok(self) -> bool:
@@ -442,6 +459,136 @@ def _image_size(path: Path) -> tuple[int, int] | None:
     return width, height
 
 
+# ------------------------------------------------------------------ 键盘形态（task17）
+
+
+def _keyview_file_issues(
+    root: Path, namespace: str, spec: KeyViewSpec
+) -> tuple[list[PetIssue], list[PetIssue]]:
+    """检查键盘形态引用到的图片在不在，并把**按布局**的可用性定下来。
+
+    返回 `(问题, 警告)`。**同一个文件名只报一次**（与 `_frame_issues` 同款，
+    一个包里有 16 个键共用一张 overlay 时，报 16 条一样的"缺图"只会淹没真问题）。
+
+    ## 判据是**按布局**的（task17 §3.1 / §6）
+
+    - 某个布局用到的键缺图 → **只是该布局**不可用（其它布局照常）；
+    - **全部**布局都不可用 → KV 形态不可用（调用方把 `keyview` 置 `None`）。
+
+    一段布局是否可用 = 它引用的**每一个键的图都在**，且 `background` 都在。
+    手 / 头缺图**只让那一层不画**（`keyview_render.layers()` 会跳过空图），
+    不算"布局不可用"——它们本来就是可选的。
+    """
+    kvd_root = root / keyview_spec.KEYVIEW_DIR_NAME
+    missing: list[PetIssue] = []
+    warnings: list[PetIssue] = []
+    reported: set[str] = set()
+
+    def _need(filename: str, where: str) -> bool:
+        """这张图在吗？不在就记一条（同名只记一次）。返回"在不在"。"""
+        if not filename:
+            return False
+        if filename in reported:
+            return (kvd_root / filename).is_file()
+        reported.add(filename)
+        if not (kvd_root / filename).is_file():
+            missing.append(
+                PetIssue(
+                    IssueKind.KEYVIEW_INVALID,
+                    namespace,
+                    None,
+                    f"{where} 的图片不存在：{kvd_root / filename}",
+                )
+            )
+            return False
+        return True
+
+    background_ok = all(_need(name, "keyview.background.normal") for name in spec.background)
+
+    usable: list[str] = []
+    for name in spec.layout_names:
+        layout = spec.layouts[name]
+        if background_ok and all(
+            _need(spec.keys[key_id].down or spec.keys[key_id].overlay, f"keyview.layouts.{name}")
+            for key_id in layout.key_ids
+        ):
+            usable.append(name)
+
+    # 手与头只记日志（它们缺图只是"那一层不画"，不构成布局不可用）。
+    for hand in spec.hands:
+        _need(hand.up, "keyview.hands.up")
+        for filename in hand.down.values():
+            _need(filename, "keyview.hands.down")
+    for head in spec.heads:
+        _need(head.image, "keyview.head")
+
+    if not usable:
+        # 全部布局都不可用 → KV 不可用。**不升级成宠物形态失败**。
+        missing.append(
+            PetIssue(
+                IssueKind.KEYVIEW_NO_LAYOUT,
+                namespace,
+                None,
+                "键盘形态的全部布局都不可用（缺图），KV 形态不可用",
+            )
+        )
+    elif len(usable) < len(spec.layout_names):
+        warnings.append(
+            PetIssue(
+                IssueKind.KEYVIEW_INVALID,
+                namespace,
+                None,
+                f"键盘形态只有这些布局可用：{'、'.join(usable)}；"
+                f"其余（{'、'.join(n for n in spec.layout_names if n not in usable)}）缺图，已跳过",
+            )
+        )
+
+    if usable:
+        warnings.append(
+            PetIssue(
+                IssueKind.KEYVIEW_INVALID,
+                namespace,
+                None,
+                f"键盘形态可用布局：{'、'.join(usable)}（共 {len(usable)} 个）",
+            )
+        )
+    return missing, warnings
+
+
+def load_keyview(
+    root: Path | str, data: Mapping[str, Any] | None = None
+) -> tuple[KeyViewSpec | None, list[PetIssue], list[PetIssue]]:
+    """读一个素材包的键盘形态。**永不抛异常。**
+
+    返回 `(规格 | None, 问题, 警告)`。调用方（`app.py`）按"规格是不是 `None`"
+    决定菜单项灰不灰；问题只写日志，**绝不阻止启动**（§2.10 第三类）。
+
+    `data=None` 时自己读一遍索引（`app.py` 的正常路径）；自检里也可以
+    直接把已经解析好的索引对象传进来，省掉一次读盘。
+    """
+    root = Path(root)
+    namespace = root.name
+    if data is None:
+        data = _read_index(root, namespace)
+    if data is None:
+        # 索引本身就读不出来：那不是 keyview 的问题，**不在这里报**
+        # （宠物形态那条路径会如实报出来，两处报同一件事就是噪音）。
+        return None, [], []
+
+    spec, issues, warnings = _parse_keyview(
+        data.get("keyview"), namespace=namespace, root=root
+    )
+    if spec is None:
+        return None, issues, warnings
+
+    file_issues, file_warnings = _keyview_file_issues(root, namespace, spec)
+    issues.extend(file_issues)
+    warnings.extend(file_warnings)
+    if issues:
+        return None, issues, warnings
+    return spec, issues, warnings
+
+
 def _analyze(root: Path, *, source: str | None = None) -> PetReport:
     """**校验的唯一实现**：`list_reports()` / `validate_pet()` / `load_pet()` 都走它。"""
     namespace = root.name
@@ -452,6 +599,9 @@ def _analyze(root: Path, *, source: str | None = None) -> PetReport:
         source=resolved_source,
         display_name=namespace,
     )
+
+    #: 键盘形态的结论（**只影响 KV 形态**，与宠物形态的 issues 完全分开）。
+    keyview_result: list[KeyViewSpec | None] = [None]
 
     def _report(
         spec: PetSpec | None,
@@ -464,6 +614,7 @@ def _analyze(root: Path, *, source: str | None = None) -> PetReport:
             spec=spec,
             issues=tuple(issues),
             warnings=tuple(warnings),
+            keyview=keyview_result[0],
         )
 
     # 0) 目录本身 + 命名空间白名单（后面所有推理都建立在"它是个合法目录"上）。
@@ -489,6 +640,17 @@ def _analyze(root: Path, *, source: str | None = None) -> PetReport:
     # 2) 结构解析（cell / actions / fps / sounds）。
     spec, build_issues, warnings = build_pet_spec(root, data, source=resolved_source)
     issues.extend(build_issues)
+
+    # 2b) 键盘形态（task17）。⚠ **它的任何问题都不进 `issues`**：
+    #     KV 坏掉只让菜单项灰掉，**绝不影响宠物形态**（§3.1 的硬纪律）。
+    #     ⚠ 段缺失 / `null` 时 `parse_keyview` 返回 `([], [])`，
+    #     **既不报错也不警告**（与"没有 sounds"完全同义）。
+    keyview, kv_issues, kv_warnings = load_keyview(root, data)
+    keyview_result[0] = keyview
+    for issue in kv_issues:
+        logger.warning("键盘形态问题：%s", issue)
+    for warning in kv_warnings:
+        logger.debug("键盘形态：%s", warning)
 
     # 3) 帧文件在不在（只有结构过了才谈得上）。
     if spec is not None and not issues:
