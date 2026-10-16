@@ -42,6 +42,7 @@ import math
 import signal
 import sys
 import time
+from typing import Callable
 
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
@@ -74,6 +75,7 @@ from .settings import (
     ConfirmHandler,
     HotkeyChanger,
     HotkeyOutcome,
+    KeyviewOutcome,
     RestartHandler,
     RestartOutcome,
     SettingsWindow,
@@ -863,6 +865,52 @@ class SettingsController:
         self._confirm_handler: "ConfirmHandler | None" = None
         #: 开关开机自启的处理器（task14）。同样**每个新窗口都要重装**。
         self._autostart_handler: "AutostartHandler | None" = None
+        #: 换键盘布局的处理器（task19）。同样**每个新窗口都要重装**。
+        self._keyview_changer: "KeyviewChanger | None" = None
+        #: 当前素材包的键盘形态（task19）。设置窗口按它决定"整组禁用还是有网格"。
+        #: ⚠ 与角色同一条规矩：换角色要重启，所以窗口存活期间它是**常量**。
+        self._keyview: "KeyViewSpec | None" = None
+        #: "某一项设置改了、立刻作用到运行时"的回调（task19）。
+        #: `None` = 没有要做的事（自检里常见）→ 只记一行日志。
+        self._settings_handler: "Callable[[str, object], None] | None" = None
+
+    def set_settings_handler(
+        self, handler: "Callable[[str, object], None] | None"
+    ) -> None:
+        """由 `app.py` 装上"某项设置改完立刻生效"的回调（task19）。
+
+        ⚠ 与换热键/重启/自启/换布局那几个处理器**不是一回事**：
+        那几个是"界面上某一行的动作"，这个是"**任意一行写成功之后**的通知"
+        ——所以它不需要每窗口重装（它挂在窗口的 `settings_changed` 信号上，
+        而那个信号在 `open()` 里每次都接）。
+
+        ⚠ 它在信号**之后**跑：那时配置**已经写进磁盘了**（`_write_field()` 的顺序
+        是先 `apply()` 再发信号）。所以失败的情况根本到不了这里——
+        "改完立刻生效"不会作用在一个没写进去的值上。
+        """
+        self._settings_handler = handler
+
+    def set_keyview_changer(self, changer: "KeyviewChanger | None") -> None:
+        """由 `app.py` 装上"换键盘布局"的函数（task19）。
+
+        ⚠ 与 `set_hotkey_changer()` / `set_restart_handler()` / `set_autostart_handler()`
+        同一条教训（task12 §4 / task13 §4 / task14 §4）：**每个新窗口都要重装**。
+        忘了重装的表现是"第二次打开设置窗口换布局**只写配置、画面不动**"
+        ——又一种假成功。
+        """
+        self._keyview_changer = changer
+        if self._dialog is not None:
+            self._dialog.set_keyview_changer(changer)
+
+    def set_keyview(self, keyview: "KeyViewSpec | None") -> None:
+        """告诉设置窗口"当前素材包有什么键盘形态"（task19；`app.py` 用）。
+
+        界面**不自己去加载素材包**（那是数据层的事，且换角色要重启、
+        这里必须是同一份），所以由装配层把**已经解析好的那一份**传进来。
+        """
+        self._keyview = keyview
+        if self._dialog is not None:
+            self._dialog.set_keyview(keyview)
 
     def set_hotkey_changer(self, changer: "HotkeyChanger | None") -> None:
         """由 `app.py` 装上"换热键"的函数（task12）。"""
@@ -915,7 +963,13 @@ class SettingsController:
             self._dialog.activateWindow()
             return
 
-        dialog = SettingsWindow(self._store, current_pet=current, parent=None)
+        dialog = SettingsWindow(
+            self._store,
+            current_pet=current,
+            parent=None,
+            # 键盘形态（task19）：**同一份已解析的规格**，界面不自己去加载素材包。
+            keyview=self._keyview,
+        )
         # 关掉之后**释放实例引用**：下次打开是一个全新的窗口，
         # 不会带着上一次的状态（task11 §2 第 4 条："关闭后再打开正常"）。
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -932,6 +986,10 @@ class SettingsController:
         # 第二、三次打开设置窗口勾「开机自启」**只改界面、不动系统自启项**。
         if self._autostart_handler is not None:
             dialog.set_autostart_handler(self._autostart_handler)
+        # ⚠ 同理，**每个新窗口都要重新装换布局的处理器**（task19）：不装的话，
+        # 第二、三次打开设置窗口换布局**只写配置、画面不动**。
+        if self._keyview_changer is not None:
+            dialog.set_keyview_changer(self._keyview_changer)
         dialog.finished.connect(self._on_finished)
         # 设置里改的值要**立刻**作用到运行时（音量已在 `store.config_changed`
         # 上接了；久置时间由状态机每次判定现读）。
@@ -951,8 +1009,16 @@ class SettingsController:
         self._dialog = None
 
     def _on_settings_changed(self, key: str, value: object) -> None:
-        """用户在设置里改了一项（**写入成功才会走到这里**）。"""
+        """用户在设置里改了一项（**写入成功才会走到这里**）。
+
+        ⚠ 这个信号**只在写入成功时发**（task11 §4）：失败时控件已经回滚，
+        那一刻的"值"根本不是用户想要的那个，发给下游只会让运行时按错的值行动。
+        """
         _logger.info("设置已生效：%s=%r", key, value)
+        # 键盘那两项的**即时生效**（task19 §4.5）：交给装配层装好的回调。
+        handler = self._settings_handler
+        if handler is not None:
+            handler(key, value)
 
     def _current_pet_namespace(self) -> str:
         """配置里**真正生效**的角色（空串 = 没表态 → 默认形象）。
@@ -1344,12 +1410,26 @@ class FormController:
         #: 启动时定下来的布局名（**已经在可用集合里**）。
         self.layout: str = ""
 
-    def resolve_layout(self) -> str:
+    def resolve_layout(self, apply: bool = True) -> str:
         """定下用哪个布局：配置里的 > 清单里的第一个；配的那个不可用则**回退**。
 
         返回最终采用的布局名（KV 不可用时是空串）。**只读，不写盘**
         ——"改完立刻生效"由调用方按需写回。
+
+        `apply=True`（默认）时**顺手把结果施加到窗口上**（task19）：
+        回退这一条只有在真的作用到画面上时才算数——只算出一个名字、
+        画面却仍是窗口构造时那个"清单里第一个"，回退就等于没发生
+        （而配置里那个坏名字一直留着，用户永远看不出回退过）。
+
+        ⚠ `apply=False` 留给自检：它只想知道"该用哪个"，不一定要造窗口状态。
         """
+        name = self._resolve_layout_name()
+        if apply and name:
+            self.window.set_layout(name)
+        return name
+
+    def _resolve_layout_name(self) -> str:
+        """`resolve_layout()` 的**纯查询**那一半（只读、无副作用）。"""
         keyview = self.window.keyview
         if keyview is None:
             return ""
@@ -1420,6 +1500,131 @@ class FormController:
                 form or "宠物",
                 reason,
             )
+
+
+class KeyviewController:
+    """把**设置界面里的键盘配置**接到宠物上（task19 的组装层，`app.py` 独有）。
+
+    ## 它要串起来的三件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | **换布局** | `window.set_layout()`（画面当场换）→ 再重绑监听（键集变了） |
+    | **挂起录入** | `set_suspended()` → `KeyListenerController.set_suspended()` |
+    | **录完立刻生效** | `set_bindings()`（映射不进图像，**不用重绘**） |
+
+    ## 为什么挂起要单独开一个方法
+
+    `settings.KeyviewChanger` 是一个 `Callable`，而挂起是"这个处理器身上的另一个
+    能力"。第一版想把它做成"处理器必须是带 `set_suspended` 的对象"，
+    但那样自检里就没法只装一个 lambda。折中：处理器是**函数**，挂起走
+    `settings` 那边一个可选钩子（`set_keyview_changer()` 里取
+    `getattr(changer, "set_suspended", None)`）；本对象因此**必须**提供
+    `set_suspended`，并且**要能被当函数调**（`__call__`）。
+
+    ## 布局与绑定都**立刻生效**（不重启）
+
+    与"抗锯齿/换角色要重启"不矛盾（task19 §4.5）：那两项改动代价大
+    （重建滤镜 / 整个素材），这两项**只是换一张图 / 换个映射表**。
+    """
+
+    def __init__(
+        self,
+        window: PetWindow,
+        store: ConfigStore,
+        key_controller: "KeyListenerController",
+        form_controller: "FormController",
+    ) -> None:
+        self.window = window
+        self.store = store
+        self.key_controller = key_controller
+        self.form_controller = form_controller
+
+    def __call__(self, layout: str) -> "KeyviewOutcome":
+        """`settings.KeyviewChanger` 的形状就是一个可调用对象。
+
+        ⚠ 与 `set_suspended()` **分开**是有意的：`settings` 那边把
+        "换布局"当函数用、把"挂起"当一个可选方法取
+        （`getattr(changer, "set_suspended", None)`）——这样自检里
+        只装一个 lambda 也能验"换布局"，不必凑一个假对象出来。
+        """
+        return self.apply_layout(str(layout))
+
+    # ------------------------------------------------------------ 换布局
+
+    def apply_layout(self, layout: str) -> "KeyviewOutcome":
+        """换布局：**先切画面，再重绑监听**；返回结构化结论。
+
+        ```text
+        画面没切过去        -> ok=False（下拉与配置都退回真实状态）
+        画面切了、绑定重算   -> ok=True（不需要重绘：映射不进图像）
+        ```
+
+        ⚠ 换布局之后**必须重绑**：两个布局的键集不同，旧布局里按着的键
+        在新布局里可能根本没有。`set_bindings()` 自己会把"已经不在任何绑定里的
+        键 id"清掉（`key_listener.set_bindings()` 的既有行为）。
+        """
+        keyview = self.window.keyview
+        if keyview is None:
+            return KeyviewOutcome(False, "", "这个素材包没有键盘形态")
+        if keyview.layout(layout) is None:
+            return KeyviewOutcome(False, "", f"素材包里没有布局 {layout!r}")
+
+        if not self.window.set_layout(layout):
+            # 已经是这个布局 → **不是失败**：配置与画面本来就一致。
+            self.form_controller.layout = layout
+            self.rebind()
+            return KeyviewOutcome(True, layout)
+
+        self.form_controller.layout = layout
+        self.rebind()
+        _logger.info(
+            "键盘布局已切换到 %s（键 %d 个，窗口尺寸与位置不变）",
+            layout,
+            len(self.window.keyview_active_keys),
+        )
+        return KeyviewOutcome(True, layout)
+
+    def apply_bindings(self, payload: object) -> None:
+        """把配置里的 `keyview_keys` 立刻作用到监听器（task19 §4.5）。
+
+        与 `set_bindings()` 的区别：这里收的是**配置形状**（`键 id -> {vk, name}`），
+        换算成绑定表那一步走 `key_listener.bindings_from_config()`
+        （唯一实现，别处不许自己翻）。
+        """
+        self.key_controller.listener.set_bindings(bindings_from_config(payload))
+
+    def rebind(self) -> None:
+        """按**当前配置 + 当前布局**重算绑定表（换布局之后调）。
+
+        ```text
+        bindings_from_config()  -> VK -> (键 id, ...)       （task18 的既有实现）
+        再按当前布局过滤         -> 只留这个布局真的有的键   （task19）
+        ```
+
+        ⚠ **过滤是必须的**：不过滤的话，4 键布局下按一个只有 8 键布局才有的键，
+        监听器照样把它算成"按下"——画面上不亮（`KeyViewContent.image()` 滤掉了），
+        但 `pressed` 里躺着它，手会按它来选图（`pressed[-1]` 语义）。
+        """
+        raw = bindings_from_config(self.store.get("keyview_keys"))
+        active = self.window.keyview_active_keys
+        if active:
+            filtered = {
+                vk: tuple(key for key in ids if key in active)
+                for vk, ids in raw.items()
+            }
+            raw = {vk: ids for vk, ids in filtered.items() if ids}
+        self.key_controller.listener.set_bindings(raw)
+
+    # ------------------------------------------------------------ 挂起（录入）
+
+    def set_suspended(self, suspended: bool) -> None:
+        """录入期间挂起按键监听（task19 §4.3）。
+
+        ⚠ **转发**给 `KeyListenerController`：界面那边只认这一个方法，
+        不许自己去找监听器（task19 §5）。
+        """
+        self.key_controller.set_suspended(bool(suspended))
 
 
 class KeyListenerController:
@@ -1783,6 +1988,10 @@ def run(argv: list[str] | None = None) -> int:
         antialias=bool(store.get("antialias")),
         # 键盘形态（task17 §4.1 的形态接缝）。`None` = 没有可用的 KV。
         keyview=keyview,
+        # 键盘布局（task19）：**启动时读一次**。空串 = 清单里第一个，
+        # 与 `FormController.resolve_layout()` 的兜底一致（它随后会把
+        # 最终采用的布局写进 `form_controller.layout`）。
+        keyview_layout=str(store.get("keyview_layout") or "").strip(),
     )
     window.play_action(action)
     if position is None:
@@ -1907,6 +2116,26 @@ def run(argv: list[str] | None = None) -> int:
     window.set_form_handler(_switch_form_with_keys)
     # 启动时那一次也要同步：配置里记的是 KV 形态时，监听器要**当场**转起来。
     key_controller.sync()
+
+    # ------------------------------------------------------------ 键盘配置（task19）
+    #
+    # 界面与宠物之间的**唯一通道**：设置窗口不许直接持有宠物窗口/监听器
+    # （task19 §5），它只有一个 `KeyviewChanger`（本对象）。
+    keyview_controller = KeyviewController(window, store, key_controller, form_controller)
+    # 启动时的绑定表要**按当前布局过滤**一次（task18 那条路只按配置）。
+    keyview_controller.rebind()
+
+    def _on_keyview_setting_changed(key: str, value: object) -> None:
+        """设置里改了 `keyview_keys` → **立刻作用到运行时**（task19 §4.5，不重启）。
+
+        映射**不进图像**，所以这条路上只需要换绑定表，**不用重绘**。
+
+        ⚠ `keyview_layout` 那条**这里不管**：换布局走的是"先切画面、再写配置"
+        （`KeyviewController.__call__`），画面在 `settings_changed` 发出**之前**
+        就已经换了。在这里再切一次是多画一张同样的图。
+        """
+        if key == "keyview_keys":
+            keyview_controller.apply_bindings(value)
     _logger.info(
         "按键联动：%s（绑定 %d 个键、%d 个 VK，轮询间隔 %d ms）",
         "已启用" if key_controller.should_poll() else "未启用（不在键盘形态 / 窗口不可见）",
@@ -1970,6 +2199,12 @@ def run(argv: list[str] | None = None) -> int:
     # "帮我开/关一下"。快捷方式生成、`.cmd` 回退、失败原因都在 `autostart` 里。
     autostart_controller = AutostartController()
     settings_controller.set_autostart_handler(autostart_controller.apply)
+    # 键盘那两行（task19）：界面**不持有宠物窗口/监听器**，它只有一个可调用对象
+    # （换布局）与一个可选钩子（录入期间挂起监听）。
+    settings_controller.set_keyview(window.keyview)
+    settings_controller.set_keyview_changer(keyview_controller)
+    # "某一项改完立刻生效"（task19 §4.5）：`keyview_keys` 换绑定表，**不用重绘**。
+    settings_controller.set_settings_handler(_on_keyview_setting_changed)
 
     # 音量"改完立刻生效"（task10 §2 第 3 条）：挂在配置的 `config_changed` 上。
     # ⚠ 这条只在**程序内改配置**（`ConfigStore.set()` / `reload()`）时触发；

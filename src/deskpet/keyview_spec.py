@@ -31,11 +31,14 @@
 **那才是渲染顺序**）。顺序搞反就是"人物盖住键盘"，而且改一层要重烤一次。
 """
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
+
+logger = logging.getLogger(__name__)
 
 #: **布局白名单**（六个固定布局）。真值只允许存在这一处。
 #:
@@ -750,6 +753,106 @@ def _check_heads_reference(
                     IssueKind.KEYVIEW_INVALID.value,
                     f"keyview.head[{index}].when_all_of 引用了 keys 里不存在的键 {key_id!r}",
                 )
+
+
+# ------------------------------------------------------------------ 绑定规范化
+
+
+@dataclass(frozen=True)
+class KeyBinding:
+    """一个键位上的绑定：**录到的那一个物理键**。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `vk` | 虚拟键码（`QKeyEvent.nativeVirtualKey()` 给什么就是什么） |
+    | `name` | 可读名字（`J` / `Space` / `Num5`），只用于显示 |
+
+    ⚠ **没有"布局"这一维**：键 id 在所有布局里指同一个键，所以**配一次、所有布局通用**
+    （agent.md §2.23）。带布局前缀就会变成"每个布局各配一套"——那是明令不要做的。
+    """
+
+    vk: int
+    name: str = ""
+
+
+#: 配置里 `keyview_keys` 的值的合法形状：`{"vk": 74, "name": "J"}`。
+#: 别处不许再手写一遍这两个字段名。
+BINDING_VK_FIELD: Final[str] = "vk"
+BINDING_NAME_FIELD: Final[str] = "name"
+
+
+def normalize_bindings(
+    raw: object, spec: KeyViewSpec | None = None
+) -> dict[str, KeyBinding]:
+    """把配置里的 `keyview_keys` 整理成"**当前素材包真的有的键位** → 绑定"。
+
+    ## 三条约定（task19 §4.6 / 决策 1、2）
+
+    1. **不存在的键 id 直接丢掉**（换过素材包、键位被删了），只记一条日志；
+    2. ⚠ **绝不写回配置**——这是**读**操作（§2.10"读操作只读"）。被丢掉的那些
+       留在文件里不动，用户把素材包换回来时它们是活的；
+    3. **同一个物理键绑到多个键位是合法的**（用户 2026 决策 2），这里一个都不解绑。
+
+    坏形状静默丢弃（配置是"读取永不致命"的那一类）：
+    `vk` 不是正整数 / 值不是对象 / 键 id 不是非空字符串。
+
+    `spec=None` 表示"这个包没有键盘形态" → 全部丢掉（只留日志）。
+    """
+    out: dict[str, KeyBinding] = {}
+    if not isinstance(raw, Mapping):
+        return out
+
+    known = spec.keys if spec is not None else {}
+    unknown: list[str] = []
+    for raw_id, raw_entry in raw.items():
+        key_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not key_id or not isinstance(raw_entry, Mapping):
+            continue
+        vk = raw_entry.get(BINDING_VK_FIELD)
+        if isinstance(vk, bool) or not isinstance(vk, int) or vk <= 0:
+            continue
+        if key_id not in known:
+            unknown.append(key_id)
+            continue
+        name = raw_entry.get(BINDING_NAME_FIELD)
+        out[key_id] = KeyBinding(
+            vk=int(vk), name=name.strip() if isinstance(name, str) else ""
+        )
+
+    if unknown:
+        # ⚠ **只记日志，一个字节都不写回**（§2.10 读操作只读）。
+        logger.info(
+            "键位映射：配置里有 %d 个键位在当前素材包里不存在，已忽略（配置不改）：%s",
+            len(unknown),
+            "、".join(unknown),
+        )
+    return out
+
+
+def bindings_for_layout(
+    bindings: Mapping[str, KeyBinding], layout: LayoutSpec | None
+) -> dict[str, KeyBinding]:
+    """只留**这个布局真的用到**的键位（网格按它填初值）。
+
+    "配了但当前布局没有这个键"不是错误：键 id 跨布局通用，
+    换个布局它就会重新出现（真实例子里 4 键布局根本没有 8 键布局的那些键）。
+    """
+    if layout is None:
+        return {}
+    wanted = set(layout.key_ids)
+    return {key_id: binding for key_id, binding in bindings.items() if key_id in wanted}
+
+
+def bindings_to_config(bindings: Mapping[str, KeyBinding]) -> dict[str, dict]:
+    """绑定 → 写进 `keyview_keys` 的普通对象（**写配置的唯一拼法**）。
+
+    ⚠ 就是 `{"键 id": {"vk": …, "name": …}}` 的形状，**不加布局前缀**。
+    键顺序取传入顺序（dict 保持插入序），于是写出来的 JSON 顺序稳定、可读。
+    """
+    return {
+        key_id: {BINDING_VK_FIELD: int(binding.vk), BINDING_NAME_FIELD: binding.name}
+        for key_id, binding in bindings.items()
+    }
 
 
 # ------------------------------------------------------------------ 模块级断言

@@ -184,7 +184,12 @@ class KeyViewContent(_Content):
       ⚠ 这不是"暂不支持"，是**语义上不该有**——所以是硬 `False`，不是配置项。
     """
 
-    def __init__(self, spec: KeyViewSpec, level: int | None = None) -> None:
+    def __init__(
+        self,
+        spec: KeyViewSpec,
+        level: int | None = None,
+        layout: str = "",
+    ) -> None:
         self.form = FORM_KEYVIEW
         self.spec = spec
         self.renderer = keyview_render.KeyViewRenderer(spec, level)
@@ -192,13 +197,59 @@ class KeyViewContent(_Content):
         #: **当前按下的键 id，按按下顺序**（最早在前）。
         #: ⚠ K1 只到这里为止："物理键 → 这个元组"是 **task18** 的事。
         self.pressed: tuple[str, ...] = ()
+        #: 当前布局的**有效键 id 集合**（task19）：布局之外的键**不亮、也不画**。
+        #:
+        #: ⚠ 这一维**必须**有：`background` 里烤的是全部键帽（16 个），
+        #: `layouts.<名>.rows` 才是"这一档画面里真的有哪几个键"。
+        #: 没有它的话，4 键布局下按一个 8 键布局才有的键照样会亮
+        #: ——画面与布局对不上，用户会以为"布局没生效"。
+        self._layout: str = ""
+        self._active: frozenset[str] = frozenset()
+        self.set_layout(layout or (spec.layout_names[0] if spec.layout_names else ""))
 
     def image(self, level: int, mirrored: bool) -> QImage:
-        return self.renderer.image(level, self.pressed)
+        # 出图前**再滤一次**：`pressed` 可能来自别的入口（`set_pressed()` 是
+        # 程序入口，谁都能调），滤在这里则"画面上的键永远在当前布局里"是一条
+        # 与入口无关的保证。集合判定是 O(1)，代价可以忽略。
+        return self.renderer.image(
+            level, tuple(key for key in self.pressed if key in self._active)
+        )
 
     def layout_names(self) -> tuple[str, ...]:
         """这个包有哪些可用布局（菜单项灰不灰、回退到哪个都看它）。"""
         return self.spec.layout_names
+
+    # ------------------------------------------------------------ 布局（task19）
+
+    @property
+    def layout(self) -> str:
+        """当前布局名（`""` = 没有可用布局）。"""
+        return self._layout
+
+    @property
+    def active_keys(self) -> frozenset[str]:
+        """当前布局里**有效**的键 id（布局之外的键不亮）。"""
+        return self._active
+
+    def set_layout(self, name: str) -> bool:
+        """换成另一个布局；返回**画面真的变了吗**。
+
+        ⚠ 切布局**不改 `cell``**（所有布局共用一份，§2.23）→ 窗口尺寸、
+        锚点、控制台预留**全都不动**，所以这里**不碰 `_apply_level()`**：
+        由调用方决定要不要重绘（映射变了要重绘一次，见 `PetWindow.set_layout`）。
+        """
+        spec = self.spec.layout(name)
+        if spec is None:
+            return False
+        active = frozenset(spec.key_ids)
+        if name == self._layout and active == self._active:
+            return False
+        self._layout = name
+        self._active = active
+        # 布局换小之后，原来按着的、现在不在布局里的键要**当场消失**
+        # （否则画面上留着一个这个布局根本没有的键）。
+        self.pressed = tuple(key for key in self.pressed if key in active)
+        return True
 
 
 def region_for_image(image: QImage | None) -> QRegion | None:
@@ -328,6 +379,7 @@ class PetWindow(QWidget):
         sounds: SoundPlayer | None = None,
         antialias: bool = False,
         keyview: KeyViewSpec | None = None,
+        keyview_layout: str = "",
     ) -> None:
         super().__init__(parent)
 
@@ -438,8 +490,14 @@ class PetWindow(QWidget):
         #: 宠物形态的画源（**永远存在**，即使 KV 可用——切回来就是它）。
         self._pet_content = PetContent(pet, self._renderer, self._animation)
         #: KV 形态的画源（可缺）。构造放在**渲染器之后**：它要按档位预合成。
+        #:
+        #: `keyview_layout` 是**启动时读一次**的布局（task19）：空串 = 清单里
+        #: 第一个（与 `FormController.resolve_layout()` 的兜底一致）。
+        #: 运行期换布局走 `set_layout()`，不重建画源（帧缓存照样能用）。
         self._keyview_content = (
-            KeyViewContent(keyview) if keyview is not None else None
+            KeyViewContent(keyview, layout=keyview_layout)
+            if keyview is not None
+            else None
         )
         #: **当前画源**。默认是宠物形态；`set_form()` 是唯一改它的地方。
         #: ⚠ `_content.cell` 是尺寸的真值（宠物 = `pet.cell`，KV = `keyview.cell`），
@@ -813,6 +871,44 @@ class PetWindow(QWidget):
         )
         return True
 
+    def set_layout(self, name: str) -> bool:
+        """换键盘布局（task19 §4.5）；返回**画面真的变了吗**。
+
+        ## 为什么这里**不**做锚点保护（与 `set_form()` 正好相反）
+
+        `cell` 是**所有布局共用**的一份（§2.23），所以切布局**不改窗口尺寸**
+        → 锚点、位置、控制栏预留**一样都不用动**。这正是"切布局便宜、
+        切形态贵"的那条区别。
+
+        ⚠ 不在 KV 形态时**也照常换**（只记状态、不重绘）：与 `set_pressed()`
+        同一条理由——用户可能先在宠物形态下把布局配好，再切过去；
+        那时 `set_form()` 的 `_apply_level()` 会按新布局出一张图。
+        """
+        content = self._keyview_content
+        if content is None:
+            return False
+        changed = content.set_layout(name)
+        if not changed:
+            return False
+        if self._content.form == FORM_KEYVIEW:
+            # 重绘一次。⚠ **返回值不是判据**：`_repaint_current()` 返回的是
+            # "图变了没有"，而"布局真的换了"由 `content.set_layout()` 回答
+            # ——当前没按任何键时两套布局的画面本来就可能一模一样。
+            self._repaint_current()
+        return True
+
+    @property
+    def keyview_layout(self) -> str:
+        """当前键盘布局名（`""` = 没有可用布局）。**只读**。"""
+        content = self._keyview_content
+        return content.layout if content is not None else ""
+
+    @property
+    def keyview_active_keys(self) -> frozenset[str]:
+        """当前布局里有效的键 id（诊断与自检用）。**只读**。"""
+        content = self._keyview_content
+        return content.active_keys if content is not None else frozenset()
+
     def toggle_form(self) -> bool:
         """在两个形态之间切一次（菜单项的动作）；返回是不是真的切了。
 
@@ -867,7 +963,14 @@ class PetWindow(QWidget):
         self.pressed_signal_count += 1
         content = self._keyview_content
         if content is not None:
-            content.pressed = keyview_render.pressed_tuple(pressed)
+            # ⚠ 与 `set_pressed()` 同一条过滤（布局之外的键不进来）：
+            # 监听器那边虽然也按布局滤过一遍（`KeyviewController.rebind`），
+            # 但"画面上的键永远在当前布局里"这条保证只该有**一处**实现。
+            content.pressed = tuple(
+                key
+                for key in keyview_render.pressed_tuple(pressed)
+                if key in content.active_keys
+            )
         # 重置（不是在原有基础上叠加）：`start()` 会重新计时，
         # 于是"连续变化"被合并成"最后一次变化之后 REPAINT_INTERVAL_MS"一次重绘。
         self._repaint_timer.start()
@@ -888,13 +991,22 @@ class PetWindow(QWidget):
         `pressed` 是**已按下的键 id，按按下顺序**（最早在前）。
         "物理键 → 这个元组"是 **task18** 的事，本方法只接受结果。
 
+        ⚠ **按当前布局过滤**（task19）：布局之外的键**不进来**。
+        过滤放在这里（而不是只放在 `image()` 里）是为了让 `pressed`
+        这个**对外可读的状态**与画面一致——否则 4 键布局下按一个 8 键
+        布局才有的键，画面不亮但 `pressed` 里躺着它，两份状态对不上。
+
         不在 KV 形态时**只记住状态、不重绘**：切过去时 `_apply_level()`
         会按新状态出一张图，不需要在后台白画一张没人看的图。
         """
         content = self._keyview_content
         if content is None:
             return False
-        state = keyview_render.pressed_tuple(pressed)
+        state = tuple(
+            key
+            for key in keyview_render.pressed_tuple(pressed)
+            if key in content.active_keys
+        )
         if state == content.pressed:
             return False
         content.pressed = state

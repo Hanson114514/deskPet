@@ -51,9 +51,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import autostart, keycapture, pet_loader
+from . import autostart, keycapture, keygrid, pet_loader
 from .config import ConfigStore, SetResult, VALIDATION_ERROR
 from .idle_state import normalize_idle_seconds
+from .keyview_spec import (
+    KeyBinding,
+    KeyViewSpec,
+    bindings_for_layout,
+    bindings_to_config,
+    normalize_bindings,
+)
 from .pet_spec import DEFAULT_PET_NAMESPACE
 from .sounds import VOLUME_MAX, VOLUME_MIN
 
@@ -64,8 +71,9 @@ logger = logging.getLogger(__name__)
 #: 窗口标题（附录 B）。
 TITLE: Final[str] = "桌宠设置"
 
-#: 分组标题与**顺序**（附录 B）：常规 / 声音 / 行为。
-GROUP_ORDER: Final[tuple[str, ...]] = ("常规", "声音", "行为")
+#: 分组标题与**顺序**（附录 B）：常规 / 声音 / 行为 / 键盘。
+#: ⚠ `键盘`（task19）摆在 `行为` **之后**（task19 §4.1 明写的位置）。
+GROUP_ORDER: Final[tuple[str, ...]] = ("常规", "声音", "行为", "键盘")
 
 #: 未实现的项在标题后面追加的说法（task11 §2：**不是**隐藏）。
 NOT_READY_SUFFIX: Final[str] = "（暂未开放）"
@@ -98,6 +106,14 @@ HINT_AUTOSTART: Final[str] = "登录 Windows 后自动启动桌宠"
 HINT_HOTKEY: Final[str] = "隐藏后按此键呼出；点右边按钮后按一次想要的组合"
 HINT_VOLUME: Final[str] = "点击互动与坐下时的音效音量"
 HINT_IDLE: Final[str] = "鼠标静止这么久后开始张望，再过一半时间坐下"
+
+#: `键盘` 那两行的提示（task19 §1.1）。
+#: ⚠ 键位那一条必须说清"**配一次、所有布局通用**"——用户看到 4 键与 8 键两套布局时
+#: 最先冒出来的问题就是"要不要各配一套"，答案是不用（键 id 跨布局通用，§2.23）。
+HINT_KEYVIEW_LAYOUT: Final[str] = "键盘形态的键位排布；只列出当前素材包里真的有的"
+HINT_KEYVIEW_KEYS: Final[str] = (
+    "点一个键位，再按键盘上的键即可绑定；配一次所有布局通用"
+)
 
 #: `边缘抗锯齿` 那一行的提示（task15 §4 的逐字要求）。
 #: ⚠ **必须如实写清"收益 + 代价"**，不许只写好处：算法**不保证**对所有素材
@@ -148,14 +164,42 @@ PET_SAVE_FAILED_HINT: Final[str] = "保存失败，重启后会回到原来的�
 #: 坏包被拒时的标题（正文见 `_report_broken_pet()`）。
 BROKEN_PET_TITLE: Final[str] = "换角色失败"
 
+# ---------------------------------------------------------------- 键盘（task19）
+
+#: 换布局成功 / 重置成功的状态栏提示。**不写"重启后生效"**——这两项是**即时生效**的
+#: （task19 §4.5），写那句话会把已经生效的事情说成还没生效。
+KEYVIEW_LAYOUT_APPLIED: Final[str] = "键位布局已切换到「{layout}」"
+KEYVIEW_KEYS_RESET: Final[str] = "键位映射已清空"
+KEYVIEW_KEY_BOUND: Final[str] = "键位 {key_id} 已绑定为 {name}"
+
+#: 录到一个键、但**没能写进配置**时的说法（写失败回滚那一条）。
+KEYVIEW_SAVE_FAILED: Final[str] = "键位没能保存"
+
+#: 重置**没能写进配置**时的说法。
+KEYVIEW_RESET_FAILED: Final[str] = "键位没能清空"
+
 
 class FieldKind(Enum):
-    """控件的**种类**（界面按它造控件，不按 key 硬编码）。"""
+    """控件的**种类**（界面按它造控件，不按 key 硬编码）。
+
+    | 取值 | 用在 | 控件 |
+    | --- | --- | --- |
+    | `COMBO` | `角色` / `键位布局` | 下拉 |
+    | `CHECK` | `开机自启` / `边缘抗锯齿` | 勾选框 |
+    | `KEYSEQ` | `呼出快捷键` | `keycapture.KeyCaptureEdit`（**组合**） |
+    | `SLIDER` | `音量` / `久置时间` | 滑块 + 数值标签 |
+    | `KEYGRID` | `键位映射`（task19） | `keygrid.KeyGrid`（整组，不是一行） |
+
+    ⚠ 键位网格**必须**是新的一种，不许塞进 `COMBO` 分支里特判：
+    那会破坏"按种类分派"这条纪律（task19 §4.1 明写）。
+    布局下拉**可以**照 `pet` 的先例在 `COMBO` 分支里特判——它**就是**一个下拉。
+    """
 
     COMBO = "combo"
     CHECK = "check"
     KEYSEQ = "keyseq"
     SLIDER = "slider"
+    KEYGRID = "keygrid"
 
 
 class HotkeyOutcome(NamedTuple):
@@ -232,6 +276,33 @@ class AutostartOutcome:
 
 #: 开关开机自启的函数签名：`(要开启吗) -> AutostartOutcome`。由 `app.py` 装上。
 AutostartHandler = Callable[[bool], AutostartOutcome]
+
+
+@dataclass(frozen=True)
+class KeyviewOutcome:
+    """一次"换键盘布局"的结果（task19 §4.5）。
+
+    界面**不直接持有宠物窗口**（"不许在界面里直接持有宠物窗口/监听器"，
+    task19 §5）：它只把"换到哪个布局"交给 `app.py` 装的处理器，
+    处理器负责 content 换布局 + 重绘一次。
+
+    | 字段 | 语义 |
+    | --- | --- |
+    | `ok` | 这次换布局**真的成了**（画面已经是新布局） |
+    | `layout` | 最终生效的布局名（失败时是空串） |
+    | `reason` | 失败原因（成功时空串） |
+
+    ⚠ 与"写配置"**是两件事**：写配置失败由 `_write_field()` 那条路径管
+    （回滚 + 状态栏带系统原文），这里只回答"画面换没换过去"。
+    """
+
+    ok: bool
+    layout: str = ""
+    reason: str = ""
+
+
+#: 换键盘布局的函数签名：`(布局名) -> KeyviewOutcome`。由 `app.py` 装上。
+KeyviewChanger = Callable[[str], KeyviewOutcome]
 
 
 @dataclass(frozen=True)
@@ -320,6 +391,26 @@ FIELDS: Final[tuple[FieldSpec, ...]] = (
         hint=HINT_ANTIALIAS,
         kind=FieldKind.CHECK,
         implemented=True,
+    ),
+    # ---------------------------------------------------------------- 键盘（task19）
+    # ⚠ 这两行**都是即时生效**（不重启）：`keyview_layout` 只是换一张图，
+    # `keyview_keys` 连图都不换（映射不进图像）。与"抗锯齿/换角色要重启"不矛盾
+    # ——那两项改动代价大（重建滤镜 / 整个素材），这两项只是换一张图（task19 §4.5）。
+    FieldSpec(
+        group="键盘",
+        key="keyview_layout",
+        title="键位布局",
+        hint=HINT_KEYVIEW_LAYOUT,
+        kind=FieldKind.COMBO,
+    ),
+    FieldSpec(
+        group="键盘",
+        key="keyview_keys",
+        title="键位映射",
+        # ⚠ 这一行**不是一个控件**：`KEYGRID` 造出来的是整块网格 + 重置按钮，
+        # 它自己就带着标题与提示（见 `keygrid.KeyGrid`）。
+        hint=HINT_KEYVIEW_KEYS,
+        kind=FieldKind.KEYGRID,
     ),
 )
 
@@ -416,10 +507,17 @@ class SettingsWindow(QDialog):
         store: ConfigStore,
         current_pet: str = "",
         parent: QWidget | None = None,
+        keyview: KeyViewSpec | None = None,
     ) -> None:
         super().__init__(parent)
         self._store = store
         self._current_pet = str(current_pet or "")
+        #: 当前素材包的键盘形态（task19）。**`None` = 这个包没有键盘形态**
+        #: → 整组禁用 + 一句说明（task19 §4.2）。
+        #:
+        #: ⚠ 它是**构造时快照**：换角色要重启（task11/13 已定），所以一个窗口
+        #: 存活期间素材包不会换——与"档位/镜像启动时读一次"同一条规矩。
+        self._keyview: KeyViewSpec | None = keyview
         #: **守卫标志**：程序自己在动控件（初值填充 / 失败回滚）时为真，
         #: 槽函数见到就返回。**没有它，回滚会再触发一次写入**（死循环）。
         self._applying = False
@@ -451,6 +549,13 @@ class SettingsWindow(QDialog):
         #: 开关开机自启的处理器（task14，由 `app.py` 装）。
         #: `None` = 自检里那种"不真动启动文件夹"的场景 → 只刷新状态、不写盘。
         self._autostart_handler: AutostartHandler | None = None
+        #: 换键盘布局的处理器（task19，由 `app.py` 装）。
+        #: `None` = 自检里那种"没有宠物窗口"的场景 → 只写配置、不动画面。
+        self._keyview_changer: KeyviewChanger | None = None
+        #: 键位网格控件（`_build_control` 里填）。`None` = 没造（理论上不会）。
+        self._key_grid: keygrid.KeyGrid | None = None
+        #: 布局下拉的候选（`_fill_layout_combo()` 里填；**来自素材包，不是白名单**）。
+        self._layouts: tuple[str, ...] = ()
         #: 最近一次"重启成功"已经发生（供自检观察；**不写配置**）。
         self.restart_requested = False
 
@@ -537,7 +642,14 @@ class SettingsWindow(QDialog):
         return container
 
     def _build_control(self, field: FieldSpec) -> QWidget:
-        """按 `FieldKind` 造控件（**唯一的按种类分派处**）。"""
+        """按 `FieldKind` 造控件（**唯一的按种类分派处**）。
+
+        ⚠ 键位网格走的是**自己的分支**（`KEYGRID`），不是"在 COMBO 里特判"：
+        它就是另一种控件（整块网格 + 重置按钮，不是一行）。
+        布局下拉**是**一个下拉，所以照 `pet` 的先例在 `COMBO` 分支里特判。
+        """
+        if field.kind is FieldKind.KEYGRID:
+            return self._build_key_grid(field)
         if field.kind is FieldKind.COMBO:
             widget: QWidget = QComboBox()
             widget.currentIndexChanged.connect(lambda _index: self._on_combo(field))
@@ -599,6 +711,30 @@ class SettingsWindow(QDialog):
         self._value_labels[field.key] = value_label
         return container
 
+    def _build_key_grid(self, field: FieldSpec) -> QWidget:
+        """键位网格（task19 §4.3）：**整组**，不是一个"行里的控件"。
+
+        ## 这个分支与其它四种不一样，两处要特别说明
+
+        1. **它自带标题与提示**：网格的右上角要放重置按钮（task19 §4.4 的位置要求），
+           所以组名那一行由 `keygrid.KeyGrid` 自己排，返回值是一个 `QGroupBox`
+           而不是"等着被 `QFormLayout` 摆到右边"的控件；
+        2. **两个信号都不直接写配置**：`binding_requested` / `reset_requested`
+           交给 `_on_key_binding` / `_on_key_reset`，由那两条统一走
+           `ConfigStore.apply()`（task19 §5 明写"不许新增第二套写配置的路径"）。
+
+        ⚠ 挂起监听的钩子**从 `app.py` 装的处理器里拿**，不是界面自己去找监听器：
+        界面不许直接持有监听器（task19 §5）。见 `set_keyview_changer()`。
+        """
+        box, grid = keygrid.build_group(self)
+        grid.binding_requested.connect(self._on_key_binding)
+        grid.reset_requested.connect(self._on_key_reset)
+        self._key_grid = grid
+        # `_widgets[key]` 登记的是**网格本身**，刷新与回滚都按它找
+        # （与 `KEYSEQ` 登记 `KeyCaptureEdit` 同一个模式）。
+        self._widgets[field.key] = grid
+        return box
+
     # ------------------------------------------------------------ 读配置
 
     def _load_from_config(self) -> None:
@@ -614,8 +750,12 @@ class SettingsWindow(QDialog):
         self._applying = True
         try:
             self._fill_pet_combo()
+            # ⚠ 键盘那两行**先**填：网格要按"最终采用的布局"来摆，
+            # 而布局的最终取值要先把下拉填好才定得下来（见 `_fill_layout_combo`）。
+            self._fill_layout_combo()
+            self._fill_key_grid()
             for field in FIELDS:
-                if not field.key or field.key == "pet":
+                if not field.key or field.key in ("pet", "keyview_layout"):
                     continue
                 widget = self._widgets.get(field.key)
                 if widget is None:
@@ -752,6 +892,93 @@ class SettingsWindow(QDialog):
         combo.setCurrentIndex(index)
         self._sync_pet_tooltip()
 
+    # ------------------------------------------------------------ 键盘（task19）
+
+    def _fill_layout_combo(self) -> None:
+        """填布局下拉：**只列素材包里真的有的布局**（task19 §4.2）。
+
+        ⚠ 候选**取自 `keyview.layout_names`**，不是 `keyview_spec.LAYOUTS` 那张白名单：
+        白名单是"哪些名字合法"，而已用列表是"这个包真的画得出来哪几个"——
+        白名单之外的已经在解析时被忽略了，某个布局缺图也会被 `pet_loader` 筛掉。
+        用白名单当候选的结果就是"下拉里有一半选了没反应"。
+
+        ## 三种情况
+
+        | 情况 | 行为 |
+        | --- | --- |
+        | 没有键盘形态 / 一个可用布局都没有 | 整组禁用 + 一句说明 |
+        | 配置里的布局不存在 | 显示**回退后**那个 + 一句提示（**不静默改配置**） |
+        | 正常 | 选中所配置的（空串 = 清单里第一个） |
+        """
+        combo = self._widgets.get("keyview_layout")
+        grid = self._key_grid
+        keyview = self._keyview
+        if not isinstance(combo, QComboBox):
+            return
+
+        available = keyview.layout_names if keyview is not None else ()
+        self._layouts = tuple(available)
+        combo.clear()
+
+        if not available:
+            # ⚠ **整组禁用**（下拉空、网格空、重置禁用）+ 一句说明，
+            # 与"开机自启"未实现时的样式一致：**禁用而不是隐藏**（task11 §5）。
+            reason = (
+                keygrid.TEXT_NO_KEYVIEW if keyview is None else keygrid.TEXT_NO_LAYOUT
+            )
+            if grid is not None:
+                grid.set_layout(None)
+                grid.apply_bindings({})
+                grid.set_group_enabled(False, reason)
+            combo.setEnabled(False)
+            combo.setToolTip(reason)
+            return
+
+        combo.setEnabled(True)
+        combo.setToolTip("")
+        for name in available:
+            combo.addItem(name)
+
+        configured = str(self._store.get("keyview_layout") or "").strip()
+        used = configured if configured in available else available[0]
+        combo.setCurrentIndex(available.index(used))
+
+        if grid is not None:
+            grid.set_group_enabled(True)
+            if configured and configured not in available:
+                # **回退后显示 + 一句提示**（task19 §4.2）：
+                # ⚠ **不静默改配置**——用户可能只是暂时换了素材包，
+                # 把配置改掉就等于替他做了决定（下次换回来时布局没了）。
+                grid.set_hint(
+                    keygrid.TEXT_LAYOUT_FALLBACK.format(missing=configured, used=used)
+                )
+            else:
+                grid.set_hint("")
+
+    def _fill_key_grid(self) -> None:
+        """按当前布局摆网格 + 填绑定（**只读**：打开窗口不写盘）。
+
+        ⚠ 绑定经过 `normalize_bindings()`：**配置里不存在的键 id 在这里被丢掉**，
+        而且**绝不写回**（§2.10 读操作只读，task19 §4.6）。
+        """
+        grid = self._key_grid
+        if grid is None:
+            return
+        layout = None
+        if self._layouts:
+            name = str(self._store.get("keyview_layout") or "").strip()
+            used = name if name in self._layouts else self._layouts[0]
+            grid.set_layout(self._layout_spec(used))
+            layout = grid.layout
+        bindings = normalize_bindings(self._store.get("keyview_keys"), self._keyview)
+        grid.apply_bindings(bindings_for_layout(bindings, layout))
+
+    def _layout_spec(self, name: str):
+        """按名字取布局规格（没有就是 `None`）。**只读**。"""
+        if self._keyview is None:
+            return None
+        return self._keyview.layout(name)
+
     # ------------------------------------------------------------ 状态栏
 
     def refresh_status(self) -> None:
@@ -845,6 +1072,22 @@ class SettingsWindow(QDialog):
                 widget.set_shortcut_text(str(value))  # type: ignore[attr-defined]
             elif field.kind is FieldKind.CHECK:
                 widget.setChecked(bool(value))  # type: ignore[attr-defined]
+            elif field.kind is FieldKind.KEYGRID:
+                # 键位映射：真值来源**就是这条路径**（task19 §4.4 "握写失败 → 网格回到原样"）。
+                if isinstance(widget, keygrid.KeyGrid):
+                    bindings = normalize_bindings(value, self._keyview)
+                    widget.apply_bindings(bindings_for_layout(bindings, widget.layout))
+            elif field.kind is FieldKind.COMBO:
+                # 布局下拉：回滚到配置里的真值（**包括它指向一个不存在的布局**
+                # 那种情况——那时 `_fill_layout_combo` 会把它显示成回退后那个）。
+                self._fill_layout_combo()
+                if isinstance(widget, QComboBox):
+                    name = str(value or "").strip()
+                    used = name if name in self._layouts else (
+                        self._layouts[0] if self._layouts else ""
+                    )
+                    if used in self._layouts:
+                        widget.setCurrentIndex(self._layouts.index(used))
         finally:
             self._applying = False
 
@@ -1095,9 +1338,204 @@ class SettingsWindow(QDialog):
             return
         self._set_status_text(f"呼出快捷键已改为 {text}")
 
+    # ------------------------------------------------------------ 键盘（task19）
+
+    def set_keyview(self, keyview: KeyViewSpec | None) -> None:
+        """告诉窗口"当前素材包有什么键盘形态"（task19；`app.py` 用）。
+
+        ⚠ 在 `__init__` **之后**调用会错过一次 `_load_from_config()`
+        ——所以正常路径是把 `keyview` 传进构造函数（见 `SettingsController.open()`），
+        本方法只用于"窗口已经开着、外部换了素材包"那种将来才会有的场景。
+        真调到时**重新填一遍键盘那两行**，免得窗口显示的还是旧素材包的布局。
+        """
+        self._keyview = keyview
+        self._applying = True
+        try:
+            self._fill_layout_combo()
+            self._fill_key_grid()
+        finally:
+            self._applying = False
+
+    def set_keyview_changer(self, changer: KeyviewChanger | None) -> None:
+        """装上"换键盘布局"的处理器（task19；`app.py` 用）。
+
+        与 `set_hotkey_changer()` 同一个模式：**装没装决定这一行走哪条路**。
+        没装（自检里）→ 只写配置；装了 → **先切画面、切成功了再写配置**。
+
+        ⚠ 与本窗口其余处理器同一条教训：`SettingsController.open()` 里
+        **每个新窗口都要重新装**，否则第二次打开设置窗口换布局
+        **只写配置、画面不动**（又一种假成功）。
+
+        ⚠ 挂起按键监听也走它：界面**不许直接持有监听器**（task19 §5）。
+        处理器内部调 `KeyListenerController.set_suspended()`。
+        """
+        self._keyview_changer = changer
+        grid = self._key_grid
+        if grid is not None:
+            grid.set_suspend_hook(
+                None if changer is None else self._suspend_for_capture
+            )
+
+    def _on_layout_combo(self, field: FieldSpec) -> None:
+        """换了键位布局：**先切画面、切成功了再写配置**（与 `_on_keyseq` 同一条纪律）。
+
+        ## 顺序为什么不能反
+
+        | 顺序 | 后果 |
+        | --- | --- |
+        | 先写配置、再切 | 切不过去时磁盘上已经是一个**画面没在用**的布局，
+        | | 下次启动会照着它去恢复（而它可能又不可用了） |
+        | **先切、再写**（本实现） | 切不过去 → 配置与下拉都回到真实状态 |
+
+        ⚠ 布局**不像换角色那样要重启**（task19 §4.5）：所有布局共用 `keyview.cell`，
+        切布局不改窗口尺寸、不动锚点——所以这里是即时生效 + 重绘一次。
+        """
+        combo = self._widgets.get(field.key)
+        if not isinstance(combo, QComboBox):
+            return
+        index = combo.currentIndex()
+        if not 0 <= index < len(self._layouts):
+            return
+        layout = self._layouts[index]
+
+        # 先把网格摆成新布局（**这一步不能失败**：布局名来自素材包）。
+        previous = str(self._store.get("keyview_layout") or "").strip()
+        grid = self._key_grid
+        if grid is not None:
+            grid.set_layout(self._layout_spec(layout))
+            grid.set_hint("")
+            grid.apply_bindings(
+                bindings_for_layout(self._visible_bindings(), grid.layout)
+            )
+
+        if not self._write_field(field, layout):
+            # 写失败：`_write_field` 已经回滚了控件（见 `_rollback`），
+            # 这里只补一句"画面已经换了但没记住"（绝不显示假成功）。
+            logger.error("设置：%s（布局 %s）", KEYVIEW_SAVE_FAILED, layout)
+            self._append_status(KEYVIEW_SAVE_FAILED)
+            return
+
+        applied = True
+        if self._keyview_changer is not None:
+            outcome = self._keyview_changer(layout)
+            applied = bool(outcome.ok)
+            if not applied:
+                # 切不过去：把下拉与配置都退回真实状态（磁盘上永远是真的能用的那个）。
+                logger.warning("设置：布局 %s 切不过去：%s", layout, outcome.reason)
+                self._last_failure = outcome.reason or "画面没能切到这个布局"
+                if previous != layout:
+                    self._write_field(field, previous)
+                self.refresh_status()
+                return
+
+        if applied:
+            self._set_status_text(KEYVIEW_LAYOUT_APPLIED.format(layout=layout))
+
+    def _refresh_key_grid(self) -> None:
+        """按**配置里的真值**重填网格（写成功之后的回填；只在 `_applying` 里改控件）。
+
+        ⚠ 与 `_fill_key_grid()` 分开：那一个**连布局一起重摆**（打开窗口时用），
+        这一个只刷绑定（录入/重置之后用）——重摆布局会把用户正看着的网格
+        整个重建一遍，按钮的焦点与录入态都会莫名其妙地丢。
+        """
+        grid = self._key_grid
+        if grid is None:
+            return
+        bindings = self._visible_bindings()
+        self._applying = True
+        try:
+            grid.apply_bindings(bindings_for_layout(bindings, grid.layout))
+        finally:
+            self._applying = False
+
+    def _visible_bindings(self) -> dict[str, KeyBinding]:
+        """配置里**当前素材包真的有的**绑定（丢弃不存在的键 id，**不写回**）。
+
+        网格与两条写路径都以它为基础——这样"配置里留着一个不存在的键 id"
+        不会因为一次无关的录入被**顺手写掉**（§2.10 读操作只读，task19 §4.6）。
+        """
+        return normalize_bindings(self._store.get("keyview_keys"), self._keyview)
+
+    def _on_key_binding(self, key_id: str, vk: int, name: str) -> None:
+        """某个键位录到了一个键：写 `keyview_keys`（**唯一那条写配置的路**）。
+
+        ⚠ **不自动解绑别的键位**（决策 2）：同一个物理键可以绑到多个键位，
+        提示日志已经在 `keygrid` 里记过了。
+
+        ⚠ 写失败 → 网格**回滚到配置里的真值**（不是"改之前那个值"），
+        与其余各行同一条规矩（task19 §4.4 / §6）。
+        """
+        field = self._field_for("keyview_keys")
+        if field is None:  # pragma: no cover - 字段表一定有它
+            return
+        bindings = self._visible_bindings()
+        bindings[key_id] = KeyBinding(vk=int(vk), name=str(name))
+        payload = bindings_to_config(bindings)
+
+        if not self._write_field(field, payload):
+            # ⚠ 写失败时 `_write_field` 已经按 `field.kind` 回滚过网格了
+            # （`_rollback()` 里那条 KEYGRID 分支），这里只补一句后果说明。
+            logger.error("设置：%s（%s -> %s）", KEYVIEW_SAVE_FAILED, key_id, name)
+            self._append_status(KEYVIEW_SAVE_FAILED)
+            return
+        # 写成功 → **按配置回填一次**（判据以磁盘为准）。
+        #
+        # ⚠ 这一步不是多余的：网格上按钮的文字在录入那一刻就自己改了，
+        # 但"哪些键位绑着"这份状态**只有配置是权威**。不重填的话，
+        # 网格自己的 `_bindings` 还停在旧值上 —— 重置按钮的可用性、
+        # 以及"同一个键绑在几个键位上"那条提示日志都会与配置对不上。
+        self._refresh_key_grid()
+        self._set_status_text(KEYVIEW_KEY_BOUND.format(key_id=key_id, name=name))
+
+    def _on_key_reset(self) -> None:
+        """重置：写 `keyview_keys = {}`（**一次点击释放全部映射**，task19 §4.4）。
+
+        写成功 → 网格立刻全部回到"未设置" + 监听层立刻生效（`settings_changed`
+        由 `app.py` 接上 `set_bindings()`，不用重启）。
+        写失败 → `_write_field` 已经回滚，这里只补一句提示。
+        """
+        field = self._field_for("keyview_keys")
+        if field is None:  # pragma: no cover
+            return
+        if not self._write_field(field, {}):
+            logger.error("设置：%s", KEYVIEW_RESET_FAILED)
+            self._append_status(KEYVIEW_RESET_FAILED)
+            return
+        # 写成功 → 按配置回填（现在的配置是空对象 → 网格全变「未设置」）。
+        # 失败那一支不用管：`_write_field` → `_rollback()` 已经把网格还原了。
+        self._refresh_key_grid()
+        self._set_status_text(KEYVIEW_KEYS_RESET)
+
+    def _suspend_for_capture(self, suspended: bool) -> None:
+        """录入期间挂起按键监听（**唯一出口**：界面不持有监听器）。
+
+        ⚠ 没装处理器时是**空操作**，且**不报错**：自检与"没有 KV"的场景下
+        本来就没有监听器可挂起。
+        """
+        changer = self._keyview_changer
+        hook = getattr(changer, "set_suspended", None) if changer is not None else None
+        if callable(hook):
+            hook(bool(suspended))
+            return
+        logger.debug("键位录入：没有装可挂起的监听处理器（%s）", suspended)
+
+    @staticmethod
+    def _field_for(key: str) -> FieldSpec | None:
+        """按配置键找那一行（`FIELDS` 是唯一真相源，不另存一份）。"""
+        return next((item for item in FIELDS if item.key == key), None)
+
     def _on_combo(self, field: FieldSpec) -> None:
-        """角色下拉换了：写 `pet`，坏包则退回默认形象 + 提示详情。"""
+        """下拉换了。**两个下拉走两条路**（就与 `开机自启` 与别的勾选框一样）。
+
+        | 行 | 候选真值 | 换了之后 |
+        | --- | --- | --- |
+        | `角色` | 磁盘上发现的包 | 写配置 → 问要不要重启（task11/13） |
+        | `键位布局`（task19） | 当前素材包的 KV 布局 | **先切画面、切成功了再写配置** |
+        """
         if self._applying:
+            return
+        if field.key == "keyview_layout":
+            self._on_layout_combo(field)
             return
         combo = self._widgets.get(field.key)
         if not isinstance(combo, QComboBox):
