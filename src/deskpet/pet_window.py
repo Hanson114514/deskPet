@@ -1754,10 +1754,13 @@ class PetWindow(QWidget):
             # （它负责**写配置** + 调 `toggle_form()`）。
             # 没装（自检）时菜单项本来就是灰的，到不了这里；真到了也什么都不做。
             if self._form_handler is not None:
+                # ⚠ 条件表达式末尾**不能**留逗号：括起来的多行表达式一旦有尾逗号
+                # 就变成一元元组 `("keyview",)`，形态名再往下走就成了
+                # "未知形态 ('keyview',)，拒绝切换"（task19 实测踩到）。
                 target = (
                     FORM_PET
                     if self._content.form == FORM_KEYVIEW
-                    else FORM_KEYVIEW,
+                    else FORM_KEYVIEW
                 )
                 self._form_handler(target)
         elif item_id == context_menu.ID_MIRROR:
