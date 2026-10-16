@@ -81,6 +81,7 @@ from .config import ConfigStore
 from .context_menu import FORM_KEYVIEW, FORM_PET, MenuState
 from .drag import DEFAULT_DIRECTION, DragController
 from .idle_state import IdleStateMachine
+from .key_listener import KeyListener  # noqa: F401  （装配层用；打包静态分析要收全）
 from .keyview_spec import KeyViewSpec
 from .mirror import MirrorState
 from .pet_spec import PetSpec
@@ -297,6 +298,14 @@ class AnimationDriver(QObject):
         self._timer.start(interval)
 
 
+#: 合并复绘的节拍（毫秒，task18 4.3）。
+#:
+#: 收到 `keys_changed` **不当场重绘**：一次重绘（遮罩 + 半透明窗口）实测约 **41 ms**
+#: （agent.md 4.9），高速连打时连打会积压成一串没人看得清的中间态。
+#: 这里用一个**单次**定时器把它合并：期间再来变化只**重置**定时器，不叠加。
+REPAINT_INTERVAL_MS: Final[int] = 16
+
+
 class PetWindow(QWidget):
     """宠物主窗口（task05：按素材帧率持续播放当前动作）。"""
 
@@ -437,6 +446,25 @@ class PetWindow(QWidget):
         #: 而档位仍然只由 `_apply_level()` 一处决定——两条别混。
         self._content: _Content = self._pet_content
         self._driver.frame_due.connect(self._on_frame_due)
+
+        # ---------------------------------------------------------- 按键联动（task18）
+        #: 按键监听器（`app.py` 装进来）。`None` = 没有监听（自检里常见）——
+        #: 此时 `pressed` 只能由 `set_pressed()` 直接喂（K1 的入口，行为与 task17 相同）。
+        #: ⚠ 本类**不创建**监听器：它的生命周期（随形态与可见性启停）是装配层的事，
+        #: 窗口只管"收到信号之后做什么"。
+        self._key_listener: QObject | None = None
+        #: **合并复绘**的单次定时器（task18 4.3）。收到按键变化**不当场重绘**：
+        #: 一次重绘（遮罩 + 半透明窗口）实测约 41 ms，连打会积压成一串没人看得清的中间态。
+        #: 期间再来变化只**重置**定时器，不叠加——所以 1 秒内 N 次变化最多出 1/16 ms 次重绘。
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.setTimerType(Qt.PreciseTimer)
+        self._repaint_timer.setInterval(REPAINT_INTERVAL_MS)
+        self._repaint_timer.timeout.connect(self._on_repaint_due)
+        #: 真的重绘了几次（自检与诊断用："合并复绘"那条验收直接盯它）。
+        self.repaint_count = 0
+        #: 收到过几次按键变化信号（与 `repaint_count` 比出来的就是合并率）。
+        self.pressed_signal_count = 0
         #: 片段序列播完 → 收尾（双击挥手播完回 `idle`，task10 §2 第 4 条）。
         self._animation.sequence_done.connect(self._on_sequence_done)
         #: 已经显示过的帧号（**用来跳过无变化的重绘**，见 `_on_frame_due`）。
@@ -794,6 +822,66 @@ class PetWindow(QWidget):
         target = FORM_PET if self._content.form == FORM_KEYVIEW else FORM_KEYVIEW
         return self.set_form(target)
 
+    def set_key_listener(self, listener: "QObject | None") -> None:
+        """装上按键监听器（task18 的装配接缝，`app.py` 用）。
+
+        `None` 卸下。装上之后：`keys_changed` -> **合并复绘** -> `set_pressed()`。
+
+        ⚠ **本类不启停监听器**：什么时候该轮询（形态 == KV 且窗口可见且没被挂起）
+        是装配层的判断（task18 4.4），窗口这里只回答"收到变化之后做什么"。
+        """
+        if self._key_listener is not None:
+            try:
+                self._key_listener.keys_changed.disconnect(self._on_keys_changed)
+            except (RuntimeError, TypeError):  # pragma: no cover - 已经断开/对象没了
+                pass
+        self._key_listener = listener
+        if listener is not None:
+            listener.keys_changed.connect(self._on_keys_changed)
+
+    @property
+    def key_listener(self) -> "QObject | None":
+        """当前装着按键监听器吗（只读；改它请用 `set_key_listener()`）。"""
+        return self._key_listener
+
+    @property
+    def repaint_pending(self) -> bool:
+        """合并复绘定时器还在等吗（诊断与自检用）。"""
+        return self._repaint_timer.isActive()
+
+    def _on_keys_changed(self, pressed: tuple) -> None:
+        """收到"按下的键变了"：**记下状态、重置合并定时器**，不当场重绘。
+
+        ## 为什么不当场重绘（task18 4.3）
+
+        一次重绘（重算 `QRegion` + 半透明窗口合成）实测约 **41 ms**（agent.md 4.9）。
+        在信号处理里直接 `update()` / `apply_mask()` 会积压：高速连打时
+        事件队列里排的是一串**没人看得清的中间态**，越追越晚。
+
+        ## 为什么状态**当场**写进 content
+
+        图像要的是"最终那一份 `pressed`"，不是"每一次变化的回放"。
+        所以这里立刻把状态写进画源（不重绘），到点时画的就已经是**最新**的状态
+        ——中间那些变化天然被合并掉了，这正是"合并"的语义。
+        """
+        self.pressed_signal_count += 1
+        content = self._keyview_content
+        if content is not None:
+            content.pressed = keyview_render.pressed_tuple(pressed)
+        # 重置（不是在原有基础上叠加）：`start()` 会重新计时，
+        # 于是"连续变化"被合并成"最后一次变化之后 REPAINT_INTERVAL_MS"一次重绘。
+        self._repaint_timer.start()
+
+    def _on_repaint_due(self) -> None:
+        """合并窗口到点：**现在**才重绘 + 重算遮罩。
+
+        不在 KV 形态时直接返回：那种情况下监听器本来就该是停的（收到信号是装配层
+        的时序问题），这里再兜一层，绝不白画一张没人看的图。
+        """
+        if self._content.form != FORM_KEYVIEW:
+            return
+        self.repaint_count += 1
+        self._repaint_current()
     def set_pressed(self, pressed: object = ()) -> bool:
         """设置键盘形态的按键状态（**K1 的对外入口**）；返回画面变没变。
 

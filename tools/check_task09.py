@@ -773,10 +773,21 @@ def _run_checks() -> int:
         closes_bar,
         "独立顶层窗口要显式收起，否则它比宠物活得久",
     )
+    # ⚠ 判据必须是"**控制栏**没有被 QTimer 轮询驱动"，不是"app.py 里不许出现 poll
+    #   这个子串"（task18 加了按键轮询之后，后者会无谓地红掉——那是**用例脆**，
+    #   与 task17 插入菜单项时修过的那批断言同一种毛病）。
+    #   真正的判据：控制栏的跟随只由 `position_changed` 信号驱动，没有任何定时器
+    #   在"问宠物在哪"。
     check(
-        "app.py 用 Qt 的 QTimer 做控制栏轮询（不该有）",
-        "bar_controller" in app_src and "poll" not in app_src,
-        "位置变化一律靠信号",
+        "app.py 不拿 QTimer 做控制栏轮询（位置变化一律靠信号）",
+        "bar_controller" in app_src
+        and "position_changed" in app_src
+        and "sync_follow" in app_src
+        and not any(
+            tokens[i] == "QTimer" and "bar_controller" in tokens[max(0, i - 6) : i + 6]
+            for i in range(len(tokens))
+        ),
+        "跟随挂在 position_changed 上，不轮询",
     )
 
     # ------------------------------------------------------------ §15 目录干净

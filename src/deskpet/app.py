@@ -60,6 +60,7 @@ from .control_bar import RESERVED, ControlBar
 from .cursor_watch import CursorWatch
 from .errors import DataDirError
 from .idle_state import IdleStateMachine, normalize_idle_seconds
+from .key_listener import KeyListener, bindings_from_config
 from .mirror import MirrorState
 from .pet_loader import PetLoadError, list_reports, load_keyview, resolve_pet
 from .pet_spec import DEFAULT_PET_NAMESPACE, PetSpec
@@ -1421,6 +1422,79 @@ class FormController:
             )
 
 
+class KeyListenerController:
+    """把**按键监听**接到宠物窗口上（task18 的组装层，`app.py` 独有）。
+
+    ## 它要串起来的三件事
+
+    | 事 | 怎么做 |
+    | --- | --- |
+    | **启用条件** | 形态 == `keyview` **且** 窗口可见 **且** 没被挂起（三件事同时成立才轮询） |
+    | **喂状态** | 监听器 `keys_changed` -> 窗口的**合并复绘**（不在信号处理里直接重绘） |
+    | **停得干净** | 任一条件不成立 -> `set_enabled(False)`（停表 + `pressed` 清空，CPU 0） |
+
+    ## 为什么启用条件放在这里、不放在窗口里
+
+    "什么时候该轮询"是三件事的**合取**，其中两件（可见性、形态）由装配层驱动，
+    第三件（挂起）是 task19 的录入界面要用的接口（task18 4.4）。
+    窗口只管"收到变化之后做什么"——把合取放在窗口里就多一处要对齐的状态。
+
+    ## 挂起接口
+
+    `set_suspended(True)` 给 task19 的录入用（录一个键的时候不能让那个键
+    当场点亮）；本卡只**提供**它，不接线（task18 5 明写"不许做设置界面"）。
+    """
+
+    def __init__(self, window: PetWindow, store: ConfigStore) -> None:
+        self.window = window
+        self.store = store
+        #: 绑定表：**启动时从配置读一次**（`keyview_keys`）。
+        #: 配置是内存快照，运行期改磁盘不生效——与档位 / 镜像同一条规矩（agent.md 2.4）。
+        self.listener = KeyListener(
+            bindings=bindings_from_config(store.get("keyview_keys"))
+        )
+        #: **临时挂起**（task19 录入用）。与形态 / 可见性分开，恢复时各还各的。
+        self._suspended = False
+        window.set_key_listener(self.listener)
+        # 窗口的可见性变化驱动启停（隐藏 = 没人看，白烧 CPU，2.13 同一条纪律）。
+        window.visibility_changed.connect(lambda _visible: self.sync())
+
+    # ------------------------------------------------------------ 启停
+
+    def set_suspended(self, suspended: bool) -> None:
+        """临时挂起 / 恢复轮询（task19 的录入界面用）。"""
+        self._suspended = bool(suspended)
+        self.sync()
+
+    @property
+    def suspended(self) -> bool:
+        """现在是不是被临时挂起了（诊断与自检用）。"""
+        return self._suspended
+
+    def should_poll(self) -> bool:
+        """**启用条件**：形态 == KV 且窗口可见且没被挂起。
+
+        三个条件**都要成立**（task18 4.4）。判据是 `window.form` / `window.isVisible()`，
+        不另记布尔：多一个开关就多一处会对不上的状态（agent.md 2.13 同一条理由）。
+        """
+        return (
+            self.window.form == FORM_KEYVIEW
+            and self.window.isVisible()
+            and not self._suspended
+        )
+
+    def sync(self) -> None:
+        """按启用条件让监听器转 / 停（**唯一改它状态的地方**）。
+
+        停下来时监听器自己会**清空 `pressed`**（`KeyListener._sync`），
+        于是回来时不会带着一个"陈旧的按下"（task18 8 第 3 条）。
+        """
+        self.listener.set_enabled(self.should_poll())
+
+    def stop(self) -> None:
+        """退出收尾：停表（与其它驱动一样，`finally` 里做）。"""
+        self.listener.stop()
+
 def _report_resolution_problems(issues: tuple, fell_back: bool, config_pet: str | None) -> None:
     """把解析素材包时攒下的问题**一次性全部**写进日志（§2.10 第三类）。"""
     for issue in issues:
@@ -1807,6 +1881,39 @@ def run(argv: list[str] | None = None) -> int:
     if hotkey_result.combo is None:
         _logger.error("隐藏功能不可用：%s", hotkey_result.reason)
 
+    # ------------------------------------------------------------ 按键联动（task18）
+    #
+    # 组装放在**窗口 show() 之后**：启用条件里有一条是"窗口可见"，
+    # 它要窗口先起来才问得准（agent.md 4.9 同一条纪律）。
+    #
+    # ⚠ **不做**：不装键盘钩子、不开忙等线程（参考实现那条不 sleep 的 while）。
+    # 这里是一条 8 ms 的 `QTimer` 轮询（实测 28.9 us/轮 约 0.36% 单核），
+    # 只问**真正被绑定的**那几个 VK（task18 4.2）。
+    key_controller = KeyListenerController(window, store)
+    # 形态一切换就要重新判"该不该轮询"：进 KV 且可见 -> 开；回宠物 -> 停。
+    # 挂在 `set_form` 之后（`FormController.switch` / `restore` 都走它）。
+    _original_switch = form_controller.switch
+
+    def _switch_form_with_keys(form: str) -> bool:
+        """切形态 + **重新判一次该不该轮询**（task18 4.4 的启用条件）。
+
+        ⚠ 顺序是"先切、成功了再同步"：切失败（KV 不可用）时形态没变，
+        启用条件自然还是原来的结论，不需要为失败路径单独写一遍。
+        """
+        switched = _original_switch(form)
+        key_controller.sync()
+        return switched
+
+    window.set_form_handler(_switch_form_with_keys)
+    # 启动时那一次也要同步：配置里记的是 KV 形态时，监听器要**当场**转起来。
+    key_controller.sync()
+    _logger.info(
+        "按键联动：%s（绑定 %d 个键、%d 个 VK，轮询间隔 %d ms）",
+        "已启用" if key_controller.should_poll() else "未启用（不在键盘形态 / 窗口不可见）",
+        sum(len(ids) for ids in key_controller.listener.bindings.values()),
+        len(key_controller.listener.bindings),
+        key_controller.listener.interval_ms,
+    )
     # ------------------------------------------------------------ 尺寸控制栏（task09）
     #
     # 组装放在**窗口 show() 之后**：控制栏要读宠物的权威位置与自己所在屏幕，
@@ -1910,6 +2017,9 @@ def run(argv: list[str] | None = None) -> int:
         # （退出时用户手里正好开着设置的场合）。
         settings_controller.close()
         idle_timer.stop()
+        # 按键轮询必须**明确停掉**（task18）：与光标轮询一样是个常驻定时器，
+        # 留着会让"退出后还有残留"（task07 §6 最后一条的同一条纪律）。
+        key_controller.stop()
         # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条）。
         cursor_watch.stop()

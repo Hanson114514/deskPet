@@ -60,6 +60,13 @@ WAIT_TIMEOUT: Final[int] = 0x102
 #: 热键编号（同一个进程内唯一即可）。
 HOTKEY_ID: Final[int] = 1
 
+#: `GetAsyncKeyState` 返回值里"**此刻**按着"的那一位（高字节的最高位）。
+#:
+#: ⚠ **判据必须是这一位，不是 `state != 0`**：低字节是"自上次调用以来按过"
+#: 的**历史位**，它会在松开之后继续为真。写成 `state != 0` 的表现是
+#: "**点一下键就永远亮着**"（task18 §4.1 头号坑）。
+ASYNC_KEY_DOWN_MASK: Final[int] = 0x8000
+
 #: `GetMessageW` 的返回值：**-1 表示出错**，它不是"有消息"。
 _GETMESSAGE_ERROR: Final[int] = -1
 
@@ -126,6 +133,15 @@ if IS_WINDOWS:  # pragma: no cover - 原型声明，Windows 上才跑
     _user32.PostThreadMessageW.restype = wintypes.BOOL
     _user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
     _user32.GetCursorPos.restype = wintypes.BOOL
+
+    # --- 全局按键状态（task18 的键盘形态联动）
+    #
+    # ⚠ 返回类型**必须**是 `c_short`（16 位**有符号**）：高字节的最高位是
+    # "此刻按着"的标志，声明成 `wintypes.BOOL` 或让 ctypes 自己猜（默认
+    # `c_int`）都不会错得太离谱，但**负数的符号扩展**在别的写法下会漏掉
+    # 那一位——显式声明是"只信返回值里该看的那一位"这条纪律的第一步。
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
 
     # --- 命名互斥体（task13 的单实例机制，D6）
     #
@@ -230,6 +246,38 @@ def get_cursor_pos() -> tuple[int, int] | None:
     if not _user32.GetCursorPos(ctypes.byref(point)):
         return None
     return (int(point.x), int(point.y))
+
+
+def get_async_key_state(vk: int) -> bool:
+    """虚拟键码 `vk` **此刻**是不是按着的（`GetAsyncKeyState` 的薄封装）。
+
+    ## 为什么"不抢焦点、不需要管理员权限"
+
+    `GetAsyncKeyState` 读的是**全局**按键状态表，不装钩子、不装过滤器、
+    不要求前台窗口是我们。参考实现用的就是它（task18 §1.1），本项目沿用
+    ——**不许**换成 `SetWindowsHookEx`（钩子有"被系统摘掉"的风险，
+    还要处理超时回调，task18 §5 明写禁止）。
+
+    ## ⚠ 判据是高字节，不是"非零"
+
+    返回值 16 位，两半是**两件不同的事**：
+
+    | 位 | 含义 | 能不能当"现在按着"用 |
+    | --- | --- | --- |
+    | 低 8 位 | **自上次调用以来**按过（历史位） | ❌ **不能** |
+    | 高 8 位最高位 | **此刻**按着 | ✅ 唯一判据 |
+
+    写成"非零即按下"的后果是"**点一下键就永远亮着**"：低字节的历史位
+    在松开之后仍然为真（与 §4.20 的 GetLastError 那类坑同源——
+    **先看该看的那一位，别拿整个返回值当真**）。
+
+    非 Windows / DLL 没加载上 → False（**不抛异常**）：键盘联动是
+    可选功能，取不到就当作"没有键在按"（与 hotkey 的退化同一条纪律）。
+    """
+    if _user32 is None:  # pragma: no cover - 非 Windows
+        return False
+    state = int(_user32.GetAsyncKeyState(int(vk)))
+    return (state & ASYNC_KEY_DOWN_MASK) != 0
 
 
 # ------------------------------------------------------------------ 命名互斥体
