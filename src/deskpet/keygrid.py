@@ -433,14 +433,42 @@ class KeyGrid(QWidget):
         self._mouse_grabbed = False
 
     def eventFilter(self, obj, event) -> bool:  # noqa: ANN001 - Qt 签名
-        """录入期间的鼠标按下：**一律**记到正在录入的那个键位上。
+        """录入期间的鼠标与失活处理（task20）。
+
+        ## 鼠标按下：**一律**记到正在录入的那个键位上
 
         只处理 `MouseButtonPress`，其余（抬起 / 移动 / 键盘）**原样放行**：
         抬起放行是必须的，否则按钮的 `clicked` 永远不触发（Qt 要 press+release
         配对），"非录入态下点按钮进录入态"这条就坏了。
+
+        ## ⚠ 失活：**本程序**被切到后台 -> 必须收掉录入态（task20 修的严重 bug）
+
+        用户 2026 实测："在窗口失焦时按下按键 KV 就不生效"。成因是一条链：
+
+        ```text
+        录入态下点别的程序   -> 我们**收不到任何鼠标事件**（窗口失焦）
+                            -> 录入态永不结束
+                            -> 监听一直挂着（suspended=True）
+                            -> 回宠物窗口按什么键都不亮
+        ```
+
+        关键点是第二节：点**本程序之外**的窗口不会给我们送鼠标事件，所以
+        靠"点击"收尾是收不到的 —— 必须监听"整个应用失活"这件事本身。
+        `ApplicationDeactivate` 一发就收尾，于是切走再回来一定是好的。
+
+        ⚠ **不**在这里处理 `WindowDeactivate`（单个窗口失活）：在本程序内部
+        换窗口（点到宠物窗口）时它也会发，而那一下按用户要求应当**录成
+        鼠标左键**（由上面的 `MouseButtonPress` 分支处理）。两者用不同的
+        事件区分开，就不会互相打架。
         """
         if not self._mouse_grabbed or self._capturing is None:
             return super().eventFilter(obj, event)
+
+        if event.type() == QEvent.Type.ApplicationDeactivate:
+            # 整个程序被切到后台：这一下不可能再等到用户按鼠标了，收尾。
+            self._end_capture()
+            return super().eventFilter(obj, event)
+
         if event.type() != QEvent.Type.MouseButtonPress:
             return super().eventFilter(obj, event)
 

@@ -200,6 +200,35 @@ check("录入中再点自己 -> 录 MouseLeft（不是取消、不是卡住）",
       rec3 == [("r2k1", 0x01, "MouseLeft")] and gm3.button("r2k1").display_text == "MouseLeft",
       f"rec={rec3}")
 
+# ---- ⭐ 严重 bug：录入态下**整个程序失活**（用户点了别的程序）必须收尾
+#
+# 成因链：录入态下点别的程序 -> 我们**收不到任何鼠标事件**（窗口失焦）
+#        -> 录入态永不结束 -> 监听一直挂着 -> 回宠物窗口按什么键都不亮。
+# 用户 2026 实测：在窗口失焦时按下按键 KV 就不生效。
+gm6 = keygrid.KeyGrid(); gm6.set_layout(kv.layout("2*8")); gm6.apply_bindings({})
+susp_log = []
+gm6.set_suspend_hook(lambda on: susp_log.append(on))
+gm6.begin_capture("r1k1")
+check("录入态: 监听被挂起", susp_log == [True], f"log={susp_log}")
+app.sendEvent(app, QEvent(QEvent.ApplicationDeactivate))
+check("程序失活 -> **自动收掉录入态**（否则监听永远挂着）",
+      not gm6.capturing, f"capturing={gm6.capturing}")
+check("程序失活 -> 监听**恢复**（切走再回来按键还亮）",
+      susp_log == [True, False], f"log={susp_log}")
+check("程序失活 -> 键位标签不再卡着",
+      gm6.button('r1k1').display_text != '按下按键…',
+      f"r1k1={gm6.button('r1k1').display_text!r}")
+
+# ---- ⭐ 反向：程序内部换窗口**不能**被当成失活（那一下该录成鼠标左键）
+gm7 = keygrid.KeyGrid(); gm7.set_layout(kv.layout("2*8")); gm7.apply_bindings({})
+log7 = []; rec7 = []
+gm7.set_suspend_hook(lambda on: log7.append(on))
+gm7.binding_requested.connect(lambda k, v, n: rec7.append((k, v, n)))
+gm7.begin_capture("r2k3")
+mouse_press(gm7.button("r2k4"), Qt.LeftButton)
+check("程序内点别的键位 -> 录 MouseLeft（不是被当成失活收掉）",
+      rec7 == [("r2k3", 0x01, "MouseLeft")], f"rec={rec7}")
+
 # ---- ⭐ 标签不再卡住：录入中改点别的键位 / 走重置
 gm4 = keygrid.KeyGrid(); gm4.set_layout(kv.layout("2*8")); gm4.apply_bindings({})
 gm4.button("r1k7").click()                  # 真实点击路径（clicked -> begin_capture）
