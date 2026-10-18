@@ -55,6 +55,7 @@ from . import geometry
 from . import hotkey as hotkey_mod
 from . import logger as log
 from . import paths, pet_loader, restart as restart_mod, size, single_instance
+from . import win32
 from .animation import UnknownActionError
 from .config import ConfigStore
 from .control_bar import RESERVED, ControlBar
@@ -1926,6 +1927,26 @@ def run(argv: list[str] | None = None) -> int:
     log.setup_logging()
     log.log_startup_banner()
     _logger.info("%s %s 启动（%s）", PROGRAM_NAME, __version__, paths.program_dir())
+    # **完整性级别**必须出现在启动行附近（task24 权限线）：
+    # 键盘形态靠 `GetAsyncKeyState` 读全局按键，而它受 UIPI 约束 ——
+    # 本进程是 `Low` 时，只要前台是普通（`Medium`）窗口就读不到任何键，
+    # 表现为「有焦点正常、一点别的窗口就全无反应」。级别偏低时**必须警告**，
+    # 否则这条症状会被误判成「系统不给按键」或「绘制坏了」（前两轮就是这么跑偏的）。
+    _integrity = win32.get_integrity_level()
+    _parent_pid = win32.get_parent_pid()
+    _parent_il = win32.get_integrity_level(_parent_pid) if _parent_pid else "?"
+    if _integrity in ("Medium", "High", "System"):
+        _logger.info("完整性级别：%s（父进程 pid=%d，级别 %s）", _integrity, _parent_pid, _parent_il)
+    else:
+        # **父进程是 Medium 而子是 Low** = 启动时被外部降权（安全软件/策略）。
+        # 这时光看「别用错方式启动」不够，必须把父进程的级别一起记下来。
+        _logger.warning(
+            "完整性级别：%s —— 偏低！此级别下前台是普通窗口时读不到按键，"
+            "键盘形态会表现为『失焦后按键不亮』。父进程 pid=%d（级别 %s）",
+            _integrity,
+            _parent_pid,
+            _parent_il,
+        )
 
     # 读配置（永不抛异常）。task02 起 **只建立这条链路**：
     # 档位不解释（task04）、位置不夹取（task08）、热键不注册（task12）。

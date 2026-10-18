@@ -280,6 +280,144 @@ def get_cursor_pos() -> tuple[int, int] | None:
     return (int(point.x), int(point.y))
 
 
+
+# ------------------------------------------------------------------ 完整性级别
+#
+# 为什么需要读这个：`GetAsyncKeyState` 受 **UIPI** 约束 ——
+# **低完整性级别**的进程，在“前台窗口属于更高完整性级别”时读到的**永远是 0**。
+# 用户机器上普通双击的程序都是 `Medium`；本程序若被以 `Low` 令牌启动
+# （例如由另一个受限进程派生），键盘形态就会表现为
+# “有焦点时正常、一点别的窗口就完全没反应”，而日志里只有 `GetAsyncKeyState` 全 0，
+# 看起来像“系统不给我们按键”。排查时必须能一眼看到自己跑在哪个级别。
+
+#: `TokenIntegrityLevel` 的已知值 → 名字。
+_INTEGRITY_LEVELS: Final[dict[int, str]] = {
+    0x0000: "Untrusted",
+    0x1000: "Low",
+    0x2000: "Medium",
+    0x3000: "High",
+    0x4000: "System",
+    0x5000: "Protected",
+}
+
+
+def get_integrity_level(pid: int | None = None) -> str:
+    """本进程的**完整性级别**名字（`Low` / `Medium` / `High` …）。
+
+    读不到时返回 ``"?"``（**不抛异常**：这只是一条诊断，不该影响启动）。
+    令牌里的 IL 是 `SID S-1-16-xxxx`，取**最后一个子权威值**。
+
+    ``pid`` 为 ``None`` 时看**本进程**；给别的 pid 就查那个进程（用来核对
+    "父进程是什么级别"——父是 Medium 而子是 Low，说明启动时被降权了）。
+    """
+    if not IS_WINDOWS:  # pragma: no cover - 非 Windows 分支
+        return "?"
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        # ⚠ 原型必须显式声明：不声明时 ctypes 把 HANDLE 当 32 位 int，
+        # 64 位下句柄被截断，OpenProcessToken 一定失败（本文件开头的坑）。
+        _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        _kernel32.OpenProcess.restype = wintypes.HANDLE
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+        target = _kernel32.GetCurrentProcessId() if pid is None else int(pid)
+        process = _kernel32.OpenProcess(0x1000, False, target)
+        if not process:
+            return "?"
+        try:
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(process, 0x0008, ctypes.byref(token)):
+                return "?"
+            try:
+                size = wintypes.DWORD(0)
+                advapi32.GetTokenInformation(token, 25, None, 0, ctypes.byref(size))
+                if not size.value:
+                    return "?"
+                buf = ctypes.create_string_buffer(size.value)
+                if not advapi32.GetTokenInformation(
+                    token, 25, ctypes.cast(buf, ctypes.c_void_p), size.value, ctypes.byref(size)
+                ):
+                    return "?"
+                sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                count = ctypes.cast(sid, ctypes.POINTER(ctypes.c_ubyte))[1]
+                base = ctypes.addressof(ctypes.cast(sid, ctypes.POINTER(ctypes.c_ubyte)).contents)
+                value = ctypes.cast(
+                    base + 8 + 4 * (count - 1), ctypes.POINTER(ctypes.c_uint)
+                ).contents.value
+                return _INTEGRITY_LEVELS.get(value, hex(value))
+            finally:
+                _kernel32.CloseHandle(token)
+        finally:
+            _kernel32.CloseHandle(process)
+    except Exception:  # noqa: BLE001 - 诊断绝不影响启动
+        return "?"
+
+
+def get_parent_pid() -> int:
+    """父进程 PID（`None`/0 读不到时返回 0）。
+
+    用 `CreateToolhelp32Snapshot` 遍历进程表匹配 `th32ParentProcessID`——
+    比 `NtQueryInformationProcess` 简单，且不需要额外权限。
+    """
+    if not IS_WINDOWS:  # pragma: no cover
+        return 0
+    try:
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        _kernel32.Process32FirstW.restype = wintypes.BOOL
+        _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        _kernel32.Process32NextW.restype = wintypes.BOOL
+
+        snap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID:
+            return 0
+        try:
+            me = _kernel32.GetCurrentProcessId()
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                if entry.th32ProcessID == me:
+                    return int(entry.th32ParentProcessID)
+                ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+            return 0
+        finally:
+            _kernel32.CloseHandle(snap)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def get_async_key_state(vk: int) -> bool:
     """虚拟键码 `vk` **此刻**是不是按着的（`GetAsyncKeyState` 的薄封装）。
 
