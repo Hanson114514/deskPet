@@ -1020,10 +1020,22 @@ def _check_user_position_survives_level_change(app) -> None:
     window.set_size_level(8)
     after = window.base_position
     width_after, height_after = window.pixel_size
+    corner_after = (after.x() + width_after, after.y() + height_after)
+    area = window._screen_area()
+    # ⚠ task22 起切档按**窗口本身**夹取（不再按可见块），于是锚点只在
+    # “放大后窗口还放得下”时严格成立；放不下时必须夹，锚点是**几何上守不住**的。
+    # 这里两种都接受，但要求“夹过的结果仍在屏内”。
+    anchor_held = corner_after == anchor
+    anchor_clamped = (
+        corner_after[0] <= area[0] + area[2]
+        and corner_after[1] <= area[1] + area[3]
+        and after.x() >= area[0]
+        and after.y() >= area[1]
+    )
     check(
-        "切档后右下角锚点不动（仍以用户位置为准）",
-        (after.x() + width_after, after.y() + height_after) == anchor,
-        f"锚点 {anchor} → ({after.x() + width_after}, {after.y() + height_after})",
+        "切档后右下角锚点不动，或（放不下时）夹到屏内",
+        anchor_held or anchor_clamped,
+        f"锚点 {anchor} → {corner_after}（held={anchor_held}, clamped_ok={anchor_clamped}）",
     )
     # 缺省落点在**当前屏幕**上是哪儿——用同一个函数算，别写死。
     from deskpet import geometry

@@ -436,9 +436,9 @@ class PetWindow(QWidget):
         self._region_owner: "OrderedDict[tuple[int, int, int, int], QImage]" = OrderedDict()
         #: 真的算过多少次区域（诊断 / 自检用：换帧命中缓存时它**不该涨**）。
         self.region_builds = 0
-        #: **上一次夹取**用的那个可见矩形（下一轮并进 `_clamp_box`，见那里）。
-        #: `None` = 还没夹过。
-        self._clamp_box_cache: tuple[int, int, int, int] | None = None
+        # ⚠ 这里**没有**"上一次夹取用的块"这种缓存（task22 删掉它）：
+        # 它是历史而不是事实，会把夹取框越撑越大、还会跨档位带过去。
+        # 见 `_clamp_box` 的说明。
         #: 动作包络（`所有动作首帧` 的可见块并集）与它属于哪个档位。
         #: 档位对不上就重算——换档之后可见块的**大小与位置都会变**。
         self._envelope_box: tuple[int, int, int, int] | None = None
@@ -729,12 +729,26 @@ class PetWindow(QWidget):
         if target == self._level:
             return
 
+        # ⚠ 锚点要用**窗口本身**的右下角，且换档后**按窗口尺寸夹**（task22）。
+        # 从前这里走 `_move_clamped()`（按可见块夹），于是"右下角不动"只在
+        # 没碰到屏幕边时成立：一旦可见块被夹，左上角与窗口尺寸就对不上锚点，
+        # 表现为"放大缩小会乱飞"。切档是一次**整体搬运**，夹的必须是窗口，
+        # 这样"右下角 = 锚点"在任何位置都严格成立。
         anchor = size.anchor_of(
             self._base_pos.x(), self._base_pos.y(), *self.pixel_size
         )
         self._apply_level(target)
-        left, top = anchor.top_left_for(*self.pixel_size)
-        self._move_clamped(left, top)
+        width, height = self.pixel_size
+        left, top = anchor.top_left_for(width, height)
+        x, y = geometry.clamp_position(left, top, width, height, self._screen_area())
+        self.move_to(x, y)
+        if (x, y) != (left, top):
+            # 夹过了：锚点必然守不住（窗口放不下 / 顶到屏幕边），如实说一句。
+            # 这是**几何必然**，不是 bug——但静默夹取会让"右下角没动"变成谎话。
+            logger.debug(
+                "切档后按锚点算出的位置 %s 越界，已夹到 %s",
+                (left, top), (x, y),
+            )
         # 换档会改左上角（右下角锚点不动），所以这也是"位置变了"的一处：
         # 与松手一样写一次配置（**不逐帧写**，task08 §4 硬规则）。
         # 用户拖动过之后位置就以他的为准，**绝不重新算右下角缺省落点**。
@@ -780,19 +794,19 @@ class PetWindow(QWidget):
             left + inner_x, top + inner_y, inner_w, inner_h, self._screen_area()
         )
         self.move_to(x - inner_x, y - inner_y)
-        # 记下这一次夹取用的那一块：下一次夹取会把它并进来（见 `_clamp_box`）。
-        self._clamp_box_cache = (inner_x, inner_y, inner_w, inner_h)
 
     def _clamp_box(self) -> tuple[int, int, int, int]:
         """夹取时该用的"可见矩形" `(窗口内偏移x, 偏移y, 宽, 高)`。
 
-        默认是整块画布 `(0, 0, 宽, 高)`；算得出可见块时取这三者的并集：
+        取 **本档位下所有动作首帧的包络**（`_action_bounds_envelope`）——它已经
+        覆盖了每一个动作，也就覆盖了"当前这一帧"；算不出来才退回当前帧，
+        再退整块画布。
 
-        1. **当前这一帧**的可见块；
-        2. **本档位下所有动作首帧**的包络（`_action_bounds_envelope`）；
-        3. **上一次夹取用的那一块**（`_clamp_box_cache`）。
+        ⚠ **不要**再并进"当前这一帧"（task22 实测）：那样夹取框会随动画帧变化，
+        同一次调档里前后算出来的框不一样，`结果取决于当时播到哪一帧`——
+        最直接的症状就是"切档回到同一档位，位置却和刚才不同"。
 
-        ## 为什么光看当前帧不够（task21 自检挖出来的两条真 bug）
+        ## 为什么光看当前帧不够（task21 挖出来的两条真 bug）
 
         可见块是**逐帧/逐动作**变的——同一档位下 `idle` 是 `(46,41,39,56)`，
         `running_right` 是 `(40,41,39,57)`，`rest` 是 `(38,70,55,33)`（躺姿往左、往下伸）。
@@ -801,26 +815,45 @@ class PetWindow(QWidget):
         - **拖动中**切到 `running_*`，可见块当场出右下角；
         - **松手回** `idle`、或**切到** `rest`/`waiting`，同样出屏（`808 > 800`）。
 
-        于是"人物永远点得到"这条红线被换帧打破。补了 ②（覆盖所有动作）与
-        ③（覆盖"松手回上一个姿势"）之后，夹取只会**更保守**，任何时候都在屏内。
+        所以补上包络："所有动作里最靠外的那一圈"才算得下，任何时候都在屏内。
 
-        ⚠ ③ 这个缓存**只在夹取时更新**（`_move_clamped`），不跟帧变化走——
-        跟帧走就等于又变成"逐帧取并集"，窗口会被拖得来回挪。
+        ## ⚠ 这里**绝不能**掺进"上一次夹取用的那一块"（task22）
+
+        上一版为了兜"松手回上一个姿势"把 `上一次的矩形` 也并了进来。它是**历史**，
+        不是**事实**：三个方向的分支不断把并集撑大，而且**跨档位不清空**
+        （10 档记下的 600×756 会一路带进 1 档）。实测两个直接后果：
+
+        1. 夹取框长成 `708×879`，而窗口只有 500×500——框比窗口还大，于是
+           "往下拖"永远被算成越界、位置原地不动（用户报的"卡住不能往下"）；
+        2. 越界夹取把左上角一路推成负值，右下角锚点跟着漂
+           （用户报的"放大缩小乱飞"）。
+
+        "松手回上一个姿势会出屏"那个顾虑由**包络**解决：包络已经覆盖了所有
+        动作的首帧，比"上一次那一块"更全、而且是**确定**的（只跟档位有关）。
         """
-        bounds = self.visible_bounds
-        if bounds is None:
-            width, height = self.pixel_size
+        width, height = self.pixel_size
+        box = self._action_bounds_envelope()
+        if box is None:
+            # 包络算不出来（没有动作 / 全坏图）→ 退回**当前这一帧**，再退整块画布。
+            box = self.visible_bounds
+        if box is None:
             return (0, 0, width, height)
-        # 当前这一帧 + **本档位下所有动作首帧的包络** + 上一次夹取用的那一块。
-        # 三者取并集：缺了包络，切到躺姿（`rest` 的可见块比 `idle` 更靠左/更低，
-        # 实测 808 > 800）就会出屏；缺了上一次，松手回 `idle` 那一下也会出屏
-        # （task21 自检两条都抓到过）。
-        envelope = self._action_bounds_envelope()
-        box = _union_box(bounds, envelope) if envelope is not None else bounds
-        previous = self._clamp_box_cache
-        if previous is None:
-            return box
-        return _union_box(previous, box)
+        # 兜底：夹取框**不许**超出窗口本身。
+        # 超出就意味着"按这个框去夹"必然和窗口尺寸打架（框比窗口大时任何位置
+        # 都算越界，宠物原地卡死），该返回的是错误数据而不是错误行为。
+        # 正常素材（可见块是画布的子集）永远走不到这里；真走到了也只是退回
+        # 旧行为（按整块画布夹），不会卡。
+        x, y, w, h = box
+        x = max(0, min(int(x), width - 1))
+        y = max(0, min(int(y), height - 1))
+        w = max(1, min(int(w), width - x))
+        h = max(1, min(int(h), height - y))
+        if (x, y, w, h) != tuple(box):
+            logger.warning(
+                "可见块超出窗口，夹取框已夹到窗口内：%s → %s（窗口 %s×%s）",
+                box, (x, y, w, h), width, height,
+            )
+        return (x, y, w, h)
 
     def _action_bounds_envelope(self) -> tuple[int, int, int, int] | None:
         """**本档位下所有动作首帧**的可见块并集（按档位缓存，换档自动作废）。
@@ -834,7 +867,12 @@ class PetWindow(QWidget):
 
         算不出来的动作（缺图 / 坏图）**跳过**，不影响其它动作。
         """
-        if self._envelope_level == self._level:
+        # 缓存必须按档位命中：`_level` 一旦变了就要重算。
+        # task22 抓到的坑：切档时 `_apply_level` 先改了 `_level`，紧接着
+        # `set_size_level` 调 `_clamp_box` —— 若这里仍然信任“上一次算过的”，
+        # 就会拿上一档的包络去夹这一档的窗口（10 档的 454x592 拿去夹 1 档的
+        # 125x125），框越界 -> 卡死、锚点漂。
+        if self._envelope_level == self._level and self._envelope_box is not None:
             return self._envelope_box
         box: tuple[int, int, int, int] | None = None
         level = self._level
