@@ -104,10 +104,13 @@ def section_integrity() -> None:
 
 
 def section_spec() -> None:
-    section("4. 定案修复在位：spec 必须声明管理员")
+    section("4. spec 不强制提权（task25 已改成按需提权）")
     spec = (ROOT / "deskpet.spec").read_text(encoding="utf-8")
-    check("deskpet.spec 含 uac_admin=True", "uac_admin=True" in spec)
-    check("deskpet.spec 不再残留 uac_admin=False", "uac_admin=False" not in spec)
+    # ⚠ 只看**赋值行**：说明文字里允许出现 uac_admin=True（那正是"别加它"）。
+    assignments = [
+        line for line in spec.splitlines() if line.lstrip().startswith("uac_admin") and "=" in line
+    ]
+    check("deskpet.spec 没有 uac_admin 赋值", not assignments, "; ".join(assignments))
 
     section("5. 卫生：源码里不许有令牌操作（提权只由清单做）")
     pattern = re.compile(r"SetTokenInformation|SetThreadToken|CreateRestrictedToken|SaferCompute")

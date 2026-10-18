@@ -366,6 +366,50 @@ def get_integrity_level(pid: int | None = None) -> str:
         return "?"
 
 
+def shell_execute_runas(program: str, parameters: str, directory: str) -> bool:
+    """以**管理员身份**拉起 `program`（`ShellExecuteW` + `"runas"`）。
+
+    返回是否**真的拉起成功**（`ShellExecuteW` 返回值 > 32 才算成功）。
+    用户点了「否」（撤销 UAC）不算异常：返回 `False` 即可，调用方应当
+    「什么都不做、继续用现在这个实例」，而不是报错退出。
+
+    ## 为什么不用 `QProcess.startDetached()`
+
+    `startDetached` 走 `CreateProcess`，**没有「请求提权」这个概念**
+    ——想要 UAC 只能走 Shell 的 `runas` 动词，那是 `ShellExecute` 的路径。
+    两者互补：task13 用前者做普通重启，task25 用这里做提权重启。
+    """
+    if not IS_WINDOWS:  # pragma: no cover - 非 Windows
+        return False
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        # ⚠ 返回 `HINSTANCE`：它有**两种含义**——成功时是 >32 的假句柄，
+        # 失败时是 0..32 的错误码。判据必须是 `> 32`，不能判非空。
+        shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+        SW_SHOWNORMAL = 1
+        result = shell32.ShellExecuteW(
+            None, "runas", program, parameters or None, directory or None, SW_SHOWNORMAL
+        )
+        value = ctypes.cast(result, ctypes.c_void_p).value or 0
+        if value > 32:
+            logger.info("提权启动：已拉起 %s %s", program, parameters)
+            return True
+        # 5 = SE_ERR_ACCESSDENIED（典型情况是用户在 UAC 里点了「否」）。
+        logger.info("提权启动：没有拉起（返回码 %s，5=用户取消/被拒绝）", value)
+        return False
+    except Exception as exc:  # noqa: BLE001 - 提权失败只能降级，不能崩
+        logger.warning("提权启动失败：%s: %s", type(exc).__name__, exc)
+        return False
+
+
 def get_parent_pid() -> int:
     """父进程 PID（`None`/0 读不到时返回 0）。
 

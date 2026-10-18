@@ -125,30 +125,26 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # **声明需要管理员**。
+    # ⚠ **不要**加 `uac_admin=True`（task25 定案，别再改回去）。
     #
-    # ## 真实根因（task24 定案，有日志与实测支撑）
+    # ## 为什么不做成"清单里强制提权"
     #
-    # 键盘形态靠 `GetAsyncKeyState` 读**全局**按键。它受 Windows 的 **UIPI**
-    # 约束：**低完整性级别的进程，在前台窗口属于更高完整性级别时读到的永远是 0**。
+    # 键盘形态读键受 UIPI 约束：**低完整性级别**进程在「前台窗口属于更高级别」时
+    # 读到的永远是 0（症状：有焦点正常、一点别的窗口就全无反应）。
     #
-    # 实测（用户机器）：双击本 exe 后进程的完整性级别是 **`Low`**，
-    # 而它周围每个窗口（Edge / 微信 / 记事本…）都是 `Medium`。于是
-    # "有焦点时按键正常、一点别的窗口就完全没反应" —— 与"绘制坏了"
-    # "轮询停了"长得一模一样，前两轮就是照那两条错误方向查的。
+    # 但"本进程是 Low"**只是某些机器上的现象**，不是普遍情况：
+    # 实测装了腾讯 ACE 反作弊驱动的机器上，**未签名 exe 会被降到 `Low`**
+    # （父进程 explorer 是 Medium，子进程却是 Low）；同一台机器上已签名的
+    # `python.exe`、Edge、微信都是 `Medium`。多数用户机器不会降权。
     #
-    # 同一台机器上 `python run.py`（Medium）完全正常，独立探针（Medium）
-    # 在 B 站前台时 10/10 读到按键 —— 差别只在**进程自己的完整性级别**。
-    # 提权到 `High` 后不再低于任何前台窗口，问题消失（用户实测确认）。
+    # 所以强制提权 = **给所有人加一次本不需要的 UAC**（还会让开机自启失效）。
+    # 现在的做法是**按需提权**：`app._maybe_offer_elevation()` 启动时检测级别，
+    # 只有真的是 `Low` 且素材包有键盘形态时才问一句"要不要以管理员重启一次"，
+    # 走 `restart.restart_self_elevated()`（`ShellExecuteW` + `runas`）。
     #
-    # `Low` 不是本程序自己要求的（清单里是 `asInvoker`，代码里没有任何令牌操作），
-    # 是启动时被外部机制降权：父进程 `explorer.exe` 是 `Medium`，子进程却是 `Low`。
-    # 这台机器上没查到 SRP / AppLocker / 兼容性标记 / 第三方安全软件，来源未明；
-    # 提权是一条绕开它的确定做法。
-    #
-    # ⚠ 代价（已知并接受）：手动双击会弹一次 UAC；开机自启那条线本次未改，
-    # 登录自启仍可能因 UAC 不生效，彻底解决需改用任务计划程序（最高权限）。
-    uac_admin=True,
+    # 也就是说：**用户没有点 UAC 提示的意义，就不该有那个提示。**
+    # 相关实现：`win32.get_integrity_level()` / `win32.shell_execute_runas()` /
+    # `restart.restart_self_elevated()` / `app._maybe_offer_elevation()`。
 )
 
 coll = COLLECT(

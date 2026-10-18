@@ -39,13 +39,14 @@ build_args()  →  startDetached()  →  真判返回值  →  成功才 handle.
 
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Final
 
 from PySide6.QtCore import QProcess
 
-from . import paths
+from . import paths, win32
 from .single_instance import SingleInstanceHandle
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,43 @@ def _start_detached(program: str, args: list[str], working_dir: str) -> bool:
         # `(ok, pid)`：**第一个元素才是判据**。
         return bool(result[0]) if result else False
     return bool(result)
+
+
+def restart_self_elevated(
+    handle: SingleInstanceHandle | None = None,
+    delay: float = RESTART_DELAY_DEFAULT,
+) -> bool:
+    """以**管理员身份**重启自己（task25）。
+
+    ## 什么时候用
+
+    Windows 的 UIPI 让**低完整性级别**进程读不到「前台是更高级别窗口」时的按键：
+    某些机器上（实测：装了腾讯 ACE 反作弊驱动的机器）**未签名的 exe 会被降到
+    `Low`**，于是键盘形态「有焦点正常、一点别的窗口就全无反应」。提权到 `High`
+    就不再低于任何前台窗口（用户实测确认）。
+
+    ## 与 `restart_self()` 的区别
+
+    只有一处：拉起新实例用的是 `ShellExecuteW(..., "runas", ...)`，会弹 UAC。
+    其余顺序**完全一致**——先拉起、真判返回值、成功才放锁；失败返回 `False`
+    且**当前实例继续运行**（绝不"关了自己却没起来"）。
+
+    ⚠ 用户在 UAC 里点「否」也返回 `False`：那不是错误，调用方按"保持现状"处理即可。
+    """
+    built = build_args(delay)
+    program, args = built[0], built[1:]
+    parameters = subprocess.list2cmdline(args) if args else ""
+    directory = working_directory()
+    logger.info("提权重启：准备以管理员身份拉起 %s %s（工作目录 %s）", program, parameters, directory)
+
+    if not win32.shell_execute_runas(program, parameters, directory):
+        logger.info("提权重启：没有发生（用户取消或系统拒绝），保持当前实例")
+        return False
+
+    logger.info("提权重启：新实例已拉起，开始交接单实例锁")
+    if handle is not None:
+        handle.release()
+    return True
 
 
 def working_directory() -> str:

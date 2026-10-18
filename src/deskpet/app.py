@@ -1223,6 +1223,76 @@ class AutostartController:
         return outcome
 
 
+def _maybe_offer_elevation(
+    app: QApplication,
+    window: "PetWindow",
+    instance: single_instance.SingleInstanceHandle,
+    integrity: str,
+) -> None:
+    """进程被降权时**问一句**要不要以管理员身份重启（task25）。
+
+    ## 为什么是「问一句」而不是「清单里强制提权」
+
+    键盘形态读键受 UIPI 约束：**低完整性级别**进程在「前台是更高级别窗口」时
+    读到的永远是 0 —— 症状是「有焦点正常、一点别的窗口就全无反应」。
+    实测：装了腾讯 ACE 反作弊驱动的机器上，**未签名 exe 会被降到 `Low`**；
+    多数用户的机器不会（未签名 exe 正常是 `Medium`），对他们强制 UAC 是纯打扰。
+
+    所以这里只在**真的被降权**时才提示：同意就提权重启，不同意就保持现状
+    （键盘会退化，其余功能照常）。当前实例**绝不自己退出**。
+
+    ⚠ 只问**一次**（`QTimer` 只排一发）；用户拒绝后本次运行不再打搅。
+    """
+    if integrity not in ("Low", "Untrusted"):
+        return
+    if window.keyview is None:
+        # 没有可用的键盘形态：读了也用不上，不值得为它弹 UAC。
+        _logger.info("进程完整性级别偏低（%s），但本素材包没有键盘形态：不提示提权", integrity)
+        return
+    if app.platformName() == "offscreen":  # pragma: no cover - 自检环境不弹窗
+        return
+
+    _logger.warning(
+        "进程完整性级别偏低（%s）：键盘形态在别的窗口处于前台时读不到按键。"
+        "询问用户是否以管理员身份重启",
+        integrity,
+    )
+    try:
+        answer = QMessageBox.question(
+            None,
+            "需要管理员权限",
+            (
+                "当前进程的权限被系统降到了「低完整性级别」，\n"
+                "这会让键盘形态在别的窗口处于前台时读不到按键\n"
+                "（只有本窗口在前台时才正常）。\n\n"
+                "是否以管理员身份重启一次？\n"
+                "选「否」则保持现状，桌宠其余功能不受影响。"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+    except Exception as exc:  # pragma: no cover - 弹窗失败按不重启处理
+        _logger.warning("提权询问框没能弹出来（%s）：保持现状", exc)
+        return
+    if answer != QMessageBox.StandardButton.Yes:
+        _logger.info("用户选择不提权：键盘形态可能读不到按键，其余功能照常")
+        return
+
+    if restart_mod.restart_self_elevated(instance):
+        # 与 RestartController 同一条纪律：**先拉起新实例、成功才关自己**。
+        app.quit()
+        return
+    # 没起来（用户在 UAC 里点了否 / 系统拒绝）：**不退出**，照常运行。
+    try:
+        QMessageBox.warning(
+            None,
+            "没有提权",
+            "没能以管理员身份重启（可能在 UAC 提示里点了「否」）。\n当前实例继续运行。",
+        )
+    except Exception:  # pragma: no cover
+        pass
+
+
 def _install_sigint_handler(app: QApplication) -> QTimer | None:
     """把 SIGINT（Ctrl+C）转成"退出请求"，并返回心跳定时器。
 
@@ -2333,6 +2403,12 @@ def run(argv: list[str] | None = None) -> int:
     idle_timer.setInterval(IDLE_TICK_MS)
     idle_timer.timeout.connect(idle_state.on_tick)
     idle_timer.start()
+
+    # 降权提示（task25）：**排一发**，等窗口与事件循环都就绪再问 ——
+    # 在 `app.exec()` 之前弹模态框会变成「窗口还没画出来就先弹个框」。
+    # 用户拒绝后本次运行不再打搅（只排一发）。
+    if _integrity in ("Low", "Untrusted"):
+        QTimer.singleShot(400, lambda: _maybe_offer_elevation(app, window, instance, _integrity))
 
     if args.exit_after is not None and args.exit_after >= 0:
         QTimer.singleShot(int(args.exit_after * 1000), window.close)
