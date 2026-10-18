@@ -229,6 +229,51 @@ mouse_press(gm7.button("r2k4"), Qt.LeftButton)
 check("程序内点别的键位 -> 录 MouseLeft（不是被当成失活收掉）",
       rec7 == [("r2k3", 0x01, "MouseLeft")], f"rec={rec7}")
 
+# ---- ⭐ 自愈：状态陈旧时必须被纠正（task20 失焦问题的兜底）
+#
+# 用户 2026 在**分发版**上实测：『只要窗口失焦 KV 就失效，点一下桌宠让焦点
+# 回来才恢复』。症状是『状态陈旧且没人来纠正』，所以加两条兜底：
+#   1. reconcile() 定期把『启用条件』与『监听器实际状态』对齐；
+#   2. visibility_changed 改由 Qt 的 showEvent/hideEvent 驱动，
+#      任何路径改变了可见性都会重判（原先只从 hide_pet/show_pet 发）。
+from deskpet.pet_window import PetWindow as _PW
+from deskpet.config import ConfigStore as _CS
+from deskpet.app import KeyListenerController as _KLC, FormController as _FC
+_tmp = ROOT / 'data' / 'task20_out'; _tmp.mkdir(parents=True, exist_ok=True)
+_store = _CS(path=_tmp / 'selfheal.json'); _store.load()
+_store.set('keyview_keys', {'r1k1': {'vk': 0x46, 'name': 'F'}})
+_w = _PW(pet, 6, config=_store, keyview=kv, keyview_layout='')
+_vis = []
+_w.visibility_changed.connect(lambda v: _vis.append(v))
+_w.show()
+for _ in range(10): app.processEvents()
+check('showEvent 会发 visibility_changed（不只 hide_pet/show_pet 那条路）',
+      True in _vis, f'vis={_vis}')
+_vis.clear(); _w.hide()
+for _ in range(10): app.processEvents()
+check('hideEvent 也会发 visibility_changed', False in _vis, f'vis={_vis}')
+_w.show()
+for _ in range(10): app.processEvents()
+_fc2 = _FC(_w, _store); _fc2.restore(); _w.set_form_handler(_fc2.switch)
+_kc = _KLC(_w, _store)
+_fc2.switch('keyview'); _kc.sync()
+check('KV 开着时监听器是启用的', _kc.listener.enabled, f'enabled={_kc.listener.enabled}')
+_kc.listener.set_enabled(False)
+check('人为制造不一致后确实不一致',
+      _kc.should_poll() and not _kc.listener.enabled,
+      f'should_poll={_kc.should_poll()} enabled={_kc.listener.enabled}')
+_kc.reconcile()
+check('reconcile() 把监听器**自愈**回来（失焦不再永久失效）',
+      _kc.listener.enabled and _kc.listener.running,
+      f'enabled={_kc.listener.enabled} running={_kc.listener.running}')
+_kc.listener._key_state = lambda vk: vk == 0x46
+_kc.listener.poll()
+_before = _kc.listener.pressed
+_kc.reconcile()
+check('一致时 reconcile() 不打扰（没清掉按着的键）',
+      _kc.listener.pressed == _before, f'{_before} -> {_kc.listener.pressed}')
+_kc.stop_reconcile(); _kc.stop(); _w.close()
+
 # ---- ⭐ 分发版专属：应用**从未激活**时，收尾仍然必须生效
 #
 # 这是上一轮只修了一半的原因：第一版只收 ApplicationDeactivate，而 Qt 只在

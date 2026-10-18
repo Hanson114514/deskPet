@@ -2138,6 +2138,29 @@ class PetWindow(QWidget):
         finally:
             painter.end()
 
+    def showEvent(self, event) -> None:  # noqa: ANN001 - Qt 签名
+        """窗口真的显示了 -> **通知一次**（task20 补）。
+
+        ## 为什么要在这里再发一次（`show_pet()` 里不是已经发过了吗）
+
+        `visibility_changed` 原先**只**从 `hide_pet()` / `show_pet()` 发。
+        但只要窗口的可见性从**别的路径**改变（Qt 自己恢复窗口、系统重建
+        顶层窗口、将来多一条显示路径），那个信号就不会响 —— 于是"该不该
+        轮询"的判断一直是旧的，KV 表现成"按什么都没反应"且**不会自愈**。
+        用户 2026 实测分发版："只要窗口失焦 KV 就失效，点一下桌宠焦点回来
+        才恢复"，正是这种"状态陈旧、没人来纠正"的症状。
+
+        挂在这里之后，判据变成"窗口**实际**的可见性"，而不是"谁调了哪个
+        方法"——多一条路径也不会漏。`sync()` 本身是幂等的，重复发无害。
+        """
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event) -> None:  # noqa: ANN001 - Qt 签名
+        """窗口真的藏起来了 -> **通知一次**（与 `showEvent` 同一条理由）。"""
+        super().hideEvent(event)
+        self.visibility_changed.emit(False)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         """左键按下：进入 **`Pressed`（候选拖动）**，此刻**不改任何状态**。
 

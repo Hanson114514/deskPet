@@ -1708,6 +1708,11 @@ class KeyListenerController:
 
         停下来时监听器自己会**清空 `pressed`**（`KeyListener._sync`），
         于是回来时不会带着一个"陈旧的按下"（task18 8 第 3 条）。
+
+        ⚠ 每次**状态真的变了**都记一行日志（task20 加的诊断）：
+        "失焦后 KV 不亮"这类问题必须能靠日志区分是哪一环出的错
+        （形态被切走 / 窗口不可见 / 被挂起 / 轮询其实在转但画面不动）。
+        只在变化时记，正常运行不刷屏。
         """
         want = self.should_poll()
         changed = want != self._last_polling
@@ -2188,6 +2193,10 @@ def run(argv: list[str] | None = None) -> int:
     window.set_form_handler(_switch_form_with_keys)
     # 启动时那一次也要同步：配置里记的是 KV 形态时，监听器要**当场**转起来。
     key_controller.sync()
+    # 再起一条**自愈**定时器：每分钟 60 次去核对"启用条件"与"监听器实际状态"，
+    # 不一致就纠正。它兜的是"某条路径改了状态却漏调 sync()"这类问题
+    # （用户 2026 实测分发版失焦后 KV 不亮、点回焦点才恢复，就是这种）。
+    key_controller.start_reconcile()
 
     # ------------------------------------------------------------ 键盘配置（task19）
     #
@@ -2326,6 +2335,7 @@ def run(argv: list[str] | None = None) -> int:
         idle_timer.stop()
         # 按键轮询必须**明确停掉**（task18）：与光标轮询一样是个常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条的同一条纪律）。
+        key_controller.stop_reconcile()
         key_controller.stop()
         # 光标轮询必须**明确停掉**：它是个 150 ms 的常驻定时器，
         # 留着会让"退出后还有残留"（task07 §6 最后一条）。
