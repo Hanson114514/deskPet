@@ -809,7 +809,7 @@ class PetWindow(QWidget):
         """
         bounds = self.visible_bounds
         if bounds is None:
-        width, height = self.pixel_size
+            width, height = self.pixel_size
             return (0, 0, width, height)
         # 当前这一帧 + **本档位下所有动作首帧的包络** + 上一次夹取用的那一块。
         # 三者取并集：缺了包络，切到躺姿（`rest` 的可见块比 `idle` 更靠左/更低，
@@ -1140,7 +1140,7 @@ class PetWindow(QWidget):
         # **节流**：已经在等就不要再 `start()`（那会把它重置成"最后一次变化之后
         # 再等 16 ms"，持续输入就永远画不出来）。没在等才起一拍。
         if not self._repaint_timer.isActive():
-        self._repaint_timer.start()
+            self._repaint_timer.start()
 
     def _on_repaint_due(self) -> None:
         """合并窗口到点：**现在**才重绘 + 重算遮罩。
@@ -2207,7 +2207,7 @@ class PetWindow(QWidget):
         """
         if event.button() == Qt.LeftButton:
             if self.drag_controller.active:
-            self._finish_drag(event.globalPosition().toPoint())
+                self._finish_drag(event.globalPosition().toPoint())
             elif self._press_pending:
                 self._cancel_press()
         super().mouseReleaseEvent(event)
