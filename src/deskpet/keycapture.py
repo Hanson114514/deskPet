@@ -24,7 +24,7 @@ import logging
 from typing import Final
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtWidgets import QPushButton, QWidget
+from PySide6.QtWidgets import QPushButton, QVBoxLayout, QWidget
 
 from . import hotkey_spec
 
@@ -457,14 +457,38 @@ class KeyCaptureEdit(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # ⚠ **必须有布局**（task23 修"呼出快捷键那一行不见了"）：
+        # 第一版把按钮直接 `QPushButton(self)` 就当子控件用、没有布局，于是
+        # `sizeHint()` 是 `(-1, -1)`、高度算出来是 **0**——只要外层表单换成一种
+        # "会把字段压扁"的行布局策略（task21 UX-12 把 `WrapLongRows` 改成
+        # `WrapAllRows` 就是），这一整行就变成 0 像素高，看起来像控件消失了。
+        # 布局一旦装上，`sizeHint` 就由按钮决定，任何行策略下都有正常高度。
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         self._button = QPushButton(self)
         self._button.clicked.connect(self.begin_capture)
+        layout.addWidget(self._button)
         self._listening = False
         self._pressed: list[str] = []
         #: 控件本身**不持有"当前快捷键"**：真值在配置里，这里只是显示。
         self._text = ""
         self.setFocusProxy(self._button)
         self._apply_button_text()
+
+    # ------------------------------------------------------------ 尺寸
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt 签名
+        """本控件的首选尺寸 = **里面那个按钮的**（高度尤其重要）。
+
+        装了布局之后 Qt 自己也能算出来；这里显式转发是把"高度必须 > 0"
+        写进代码：`QWidget` 的空 `sizeHint` 是 `(-1, -1)`，被行布局按 0 处理，
+        整行就会消失（task23 的症状）。
+        """
+        return self._button.sizeHint()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt 签名
+        """最小尺寸同理：按钮放得下就行，**不许**被压成 0 高。"""
+        return self._button.minimumSizeHint()
 
     # ------------------------------------------------------------ 只读
 
