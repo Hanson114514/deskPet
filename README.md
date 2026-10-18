@@ -98,11 +98,15 @@
 ### 方式二：从源码运行
 
 ```powershell
-pip install PySide6
+pip install -r requirements.txt
 python run.py
 ```
 
 `run.py` 是开发入口，会把 `src/` 加进搜索路径再调用 `deskpet.app.run()`。
+
+> ⚠ **不能只装 PySide6**：渲染链路（抗锯齿与低阈值遮罩）在模块顶层 import **NumPy**，
+> 少装它启动就会 `ModuleNotFoundError: No module named 'numpy'`。
+> 依赖的真值在 `pyproject.toml` 的 `dependencies`（task21 CODE-01 统一了这里）。
 
 ---
 
@@ -264,16 +268,19 @@ deskPet.exe --help               显示全部参数
 | --- | --- |
 | 操作系统 | **Windows 10 / 11（64 位）** |
 | Python | **3.14**（源码运行 / 构建时需要） |
-| 运行时依赖 | **PySide6** |
+| 运行时依赖 | **PySide6** + **NumPy**（真值见 `pyproject.toml` 的 `dependencies`） |
 | 构建依赖 | **PyInstaller 6.x** |
 | 网络 | **不需要**（程序运行期完全不联网） |
 
 ### 运行
 
 ```powershell
-pip install PySide6
+pip install -r requirements.txt
 python run.py
 ```
+
+依赖清单的真值是 `pyproject.toml`，`requirements.txt` 只是给"不会读 pyproject"的
+人准备的同一份（**两处一起改**）。
 
 ### 构建便携版
 

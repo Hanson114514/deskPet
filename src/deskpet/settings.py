@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -578,10 +579,17 @@ class SettingsWindow(QDialog):
         （task11 §4：不要靠"把窗口调高"来解决截断）。
         """
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
+        # 左右收到 8（task21 UX-12）：这 12 px 是**两侧各一份**，直接吃掉滚动区
+        # 内容宽度——而 8 键网格那一行正是"差十几像素就裁掉最后一列"的量级。
+        outer.setContentsMargins(8, 12, 8, 12)
         outer.setSpacing(8)
 
         body = QWidget()
+        # ⚠ **滚动区里的内容不许比视口宽**（task21 UX-12）：默认策略下 QScrollArea
+        # 的水平滚动条**关着**，内容比视口宽的部分直接被裁掉（标题、按钮都会缺一截）。
+        # 这里显式允许横向压缩，由行内的 wordWrap / 短标签消化宽度。
+        body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        body.setMinimumWidth(0)
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(8)
@@ -591,6 +599,9 @@ class SettingsWindow(QDialog):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # 横向不出滚动条：宽度问题必须由内容自己消化（见上面 body 的说明），
+        # 让用户横向滚才能看全一个设置项是本末倒置。
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
@@ -611,12 +622,20 @@ class SettingsWindow(QDialog):
         outer.addWidget(buttons)
 
     def _build_group(self, group: str) -> QGroupBox:
-        """一组：`QGroupBox` + 组内 `QFormLayout`（task11 §4，不用绝对坐标）。"""
+        """一组：`QGroupBox` + 组内 `QFormLayout`（task11 §4，不用绝对坐标）。
+
+        ## 行标题在左、控件在右；**太窄时自动上下排**（task21 UX-12）
+
+        原先用的是 `WrapLongRows`：它只在"字段比剩余宽度还宽"时把那一个字段换到
+        下一行，而 8 键网格这种**天生就比窗口宽**的控件永远满足那个条件——
+        于是标题行与网格反复互相挤压，表现是文字被裁。改成 `WrapAllRows`：
+        每一行都是"标题在上、控件在下"，宽度需求只剩**两者里最宽的那个**。
+        """
         box = QGroupBox(group)
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
 
         for field in FIELDS:
             if field.group != group:

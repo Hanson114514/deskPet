@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deskpet"
+version = "0.3.0"
+description = "一只住在 Windows 桌面上的透明宠物（PySide6）"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+
+# ⚠ **运行时依赖的真值只有这一处**（task21 CODE-01）。
+# 在这之前它们只散落在 README 与模块注释里，于是"按 README 新建环境"
+# 只装 PySide6 时会在启动的渲染链路上直接 `ModuleNotFoundError: numpy`
+# （`antialias.py` / `hit_test.py` 都在模块顶层 import 它）。
+# 改这里就够，README 与 `deskpet.spec` 都以本文件为准。
+dependencies = [
+    "PySide6>=6.6",
+    # 抗锯齿与"低阈值遮罩"都要按像素做向量化运算：纯 Python 逐像素实测 1885 ms/帧，
+    # numpy 版 49 ms（`antialias.py` 模块文档里有实测表）。用户已同意引入。
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# 打包用（只在做交付物时才需要，运行期不需要）。
+build = ["pyinstaller>=6.0"]
+
+[project.scripts]
+deskpet = "deskpet.app:run"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

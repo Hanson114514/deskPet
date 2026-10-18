@@ -667,6 +667,19 @@ def _clamped(window, x: int, y: int):
     return geometry.clamp_position(x, y, width, height, window._screen_area())
 
 
+def _visible_in_screen(window) -> bool:
+    """窗口位置是否让**当前画面的可见块**整块落在屏幕内（task21 UX-06）。"""
+    area = window._screen_area()
+    box = window._clamp_box()
+    left, top = window.base_position.x(), window.base_position.y()
+    return (
+        area[0] <= left + box[0]
+        and area[1] <= top + box[1]
+        and left + box[0] + box[2] <= area[0] + area[2]
+        and top + box[1] + box[3] <= area[1] + area[3]
+    )
+
+
 def _check_drag_events(app) -> None:
     from PySide6.QtCore import QPoint, Qt
 
@@ -691,10 +704,24 @@ def _check_drag_events(app) -> None:
     origin = window.base_position
     press_global = (origin.x() + 50, origin.y() + 60)
     window.mousePressEvent(_event("press", (50, 60), press_global))
-    check("按下后进入拖动", window.dragging is True)
+    # ⚠ task21 UX-03 起"按下"只进入 `Pressed`（候选拖动），**不是**拖动本身：
+    # 姿势、静置计时、指针、drag_started 全都要等越过阈值才动。
+    check("按下后**还没**进入拖动（Press ≠ Drag）", window.dragging is False)
+    check("按下后停在候选态", window._press_pending is True)
+    check("按下时不发 drag_started", len(started) == 0, f"{len(started)}")
+    check(
+        "按下时指针不变（不是'移动'形状）",
+        window.cursor().shape() != Qt.SizeAllCursor,
+        f"{window.cursor().shape()}",
+    )
+
+    # 移动 +120 / +40（用全局坐标算）：越过阈值的那一下才真正开始拖动。
+    move_global = (press_global[0] + 120, press_global[1] + 40)
+    window.mouseMoveEvent(_event("move", (170, 100), move_global))
+    check("越过阈值后进入拖动", window.dragging is True)
     check("发出 drag_started", len(started) == 1, f"{len(started)}")
     check(
-        "按下时的基准位置是权威位置（不是回读的窗口坐标）",
+        "拖动基准是按下时的权威位置（不是回读的窗口坐标）",
         window.drag_controller.state.base_pos == origin,
         f"{window.drag_controller.state.base_pos} vs {origin}",
     )
@@ -703,10 +730,6 @@ def _check_drag_events(app) -> None:
         window.cursor().shape() == Qt.SizeAllCursor,
         f"{window.cursor().shape()}",
     )
-
-    # 移动 +120 / +40（用全局坐标算，与按下点的差就是位移）。
-    move_global = (press_global[0] + 120, press_global[1] + 40)
-    window.mouseMoveEvent(_event("move", (170, 100), move_global))
     check(
         "拖动跟手：位置 = 基准 + 位移（再按屏幕夹取）",
         window.base_position == QPoint(*_clamped(window, origin.x() + 120, origin.y() + 40)),
@@ -778,14 +801,20 @@ def _check_drag_writes_config(app) -> None:
     store.load()
 
     window = _make_window(spec, config=store, level=1)  # 第 1 级：125×125
-    window.mousePressEvent(_event("press", (5, 5), (405, 305)))
-    window.mouseMoveEvent(_event("move", (200, 100), (600, 400)))
+    # 按下点用**窗口自己算出来的**全局坐标：task21 起"The press"与"拖动基准"
+    # 必须配同一个原点，写死的 (405,305) 一旦被夹取就对不上了。
+    origin2 = window.base_position
+    press2 = (origin2.x() + 5, origin2.y() + 5)
+    window.mousePressEvent(_event("press", (5, 5), press2))
+    window.mouseMoveEvent(_event("move", (200, 100), (press2[0] + 195, press2[1] + 95)))
     check(
         "拖动过程中**没有**写盘（松手前 config.json 里没有 position）",
         "position" not in json.loads(path.read_text(encoding="utf-8")),
         f"{json.loads(path.read_text(encoding='utf-8'))}",
     )
-    window.mouseReleaseEvent(_event("release", (200, 100), (600, 400), buttons=Qt.NoButton))
+    window.mouseReleaseEvent(
+        _event("release", (200, 100), (press2[0] + 195, press2[1] + 95), buttons=Qt.NoButton)
+    )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     check(
@@ -808,7 +837,8 @@ def _check_drag_writes_config(app) -> None:
 
     # 拖到屏幕外 → 写进配置的必须是**夹取后**的值。
     window2 = _make_window(spec, config=store, level=1)
-    window2.mousePressEvent(_event("press", (5, 5), (405, 305)))
+    origin3 = window2.base_position
+    window2.mousePressEvent(_event("press", (5, 5), (origin3.x() + 5, origin3.y() + 5)))
     area = window2._screen_area()
     far_x = area[0] + area[2] + 5000
     far_y = area[1] + area[3] + 5000
@@ -817,11 +847,12 @@ def _check_drag_writes_config(app) -> None:
     pos = window2.base_position
     width, height = window2.pixel_size
     payload2 = json.loads(path.read_text(encoding="utf-8"))
+    # ⚠ task21 UX-06 起夹的是**可见人物**，不是整块透明画布：
+    # 透明留白被允许跑出屏幕，判据因此改成"可见块整块在屏内"（产物自己的规则）。
     check(
-        "拖到屏幕外后：权威位置在屏内",
-        area[0] <= pos.x() <= area[0] + area[2] - width
-        and area[1] <= pos.y() <= area[1] + area[3] - height,
-        f"pos={pos} area={area} size={width}x{height}",
+        "拖到屏幕外后：可见人物整块在屏内",
+        _visible_in_screen(window2),
+        f"pos={pos} area={area} size={width}x{height} box={window2._clamp_box()}",
     )
     check(
         "配置里存的是**夹取后**的值（重启后仍在屏内）",
@@ -871,8 +902,13 @@ def _check_manual_and_idle_wiring(app) -> None:
     check("动作切到 rest", window.animation.action == "rest", f"{window.animation.action}")
 
     # 拖动：manual 必须被退出，动作控制权被挂起。
-    window.mousePressEvent(_event("press", (5, 5), (405, 305)))
-    check("拖动开始后挂起生效（动作控制权归拖动逻辑）", machine.suspended is True)
+    # ⚠ task21 起"先按下再移动"两个事件才算一次拖动（Press ≠ Drag）。
+    origin = window.base_position
+    press_global = (origin.x() + 5, origin.y() + 5)
+    window.mousePressEvent(_event("press", (5, 5), press_global))
+    check("**只按下**时还不算拖动（manual 与计时都不动）", machine.suspended is False)
+    window.mouseMoveEvent(_event("move", (60, 40), (press_global[0] + 55, press_global[1] + 35)))
+    check("越过阈值后挂起生效（动作控制权归拖动逻辑）", machine.suspended is True)
     check("manual 被拖动退出", machine.manual is False, f"manual={machine.manual}")
     check(
         "退出 manual 后静置计时归零（不是立刻又坐下）",
@@ -893,7 +929,9 @@ def _check_manual_and_idle_wiring(app) -> None:
     )
 
     release_at = _time.monotonic()
-    window.mouseReleaseEvent(_event("release", (5, 5), (405, 305), buttons=Qt.NoButton))
+    window.mouseReleaseEvent(
+        _event("release", (60, 40), (press_global[0] + 55, press_global[1] + 35), buttons=Qt.NoButton)
+    )
     check("松手后挂起解除", machine.suspended is False)
     check("松手回 idle", window.animation.action == "idle", f"{window.animation.action}")
 
@@ -937,6 +975,8 @@ def _check_manual_and_idle_wiring(app) -> None:
 def _check_user_position_survives_level_change(app) -> None:
     from PySide6.QtCore import QPoint, Qt
 
+    from deskpet import geometry
+
     section("13. 用户拖动过之后，切档不弹回右下角")
 
     spec = _load_spec()
@@ -954,10 +994,21 @@ def _check_user_position_survives_level_change(app) -> None:
     )
     check("拖动过之后 user_positioned 为真", window.user_positioned is True)
     dragged_to = window.base_position
-    # 期望值 = 基准位置 + 累计位移，再按**当时**的窗口尺寸夹取。
-    expect = _clamped(window, origin.x() + (500 - (origin.x() + 5)), origin.y() + (350 - (origin.y() + 5)))
+    # 期望值 = 基准位置 + 累计位移，再按**可见块**夹取（task21 UX-06）。
+    # ⚠ 不走 `_clamped()`：那一个按整块透明画布夹（task21 之前的规则），
+    # 而现在夹的是"人物真正有像素的那块"。所以期望值用几何层同一个函数算：
+    # 先把可见块换算成"它自己要落在哪"，夹完再减回窗口偏移。
+    box = window._clamp_box()
+    want = geometry.clamp_position(
+        origin.x() + (500 - (origin.x() + 5)) + box[0],
+        origin.y() + (350 - (origin.y() + 5)) + box[1],
+        box[2],
+        box[3],
+        window._screen_area(),
+    )
+    expect = (want[0] - box[0], want[1] - box[1])
     check(
-        "位置确实是用户拖出来的那个（基准 + 位移，按屏幕夹取后）",
+        "位置确实是用户拖出来的那个（基准 + 位移，按可见块夹取后）",
         dragged_to == QPoint(*expect),
         f"{dragged_to}（期望 {QPoint(*expect)}）",
     )
@@ -985,9 +1036,9 @@ def _check_user_position_survives_level_change(app) -> None:
     )
     check("切档后 user_positioned 仍为真", window.user_positioned is True)
     check(
-        "切档后位置在屏内（夹取生效）",
-        _clamped(window, after.x(), after.y()) == (after.x(), after.y()),
-        f"{after}",
+        "切档后可见人物整块在屏内（夹取生效，task21 UX-06）",
+        _visible_in_screen(window),
+        f"{after} box={window._clamp_box()}",
     )
 
 
@@ -1006,11 +1057,17 @@ def _check_no_temp_files(app) -> None:
     store.load()
 
     window = _make_window(spec, config=store)
-    window.mousePressEvent(_event("press", (5, 5), (405, 305)))
+    origin = window.base_position
+    press_global = (origin.x() + 5, origin.y() + 5)
+    window.mousePressEvent(_event("press", (5, 5), press_global))
     # 拖 60 次（模拟"拖动过程中逐帧来事件"）。
     for step in range(1, 61):
-        window.mouseMoveEvent(_event("move", (5, 5), (405 + step * 3, 305 + step)))
-    window.mouseReleaseEvent(_event("release", (5, 5), (405 + 180, 305 + 60), buttons=Qt.NoButton))
+        window.mouseMoveEvent(
+            _event("move", (5, 5), (press_global[0] + step * 3, press_global[1] + step))
+        )
+    window.mouseReleaseEvent(
+        _event("release", (5, 5), (press_global[0] + 180, press_global[1] + 60), buttons=Qt.NoButton)
+    )
 
     leftovers = sorted(p.name for p in scratch.iterdir())
     check(

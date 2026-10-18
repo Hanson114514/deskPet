@@ -260,6 +260,30 @@ def hit_test(
         return True
 
 
+def visible_bounds(region: QRegion | None) -> tuple[int, int, int, int] | None:
+    """区域里**真正有像素**的那一块外接矩形 ``(x, y, w, h)``；算不出来 → ``None``。
+
+    ## 它解决什么（task21 UX-06）
+
+    窗口的尺寸是**透明画布**的尺寸（素材 `cell`，500×500 或 540×420），
+    而人物只占其中一部分。按画布贴屏幕边缘时，人物与屏幕边之间还隔着
+    一大圈透明像素——"贴边"看起来根本没贴到（用户 2026 实测反馈）。
+    贴边要用**人物自己的边缘**，那正是本函数给的四元组。
+
+    ## 为什么直接用区域的外接矩形，不另数像素
+
+    区域本来就是"不透明像素的集合"（`region_for_frame()` 是唯一入口，
+    §2.8 / §4.9："不自己按 alpha 判定"），外接矩形就是它的 `boundingRect()`。
+    另写一份"扫 alpha 找边界"等于造第二个真值，迟早与遮罩对不上。
+
+    空区域 / `None` → `None`（调用方按"整块画布"处理，即退化成旧行为）。
+    """
+    if region is None or region.isEmpty():
+        return None
+    rect = region.boundingRect()
+    return (int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height()))
+
+
 def _scaled_for_test(image: QImage, width: int, height: int) -> QImage:
     """把图缩到 ``width × height`` 再做判定（已经同尺寸就原样返回）。
 

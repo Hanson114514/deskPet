@@ -1,0 +1,6 @@
+# 运行时依赖（与 pyproject.toml 的 [project].dependencies **同源**，两处一起改）。
+#
+# ⚠ NumPy 不是可选的：渲染链路（antialias.py / hit_test.py）在模块顶层 import 它。
+# 以前这里只有 PySide6，按文档新建环境会直接起不来（task21 CODE-01）。
+PySide6>=6.6
+numpy>=1.26

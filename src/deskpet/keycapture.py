@@ -23,7 +23,7 @@
 import logging
 from typing import Final
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from . import hotkey_spec
@@ -53,9 +53,10 @@ NO_MAIN_KEY: Final[str] = ""
 #: 没设过快捷键时按钮上的文字。
 UNSET_TEXT: Final[str] = "未设置"
 
-#: 键位录入态的按钮文字（task19 §4.3 逐字：按钮文字变 `按下按键…`）。
+#: 键位录入态的按钮文字（按钮很窄，见 `TEXT_MIN_ROOM_PX`；**完整含义**在
+#: 提示行与 tooltip 里那句"点一个键位，再按键盘上的键即可绑定"）。
 #: 与组合录入的 `LISTENING_SUFFIX` **故意不同**——两处的措辞各自是契约的一部分。
-LISTENING: Final[str] = "按下按键…"
+LISTENING: Final[str] = "按键…"
 
 # ------------------------------------------------------------- 单键录入（task19）
 
@@ -151,6 +152,32 @@ def modifiers_text(names: list[str] | tuple[str, ...]) -> str:
     return "+".join(ordered)
 
 
+#: 按钮文字左右各留的空（逻辑像素，task21 UX-12）。
+#:
+#: `QPushButton` 默认的内边距 + 边框合计约 12 px；这里压到 3 px，因为
+#: "录入中"那句提示 `按下按键…` 本身就有 60 px 宽——见 `TEXT_MIN_ROOM_PX`。
+TEXT_PADDING_PX: Final[int] = 3
+
+#: 键位按钮的文字区**至少要**这么宽（逻辑像素）。
+#:
+#: 由最长的状态提示 `按键…` 决定：它不能被省略（那是"它正在等我按"的唯一
+#: 提示），所以按钮必须放得下它。实测（本机字体，每个汉字 12 px）
+#: `按键…` = 36 px、`Ctrl` = 27 px，54 px 已是很宽裕的余量。
+#:
+#: ⚠ **比"整句 按下按键…"短**是刻意的：那句要 60 px，8 键一行就要 556 px，
+#: 而设置窗口的内容区只有 520 px（窗口宽度 560 是 task11 定案，不许为了它调大）。
+#: 完整含义交给 tooltip（"按下你想绑定的键"），按钮上保留动作 + 等待感。
+TEXT_MIN_ROOM_PX: Final[int] = 54
+
+#: 键位按钮的**首选宽度**（逻辑像素）= 文字区 + 左右内边距。
+#:
+#: 实测 `2*8` 布局一行 8 个按钮：每个 66 px 时一行 `8 × 66 + 7 × 4 = 556`；
+#: 原先按钮按文字宽度硬撑（`MouseRight` 一个就要 120 px），一行 980 px，
+#: 于是文字被裁、按钮互相挤压。长键名按宽度省略（`elidedText`），
+#: 而不是"按字数截"——中文字符与拉丁字母宽度差一倍，按字数截会一边太窄一边溢出。
+KEY_BUTTON_WIDTH: Final[int] = TEXT_MIN_ROOM_PX + 2 * TEXT_PADDING_PX
+
+
 class SingleKeyCaptureButton(QPushButton):
     """**单键**录入按钮（task19）：点一下 → 按键盘上的任意一个键 → 就绑上了。
 
@@ -193,6 +220,9 @@ class SingleKeyCaptureButton(QPushButton):
         super().__init__(parent)
         self._listening = False
         self._text = UNSET_TEXT
+        #: **外部**装的提示（`keygrid` 装的是键 id）。与绑定名字拼在一起显示，
+        #: 见 `setToolTip()` / `_compose_tooltip()`。
+        self._external_tip = ""
         self.clicked.connect(self.begin_capture)
         self._apply_text()
 
@@ -205,14 +235,31 @@ class SingleKeyCaptureButton(QPushButton):
 
     @property
     def display_text(self) -> str:
-        """按钮上现在显示的文字（**别叫 `text()`**，会与 Qt 撞名）。"""
-        return self.text()
+        """这个键位绑的**完整名字**（`未设置` 表示没绑）。**别叫 `text()`**，会与 Qt 撞名。
+
+        ⚠ **不是按钮上那串字**（task21 UX-12）：窄按钮上显示的是省略过的
+        （`MouseRight` → `Mou…ht`），而"绑的是谁"这件事只有完整名字说得清。
+        省略是渲染细节，换一个字号/DPI 就会变；把它放进 `display_text` 等于让
+        "绑定了什么"跟着界面布局漂移。
+        """
+        return self._text
 
     # ------------------------------------------------------------ 显示
 
     def set_key_text(self, name: str) -> None:
-        """把"这个键位现在绑的是谁"摆上去（空串 = 未设置）。**只改显示。**"""
+        """把"这个键位现在绑的是谁"摆上去（空串 = 未设置）。**只改显示。**
+
+        ⚠ **长名字会撑宽整个网格**（task21 UX-12）：键位按钮一行最多 8 个，
+        `MouseRight` / `NumDivide` 这种名字一个就要 130 px，8 个并排接近 1000 px——
+        设置窗口只有 560，于是按钮被挤扁、文字被裁掉（用户 2026 实测反馈）。
+        对策：按钮**宽度固定**、文字按宽度省略（`_apply_fitted_text`），完整名字
+        进 tooltip（`set_key_text` 负责拼），而 `display_text` 始终是完整名字。
+        """
         self._text = str(name or "") or UNSET_TEXT
+        # 完整名字进 tooltip：按钮上按宽度省略之后，这是唯一"看得全"的地方。
+        # ⚠ **不要覆盖**调用方装的提示（`keygrid` 装进去的是键 id，排查键位用）。
+        # 所以这里**接在后面**，而不是 `setToolTip` 一把刷掉。
+        self.setToolTip(self._compose_tooltip())
         if not self._listening:
             self._apply_text()
 
@@ -324,8 +371,69 @@ class SingleKeyCaptureButton(QPushButton):
     # ------------------------------------------------------------ 内部
 
     def _apply_text(self) -> None:
-        """按当前状态刷新按钮文字（**唯一**改文字的地方）。"""
-        self.setText(LISTENING if self._listening else (self._text or UNSET_TEXT))
+        """按当前状态刷新按钮文字（**唯一**改文字的地方）。
+
+        ⚠ **只改屏幕上的字，不改真值**（task21 UX-12）：`display_text` / tooltip /
+        配置里存的一律是**完整名字**，只有"画到按钮上"这一步按宽度省略。
+        所以"显示的是不是全名"不该由调用方判断——想拿全名读 `display_text`。
+        """
+        text = LISTENING if self._listening else (self._text or UNSET_TEXT)
+        self._apply_fitted_text(text)
+
+    def setToolTip(self, text: str) -> None:  # noqa: N802 - Qt 签名
+        """记住**外部**装的提示（键 id 之类），与绑定名字拼在一起显示。
+
+        ⚠ 必须拦截：`set_key_text()` 也要往 tooltip 里写完整名字，两者直接抢
+        同一个字段的话，谁后写谁赢——键 id 会消失（task21 自检抓到的）。
+        """
+        self._external_tip = str(text or "")
+        super().setToolTip(self._compose_tooltip())
+
+    def _compose_tooltip(self) -> str:
+        """键 id + 完整键名：**一行一条**（键 id 在最前，它才是有区分度的那个）。
+
+        分成两行而不是拼成一句：`keygrid` 装的键 id（`r2k8`）是排查用的，
+        绑定名（`MouseRight`）是给人看的，两者职责不同，不该粘成一个词。
+        """
+        parts = [self._external_tip, str(self._text or "") if self._text != UNSET_TEXT else ""]
+        return "\n".join(part for part in parts if part)
+
+    def _apply_fitted_text(self, text: str) -> None:
+        """把 `text` 按按钮可用宽度省略后画上去（**唯一的显示出口**）。
+
+        宽度是 `KEY_BUTTON_WIDTH`（布局给的就是这个宽度），放不下就**尾部**省略
+        （`MouseRight` → `MouseR…`）——取尾部而不是中间，是因为键名的前缀
+        才是有区分度的部分（`MouseLeft` / `MouseRight` 的中间一模一样）。
+        完整名字始终在 tooltip 里。
+        """
+        # ⚠ **放得下就原样画**，不许省略（task21 自检抓到的）：`QFontMetrics
+        # .elidedText()` 在"刚好放得下"时仍然会返回带 `…` 的串——它给 `…` 留了
+        # 位置。而 `按下按键…`（60 px 宽）正是"刚好放得下"的那一档：被压成
+        # `按…` 之后，用户根本看不出"它正在等我按"。
+        # 所以先量一次：宽度够就不动它（这也顺带保住 `F` / `Esc` 这类短标签）。
+        text = str(text)
+        metrics = self.fontMetrics()
+        room = max(1, KEY_BUTTON_WIDTH - 2 * TEXT_PADDING_PX)
+        if metrics.horizontalAdvance(text) <= room:
+            self.setText(text)
+            return
+        self.setText(metrics.elidedText(text, Qt.ElideRight, room))
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt 签名
+        """**首选宽度固定成 `KEY_BUTTON_WIDTH`**（高度照文字走）。
+
+        ⚠ 不改它的话，`QPushButton` 会按**完整文字**报宽度 → 8 键一行照样要
+        900 多像素，省略本身也就白做了（父布局是按 sizeHint 排的）。
+        """
+        base = super().sizeHint()
+        return QSize(KEY_BUTTON_WIDTH, base.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt 签名
+        """最小宽度与首选一致：这一列**不该**被压得更窄（再窄就只剩省略号了）。
+
+        一行放得下这种事由"按钮更少"还是"窗口更宽"决定，不靠把按钮压扁。
+        """
+        return QSize(KEY_BUTTON_WIDTH, super().minimumSizeHint().height())
 
 
 class KeyCaptureEdit(QWidget):

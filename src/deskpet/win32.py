@@ -143,6 +143,19 @@ if IS_WINDOWS:  # pragma: no cover - 原型声明，Windows 上才跑
     _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     _user32.GetAsyncKeyState.restype = ctypes.c_short
 
+    # --- 热键子线程建窗口用的那几个（task21 CODE-02）
+    #
+    # ⚠ 这几个原先在 hotkey.py 里"裸调"：只说得出名字，没有原型。
+    # 不声明原型时 ctypes 把返回值当 32 位 int——`GetModuleHandleW` /
+    # `CreateWindowExW` 返回的句柄在 64 位下会被**截断**，截断后的句柄拿去
+    # `RegisterClassExW` / `CreateWindowExW` 时好坏取决于高位的运气
+    # （典型表现是"建窗口失败"或"注册成功却收不到消息"）。
+    # 原型**只允许在这一层声明**（本模块是项目唯一的 ctypes 出口）。
+    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    _user32.DestroyWindow.argtypes = [wintypes.HWND]
+    _user32.DestroyWindow.restype = wintypes.BOOL
+
     # --- 命名互斥体（task13 的单实例机制，D6）
     #
     # ⚠ 返回值（`HANDLE`）**必须声明**：不声明时 ctypes 按 32 位 `int` 取，
@@ -206,6 +219,25 @@ def unregister_hotkey(hwnd: int | None, hotkey_id: int) -> bool:
         return False
     clear_last_error()
     return bool(_user32.UnregisterHotKey(hwnd, hotkey_id))
+
+
+def get_module_handle() -> int:
+    """本进程的模块句柄（`GetModuleHandleW(None)`）。取不到 → 0。
+
+    ⚠ 返回类型**必须**声明成 `HMODULE`（指针宽度）：不声明时 ctypes 按 32 位
+    `int` 取，64 位下高位被截断（task21 CODE-02）。取不到返回 0 而不是抛异常：
+    "拿不到句柄"在调用方那里是"建窗口失败"，走的是同一条退化路径。
+    """
+    if _kernel32 is None:  # pragma: no cover - 非 Windows
+        return 0
+    return int(_kernel32.GetModuleHandleW(None) or 0)
+
+
+def destroy_window(hwnd: int) -> bool:
+    """销毁一个窗口（`DestroyWindow`）。句柄为 0 / 非 Windows → False。"""
+    if _user32 is None or not hwnd:  # pragma: no cover - 非 Windows
+        return False
+    return bool(_user32.DestroyWindow(hwnd))
 
 
 def get_message() -> tuple[int, int, int] | None:

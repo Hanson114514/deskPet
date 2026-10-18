@@ -5,10 +5,18 @@
 1. **禁止回读窗口实时坐标**（`pos()` / `geometry()`）：窗口位置是**异步生效**的，
    回读会拿到旧值，表现就是"拖动只走一小截"。位移一律用
    `base_pos + (当前全局坐标 − 按下时的全局坐标)`。
-2. **位移基准是按下那一刻的位置**，`update()` 的参数是**相对按下点的累计位移**
-   （不是相邻两次移动的增量）。按增量累加会把窗口越拖越飞。
+2. **位移基准是按下那一刻的位置**，窗口位置 = 基准 + **相对按下点的累计位移**
+   （按增量累加会把窗口越拖越飞）。
 3. **不设速度阈值**：切跑动动作只看水平位移的**符号**。加阈值会让慢速拖动
    时动作来回闪（"11.0 fps 的跑动"那种观感问题不是这里能修的）。
+
+## "位置"与"方向"用的是两种位移（task21 UX-01）
+
+- **位置**：`当前全局坐标 − 按下时的全局坐标`（累计）。这个量永远指不回
+  "刚刚往哪边动"，所以它**不能**用来判方向。
+- **方向**：`当前全局坐标 − 上一个鼠标事件`（相邻）。用户"先左后右"时
+  只有它能正确地在越过按下点之前就切到 `running_right`。
+  反转另有 `DIRECTION_SWITCH_EPSILON` 的抖动防抖（见那个常量）。
 
 ## 为什么 `direction_action()` 是纯函数
 
@@ -41,6 +49,16 @@ RUNNING_RIGHT: Final[str] = "running_right"
 #: 没有方向依据时的起跑方向（agent.md §4.6："以朝右起跑"）。
 DEFAULT_DIRECTION: Final[str] = RUNNING_RIGHT
 
+#: 切换跑动方向前，**新方向**至少要累计走过的水平距离（屏幕逻辑像素）。
+#:
+#: 防的是鼠标的高频抖动：相邻两个 `mouseMoveEvent` 之间常常只差 1~2 px，
+#: 一换方向就要换动作，动作会**从起始帧重播**（跑动反复"起跑"，task21 UX-04）。
+#: 取 8：大于抖动幅度，又远小于"用户真的换方向"的幅度。
+#:
+#: ⚠ **只作用于"方向反转"**：正向连拖从不延迟——延迟的是"要不要换那张图"，
+#: 不是"窗口跟不跟手"。
+DIRECTION_SWITCH_EPSILON: Final[int] = 8
+
 
 def direction_action(dx: int, last: str | None) -> str | None:
     """由水平位移 ``dx`` 决定该播哪个跑动动作。
@@ -52,8 +70,10 @@ def direction_action(dx: int, last: str | None) -> str | None:
     - ``dx == 0``（纯竖直移动）→ ``last``；``last`` 也是 ``None`` 时
       返回 ``None``，让调用方按 `DEFAULT_DIRECTION` 起跑。
 
-    **只看符号，不看大小**：任何速度阈值都会让慢速拖动时动作来回闪
-    （agent.md §4.6 明写"不设速度阈值"）。
+    **只看符号，不看大小**：任何**速度**阈值都会让慢速拖动时动作来回闪
+    （agent.md §4.6 明写"不设速度阈值"）。这里的 ``dx`` 是**相邻两次移动**的
+    水平增量（task21 UX-01 起），不是"相对按下点的累计位移"——
+    累计位移指不回"刚刚往哪边动"（先左后右时会一直报 left）。
     """
     if dx > 0:
         return RUNNING_RIGHT
@@ -68,7 +88,8 @@ class DragState:
 
     - ``base_pos``：按下那一刻的**窗口左上角**（权威位置，不是回读来的）；
     - ``grab_offset``：鼠标在窗口内的偏移（`按下点 − 窗口左上角`）；
-    - ``last_direction``：上次切到的跑动动作名，供纯竖直移动沿用。
+    - ``last_direction``：上次切到的跑动动作名，供纯竖直移动沿用；
+    - ``last_global_pos``：**上一个鼠标事件**的全局坐标（算相邻位移用）。
 
     ``grab_offset`` 记下来是为了"**快速来回拖不丢偏移**"这条验收：
     即便窗口跟随时因为夹取没能移到理论位置，下一次也用同一个偏移重算，
@@ -85,16 +106,28 @@ class DragState:
     last_direction: str | None = None
     #: 最近一次 `update()` / `begin()` 算出的目标位置（`finish()` 的返回值来源）。
     last_target: QPoint = QPoint(0, 0)
+    #: **上一个鼠标事件**的全局坐标。方向判定看 ``global_pos - 它``（相邻位移）。
+    last_global_pos: QPoint = QPoint(0, 0)
+    #: 待确认的反转候选 `(动作名, 该方向已累计走过的水平距离)`（抖动防抖用）。
+    _pending: tuple[str, int] | None = None
 
     def begin(self, local_pos: QPoint, global_pos: QPoint, window_pos: QPoint) -> None:
-        """开始拖动。``window_pos`` 是**调用方持有的权威位置**（不是回读的）。"""
+        """开始拖动。``window_pos`` 是**调用方持有的权威位置**（不是回读的）。
+
+        ⚠ **每次拖动都从"没有方向"开始**（task21 UX-02）：不显式清空的话，
+        新的一次拖动里"纯竖直移动"会沿用**上一次拖动**的方向——
+        看到的是一只往右边跑、其实一直往上拖的宠物。
+        """
         self.base_pos = QPoint(window_pos)
         self.press_global = QPoint(global_pos)
+        self.last_global_pos = QPoint(global_pos)
         self.grab_offset = QPoint(
             int(local_pos.x()) - int(window_pos.x()),
             int(local_pos.y()) - int(window_pos.y()),
         )
         self.last_target = QPoint(window_pos)
+        self.last_direction = None
+        self._pending = None
 
     def target_position(self, global_pos: QPoint) -> QPoint:
         """按"**按下时的基准位置 + 累计位移**"算出理论上的新左上角。
@@ -110,17 +143,52 @@ class DragState:
     def update(self, global_pos: QPoint) -> tuple[QPoint, str | None]:
         """算出新位置与该播的动作。返回 ``(新位置, 动作名或 None)``。
 
-        动作名 ``None`` = "方向没有依据，沿用上次"（**不是**"不用播动作"）：
+        **位置**仍按"基准 + 累计位移"算（不回读窗口坐标）；
+        **动作**只看**相邻两次移动**的水平增量（task21 UX-01）：
+        累计位移指不回"刚刚往哪边动"。
+
+        动作名 ``None`` = "方向没有依据 / 不用切"（**不是**"不用播动作"）：
         调用方自己决定要不要切回 `idle`——那属于"拖动是不是还在进行"的判断，
         不在本函数里。
         """
-        delta_x = int(global_pos.x()) - self.press_global.x()
-        action = direction_action(delta_x, self.last_direction)
-        if action is not None:
-            self.last_direction = action
+        dx = int(global_pos.x()) - self.last_global_pos.x()
+        self.last_global_pos = QPoint(global_pos)
+        action = self._next_action(dx)
         target = self.target_position(global_pos)
         self.last_target = QPoint(target)
         return target, action
+
+    def _next_action(self, dx: int) -> str | None:
+        """相邻位移 ``dx`` → 该切的动作（带**方向反转防抖**）。
+
+        - 与当前方向相同 / 纯竖直 / 还没有方向依据 → 立刻返回（**不延迟**）；
+        - 与当前方向**相反** → 记成候选，等这个方向累计走过
+          ``DIRECTION_SWITCH_EPSILON`` 才真的切（抖一下就回去的不算换方向）；
+        - 候选自己又反回去了 → 候选作废，重新计数。
+
+        "纯竖直不切、沿用上次方向"这条仍然成立：``dx == 0`` 原样返回
+        ``self.last_direction``。
+        """
+        if dx == 0:
+            return self.last_direction
+        action = direction_action(dx, self.last_direction)
+        if self.last_direction is None or action == self.last_direction:
+            # 第一次有方向依据 / 正向连拖：当场生效，跟手感一点不欠。
+            self.last_direction = action
+            self._pending = None
+            return action
+
+        # 反转候选：累计这个方向的水平距离，够数了才真的切。
+        if self._pending is not None and self._pending[0] == action:
+            travelled = self._pending[1] + abs(dx)
+        else:
+            travelled = abs(dx)
+        if travelled < DIRECTION_SWITCH_EPSILON:
+            self._pending = (action, travelled)
+            return self.last_direction
+        self._pending = None
+        self.last_direction = action
+        return action
 
     def finish(self) -> QPoint:
         """松手：返回**最终位置**（调用方负责夹取 + 写配置）。

@@ -383,7 +383,10 @@ def section_grid_order(app) -> None:
         f"display_rows={layout.display_rows}",
     )
 
-    first_row = [grid._buttons[key].toolTip() for key in layout.display_rows[0]]
+    # ⚠ task21 UX-12 起 `display_text` 是"未设置"这种**绑定名字**，空映射下整行
+    #    都是它，看不出"第几格是哪个键"。工具提示一直放**完整键名**，改读它。
+    # tooltip 现在是"键 id + 完整键名"两行（task21 UX-12），取第一行就是键 id。
+    first_row = [grid._buttons[key].toolTip().splitlines()[0] for key in layout.display_rows[0]]
     check(
         "第一行左→右是 8 6 4 2 1 3 5 7（旋转 180° 后**中间往外**，与 §2.23 一致）",
         first_row == [f"r2k{n}" for n in (8, 6, 4, 2, 1, 3, 5, 7)],
@@ -441,10 +444,14 @@ def section_capture(app) -> None:
         "空映射",
     )
     check("点一个键位进入录入态", grid.begin_capture("r1k1"), "r1k1")
+    from deskpet import keycapture as _keycapture
+    # ⚠ task21 UX-12：`display_text` 是"绑定的完整名字"（不随录入态变），
+    #    屏幕上那串字才是录入提示——判据读**画出来的字** `QPushButton.text()`。
+    #    文案的真值在 `keycapture.LISTENING`，不在这里重复写死。
     check(
-        "录入态按钮文字变「按下按键…」",
-        grid.button("r1k1").display_text == "按下按键…",
-        f"文字={grid.button('r1k1').display_text!r}",
+        "录入态按钮文字变「按键…」",
+        grid.button("r1k1").text() == _keycapture.LISTENING,
+        f"文字={grid.button('r1k1').text()!r}（期望 {_keycapture.LISTENING!r}）",
     )
     press(grid.button("r1k1"), Qt.Key_F, 0x46, "f")
     check(

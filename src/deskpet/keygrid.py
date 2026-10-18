@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -64,8 +65,13 @@ TEXT_LAYOUT_FALLBACK: Final[str] = "配置里的布局「{missing}」不存在�
 
 #: 重置按钮的文字与确认框（task19 §4.4）。
 TEXT_RESET: Final[str] = "重置"
+
+#: 重置按钮的**首选**宽度（task21 UX-12）：只放两个字，按默认全宽按钮的
+#: 80 px 报宽度会让它那一行变宽，而那一行的宽度会算进整个网格的最小宽度。
+RESET_BUTTON_WIDTH: Final[int] = 52
 RESET_CONFIRM_TITLE: Final[str] = "重置键位"
 RESET_CONFIRM_TEXT: Final[str] = "清空全部键位映射？"
+
 
 #: 同一个物理键绑到多个键位时的提示日志（决策 2：**允许**，只记一条）。
 TEXT_DUPLICATE_HINT: Final[str] = "同一个键 %s 现在绑在多个键位上（这是允许的，不解绑别的键位）"
@@ -128,6 +134,11 @@ class KeyGrid(QWidget):
         header.addWidget(self._title)
         header.addStretch(1)
         self._reset_button = QPushButton(TEXT_RESET)
+        # 只放两个字，不必按默认的全宽按钮：它和标题同一行，多出来的宽度
+        # 会原样算进整个网格的最小宽度（task21 UX-12）。
+        # ⚠ 用 `setMaximumWidth` 而不是 `setFixedWidth`：前者压住"要多宽"，后者
+        # 连 `minimumSizeHint` 一起钉死——而最小宽度正是"一行放不下就裁"的那个数。
+        self._reset_button.setMaximumWidth(RESET_BUTTON_WIDTH)
         self._reset_button.setToolTip(RESET_CONFIRM_TEXT)
         self._reset_button.clicked.connect(self._on_reset_clicked)
         header.addWidget(self._reset_button)
@@ -144,8 +155,21 @@ class KeyGrid(QWidget):
         self._grid_host = QWidget()
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(4)
+        # 间距 2（task21 UX-12）：8 列一共 7 道缝，4 px 时是 28 px、2 px 时是 14 px，
+        # 而设置窗口的宽度是钉死的——省下来的这一截正好让按钮放得下
+        # "按下按键…"那句不能被省略的提示（见 `keycapture.TEXT_MIN_ROOM_PX`）。
+        self._grid.setSpacing(2)
         outer.addWidget(self._grid_host)
+
+        # ⚠ **整个网格不许把窗口撑宽**（task21 UX-12）：8 键一行的最小宽度
+        # 实测能到 640 px 以上，而设置窗口内容区只有约 530 px。窗口是
+        # 固定尺寸的（task11 定案"不要靠把数字调大"），所以撑不动就只能被裁。
+        # 对策两层：① 键位按钮**宽度固定 + 文字按宽度省略**（完整名字进 tooltip，
+        # 见 `keycapture._apply_fitted_text`）；② 网格/按钮都改成可压缩的策略，
+        # 让窗口能自己缩，而不是被内容撑宽后裁掉。
+        # 判据：`2*8` 布局下 `KeyGrid.minimumSizeHint().width()` 必须小于内容区宽度。
+        self._grid_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.set_layout(None)
 
@@ -213,6 +237,9 @@ class KeyGrid(QWidget):
             for column_index, key_id in enumerate(row):
                 button = keycapture.SingleKeyCaptureButton()
                 button.setToolTip(key_id)
+                # 宽度**固定**（`keycapture.KEY_BUTTON_WIDTH`）：按钮自己按这个宽度
+                # 省略文字（task21 UX-12），这里不再重复管宽度，免得两处说法分叉。
+                button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
                 button.captured.connect(
                     lambda vk, name, kid=key_id: self._on_captured(kid, vk, name)
                 )
@@ -574,7 +601,10 @@ def build_group(
     """
     box = QGroupBox(parent)
     layout = QVBoxLayout(box)
-    layout.setContentsMargins(9, 9, 9, 9)
+    # ⚠ 内边距 0（task21 UX-12）：这 9 px 是**两侧各一份**，会原样叠加在 8 键
+    # 网格的最小宽度上。设置窗口的宽度是固定的（task11 定案"不要靠把数字调大"），
+    # 那一圈白边就是"最后一列按钮被裁掉"的那几像素。
+    layout.setContentsMargins(0, 0, 0, 0)
     grid = KeyGrid(box, suspend=suspend)
     layout.addWidget(grid)
     # ⚠ 组名已经在网格自己的标题行里了（那里还要放重置按钮），

@@ -678,6 +678,35 @@ def _check_window_wiring(app) -> None:
         Qt.LeftButton,
         Qt.NoModifier,
     )
+    # ⚠ task21 UX-03 起"按下"只进入 `Pressed` 候选态，**不**退出 manual——
+    #   真正起拖要越过的位移。而双击手势读的是"按下时是不是 manual"，
+    #   所以这里必须像真实的 Qt 事件流那样**先送一次 press**再送 dblclick
+    #   （Qt 的顺序是 press → release → dblclick）。
+    press = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(5.0, 5.0),
+        QPointF(5.0, 5.0),
+        Qt.LeftButton,
+        Qt.LeftButton,
+        Qt.NoModifier,
+    )
+    window.mousePressEvent(press)
+    check(
+        "只按下（没挪鼠标）不打断 manual 坐姿",
+        window.manual_rest is True and window.dragging is False,
+        f"manual={window.manual_rest} dragging={window.dragging}",
+    )
+    window.mouseReleaseEvent(
+        QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease,
+            QPointF(5.0, 5.0),
+            QPointF(5.0, 5.0),
+            Qt.LeftButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+    )
+    window.mousePressEvent(press)
     window.mouseDoubleClickEvent(event)
     check(
         "manual 休息中双击宠物 → 退出 manual",

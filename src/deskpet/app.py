@@ -730,14 +730,23 @@ class HotkeyController:
         ## 顺序：先放旧的、再注册新的；失败把旧的抢回来
 
         `RegisterHotKey` 对同一个组合是"自己占着自己"，所以换键必须
-        **先释放旧的**，否则新键还没试就注定失败（如果新旧相同则直接返回成功）。
+        **先释放旧的**，否则新键还没试就注定失败。
+        "新旧相同"只用**管理器的实际状态**判断（见下面那段注释），不看调用方给的
+        两个字符串——它们在回滚路径上本来就相同。
 
         失败路径上一定要 `restore(previous)`：不恢复的话，用户敲了一个被占用的
         组合之后会落到**一个热键都没有**的状态 —— 那正是 task12 最怕的事情
         （藏起来叫不回来）。所以"回滚"在这里是**真的把旧热键注册回去**，
         而不是只把配置写回去（`task12 §6："绝不落到没有热键可用"`）。
         """
-        if combo == previous:
+        # ⚠ **不比"新旧说法是否相同"**（task21 CODE-03）。原来的判据是
+        # `if combo == previous: return HotkeyOutcome(True, combo, "")`，而设置窗口在
+        # "注册成功、写配置失败"的回滚路径上正是调 `change(previous, previous)`：
+        # 那句话让他直接返回 True，**旧热键根本没有被抢回来** → 内存里一个热键
+        # 都没有（`combo is None`），磁盘上却仍是旧值。
+        # 真正该问的是"管理器**现在实际**注册的是哪个"，那只有 `manager.combo` 知道。
+        if self.manager.combo == combo:
+            self.window.set_hotkey_available(self.manager.has_hotkey)
             return HotkeyOutcome(True, combo, "")
         self.manager.release_hotkey()
         outcome = self.manager.try_register(combo)

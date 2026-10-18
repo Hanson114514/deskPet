@@ -57,6 +57,7 @@ task08 起**拖动是正式交互**：只有**按在人物身上**才起拖（�
 
 
 import logging
+from collections import OrderedDict
 
 from PySide6.QtCore import QElapsedTimer, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -353,8 +354,30 @@ class AnimationDriver(QObject):
 #:
 #: 收到 `keys_changed` **不当场重绘**：一次重绘（遮罩 + 半透明窗口）实测约 **41 ms**
 #: （agent.md 4.9），高速连打时连打会积压成一串没人看得清的中间态。
-#: 这里用一个**单次**定时器把它合并：期间再来变化只**重置**定时器，不叠加。
+#: 这里用一个**单次**定时器把它合并。
+#:
+#: ⚠ **是节流不是防抖**（task21 UX-11）：定时器已经在等就**不重置**，
+#: 于是"持续输入"期间画面每 `REPAINT_INTERVAL_MS` 照样刷一次；重置（防抖）
+#: 会让持续输入期间一次都不刷。
 REPAINT_INTERVAL_MS: Final[int] = 16
+
+#: 按下之后、判定为 **Dragging** 之前要越过的位移（屏幕逻辑像素，task21 UX-03）。
+#:
+#: 鼠标按下那一刻**只进入 `Pressed`**（什么都没变）；越过这个阈值才真的接管
+#: 动作控制权、挂起静置逻辑、切指针。这样"只点一下"不会把休息姿势打断，
+#: 而真拖动只多等 4 px（人手抖一下就到了，跟手感不受影响）。
+DRAG_START_DISTANCE: Final[int] = 4
+
+#: 窗口区域（`QRegion`）缓存**最少**留几条（task21 UX-05）。
+#:
+#: 键是"这张渲染图的身份"：同一张图区域永远一样，重算只是白花
+#: `createAlphaMask()` 的时间。实际上限是 `max(这个数, 当前动作帧数) + 换档余量`
+#: （见 `_region_limit()`）—— 写死一个数的话，帧数比它多的动作（`idle` 90 帧、
+#: `waiting` 240 帧）会在**同一轮播放里自己把自己挤掉**，等于没有缓存。
+REGION_CACHE_LIMIT: Final[int] = 64
+
+#: 上面那个上限之外**额外**留的余量（够放下一档过渡的两三个动作）。
+REGION_CACHE_HEADROOM: Final[int] = 32
 
 
 class PetWindow(QWidget):
@@ -395,6 +418,31 @@ class PetWindow(QWidget):
         self._user_positioned = False
         #: **按下那一刻**是不是 `manual` 坐姿（双击判据，见 `mouseDoubleClickEvent`）。
         self._manual_rest_at_press = False
+        #: **按下但还没越过拖动阈值**（task21 UX-03 的 `Pressed` 态）。
+        #: 此时窗口还没接管任何东西：姿势不动、静置计时照走、指针不变。
+        #: 越过 `DRAG_START_DISTANCE` 才交给 `_begin_drag()`（→ `Dragging`）。
+        self._press_pending = False
+        #: `Pressed` 态里按下的**局部**坐标（只为了交给 `DragState.grab_offset`）。
+        self._press_local = QPoint(0, 0)
+        #: **画面 → QRegion** 的 LRU 缓存（task21 UX-05）。
+        #: 键是 `(id(渲染图), 宽, 高, 阈值)`：同一张图的区域永远一样，
+        #: 重算只是白花 `createAlphaMask()` 的时间。
+        #: ⚠ **不能直接拿 `QImage` 当字典键**（PySide6 里它不可哈希，实测
+        #: `TypeError: unhashable type`）。所以键是"这张图的身份"，并且缓存**同时
+        #: 持有图本身的强引用**（`_region_owner`）——否则图被回收、`id()` 被复用，
+        #: 会拿另一张图的区域去设遮罩（"可点区域与看到的画面不一致"）。
+        self._region_cache: "OrderedDict[tuple[int, int, int, int], QRegion | None]" = OrderedDict()
+        #: 与 `_region_cache` 同键的**图本身**（强引用，见上面的说明）。
+        self._region_owner: "OrderedDict[tuple[int, int, int, int], QImage]" = OrderedDict()
+        #: 真的算过多少次区域（诊断 / 自检用：换帧命中缓存时它**不该涨**）。
+        self.region_builds = 0
+        #: **上一次夹取**用的那个可见矩形（下一轮并进 `_clamp_box`，见那里）。
+        #: `None` = 还没夹过。
+        self._clamp_box_cache: tuple[int, int, int, int] | None = None
+        #: 动作包络（`所有动作首帧` 的可见块并集）与它属于哪个档位。
+        #: 档位对不上就重算——换档之后可见块的**大小与位置都会变**。
+        self._envelope_box: tuple[int, int, int, int] | None = None
+        self._envelope_level: int = -1
         #: 双击手势正在进行中（`wave_once()` 置真，播完由 `_on_sequence_done` 清掉）。
         #: ⚠ **不能**拿 `animation.in_sequence` 代替：`sequence_done` 发出时
         #: 片段表已经被清空，那一刻问它永远是假（见 `_on_sequence_done`）。
@@ -712,10 +760,120 @@ class PetWindow(QWidget):
             logger.error("记住尺寸档位失败（第 %d 级）：%s", self._level, reason)
 
     def _move_clamped(self, left: int, top: int) -> None:
-        """夹到屏幕内再写权威位置（越界值不进 `_base_pos`，agent.md §4.5）。"""
+        """夹到屏幕内再写权威位置（越界值不进 `_base_pos`，agent.md §4.5）。
+
+        ## 夹的是**可见人物**，不是透明画布（task21 UX-06）
+
+        第一版把窗口（= 素材的透明画布，整块 `cell`）塞进屏幕，于是人物与
+        屏幕边之间永远隔着画布四周的透明留白——拖到边上看着根本没贴到。
+        现在按**当前画面里真正有像素的那块矩形**（`visible_bounds`）夹：
+        允许透明留白跑去屏幕外，人物边缘可以真的贴住屏幕边。
+
+        ⚠ **抓得回来**这条红线不能破：人物的可见块永远**整块**留在屏幕内
+        （不是"留一角"）。所以哪怕可见块因为换帧/换镜像而变化，用户在任何
+        时候都点得到人物。
+        """
+        inner_x, inner_y, inner_w, inner_h = self._clamp_box()
+        # `clamp_position()` 的语义是"把 宽 × 高 这块夹进屏幕、返回左上角"。
+        # 传可见块时先把它换算成"这块自己要落在哪"，再减回窗口偏移。
+        x, y = geometry.clamp_position(
+            left + inner_x, top + inner_y, inner_w, inner_h, self._screen_area()
+        )
+        self.move_to(x - inner_x, y - inner_y)
+        # 记下这一次夹取用的那一块：下一次夹取会把它并进来（见 `_clamp_box`）。
+        self._clamp_box_cache = (inner_x, inner_y, inner_w, inner_h)
+
+    def _clamp_box(self) -> tuple[int, int, int, int]:
+        """夹取时该用的"可见矩形" `(窗口内偏移x, 偏移y, 宽, 高)`。
+
+        默认是整块画布 `(0, 0, 宽, 高)`；算得出可见块时取这三者的并集：
+
+        1. **当前这一帧**的可见块；
+        2. **本档位下所有动作首帧**的包络（`_action_bounds_envelope`）；
+        3. **上一次夹取用的那一块**（`_clamp_box_cache`）。
+
+        ## 为什么光看当前帧不够（task21 自检挖出来的两条真 bug）
+
+        可见块是**逐帧/逐动作**变的——同一档位下 `idle` 是 `(46,41,39,56)`，
+        `running_right` 是 `(40,41,39,57)`，`rest` 是 `(38,70,55,33)`（躺姿往左、往下伸）。
+        只按当前帧夹的后果实测过两次：
+
+        - **拖动中**切到 `running_*`，可见块当场出右下角；
+        - **松手回** `idle`、或**切到** `rest`/`waiting`，同样出屏（`808 > 800`）。
+
+        于是"人物永远点得到"这条红线被换帧打破。补了 ②（覆盖所有动作）与
+        ③（覆盖"松手回上一个姿势"）之后，夹取只会**更保守**，任何时候都在屏内。
+
+        ⚠ ③ 这个缓存**只在夹取时更新**（`_move_clamped`），不跟帧变化走——
+        跟帧走就等于又变成"逐帧取并集"，窗口会被拖得来回挪。
+        """
+        bounds = self.visible_bounds
+        if bounds is None:
         width, height = self.pixel_size
-        x, y = geometry.clamp_position(left, top, width, height, self._screen_area())
-        self.move_to(x, y)
+            return (0, 0, width, height)
+        # 当前这一帧 + **本档位下所有动作首帧的包络** + 上一次夹取用的那一块。
+        # 三者取并集：缺了包络，切到躺姿（`rest` 的可见块比 `idle` 更靠左/更低，
+        # 实测 808 > 800）就会出屏；缺了上一次，松手回 `idle` 那一下也会出屏
+        # （task21 自检两条都抓到过）。
+        envelope = self._action_bounds_envelope()
+        box = _union_box(bounds, envelope) if envelope is not None else bounds
+        previous = self._clamp_box_cache
+        if previous is None:
+            return box
+        return _union_box(previous, box)
+
+    def _action_bounds_envelope(self) -> tuple[int, int, int, int] | None:
+        """**本档位下所有动作首帧**的可见块并集（按档位缓存，换档自动作废）。
+
+        ## 为什么用"每个动作的首帧"而不是"每一帧"
+
+        首帧已经是每个动作里**最像"这个人站在哪儿"**的一帧，且算这 7 张图一共
+        只要几十毫秒（只在换档后的第一次夹取时发生，不进逐帧路径）。全帧扫描
+        （`weedy.waiting` 240 帧）会把换档拖成肉眼可见的停顿——而"可点区域"
+        并不要求包络精确，多留一点点透明边距完全可以接受。
+
+        算不出来的动作（缺图 / 坏图）**跳过**，不影响其它动作。
+        """
+        if self._envelope_level == self._level:
+            return self._envelope_box
+        box: tuple[int, int, int, int] | None = None
+        level = self._level
+        try:
+            for action in self.pet.action_order:
+                if self.pet.action(action) is None:
+                    continue
+                # ⚠ 渲染层给的是 `QPixmap`，而区域是**按 `QImage` 算的**（`_region_for`
+                # 的键也基于图对象）——先转成图，否则 `region_for_frame()` 直接判空，
+                # 整个包络静默变成 `None`（task21 自检抓到：夹取退回"只看当前帧"）。
+                pixmap = self._renderer.frame(action, 0, level, False)
+                if pixmap.isNull():
+                    continue
+                bounds = hit_test.visible_bounds(
+                    hit_test.region_for_frame(
+                        pixmap.toImage(), alpha_threshold=self._mask_threshold
+                    )
+                )
+                if bounds is None:
+                    continue
+                box = bounds if box is None else _union_box(box, bounds)
+        except Exception:  # pragma: no cover - 素材异常时退化成"当前这一帧"
+            logger.debug("算动作包络失败，退化为当前帧", exc_info=True)
+            box = None
+        self._envelope_level = level
+        self._envelope_box = box
+        return box
+
+    @property
+    def visible_bounds(self) -> tuple[int, int, int, int] | None:
+        """**当前画面**里真正有像素的那块矩形 `(x, y, w, h)`（窗口内逻辑坐标）。
+
+        取当前帧区域的外接矩形（`hit_test.visible_bounds()`）——与遮罩同一个
+        来源，所以"看得到的边缘"与"贴边用的边缘"永远是同一条线。
+        算不出来（空帧 / 没有 app）→ `None`，调用方退回整块画布。
+        """
+        if self._frame_image.isNull():
+            return None
+        return hit_test.visible_bounds(self._region_for(self._frame_image))
 
     # ------------------------------------------------------------ 显示
 
@@ -946,7 +1104,7 @@ class PetWindow(QWidget):
         return self._repaint_timer.isActive()
 
     def _on_keys_changed(self, pressed: tuple) -> None:
-        """收到"按下的键变了"：**记下状态、重置合并定时器**，不当场重绘。
+        """收到"按下的键变了"：**记下状态、起一次节流定时器**，不当场重绘。
 
         ## 为什么不当场重绘（task18 4.3）
 
@@ -959,6 +1117,14 @@ class PetWindow(QWidget):
         图像要的是"最终那一份 `pressed`"，不是"每一次变化的回放"。
         所以这里立刻把状态写进画源（不重绘），到点时画的就已经是**最新**的状态
         ——中间那些变化天然被合并掉了，这正是"合并"的语义。
+
+        ## ⚠ 是**节流**不是防抖（task21 UX-11）
+
+        第一版每次都 `start()`（= 重置计时）：只要用户不停地敲键，每次变化都把
+        重绘再推迟 16 ms，**持续输入期间画面一直不刷新**（一停才画）。
+        现在**定时器已经在等就不再重置**：上一拍起算 16 ms 后必画一次，
+        画的是那一刻的最新状态。判据：`ts = time.perf_counter()` →
+        `repaint_count` 每 `REPAINT_INTERVAL_MS` 至少长一次，与信号密度无关。
         """
         self.pressed_signal_count += 1
         content = self._keyview_content
@@ -971,8 +1137,9 @@ class PetWindow(QWidget):
                 for key in keyview_render.pressed_tuple(pressed)
                 if key in content.active_keys
             )
-        # 重置（不是在原有基础上叠加）：`start()` 会重新计时，
-        # 于是"连续变化"被合并成"最后一次变化之后 REPAINT_INTERVAL_MS"一次重绘。
+        # **节流**：已经在等就不要再 `start()`（那会把它重置成"最后一次变化之后
+        # 再等 16 ms"，持续输入就永远画不出来）。没在等才起一拍。
+        if not self._repaint_timer.isActive():
         self._repaint_timer.start()
 
     def _on_repaint_due(self) -> None:
@@ -1100,7 +1267,9 @@ class PetWindow(QWidget):
             # 键盘形态没有"第几帧"这回事：画面由 `pressed` 与档位决定。
             # 走 `_repaint_current()` 而不是这里（`_on_frame_due` 在 KV 形态下
             # 永远不会被触发——切换形态时表已经停了，见 `set_form()`）。
-            return self._repaint_current(),
+            # ⚠ **不许带尾逗号**：`return x,` 返回的是**元组** `(x,)`，恒为真，
+            # "没换上图"会被报成 True（task21 UX-10）。
+            return bool(self._repaint_current())
 
         mirrored = self.mirrored
         image = self._content.image(self._level, mirrored)
@@ -1480,8 +1649,33 @@ class PetWindow(QWidget):
 
     # ------------------------------------------------------------ 拖动（task08）
 
-    def _start_drag(self, local_pos: QPoint, global_pos: QPoint) -> bool:
-        """进入拖动：接管动作控制权、归零静置计时、切指针形状。
+    def _press(self, local_pos: QPoint, global_pos: QPoint) -> bool:
+        """鼠标左键按下 → **`Pressed`（候选拖动）**，此刻还什么都没动（task21 UX-03）。
+
+        返回是否进入了候选态（已经在拖动 / 已经在候选态 → `False`）。
+
+        ## 为什么按下不能直接算拖动
+
+        第一版在按下那一刻就：挂起静置逻辑、退出 `manual` 坐姿、切 `idle`——
+        于是用户**只是点了一下**（没挪鼠标），休息中的宠物也会突然站起来换姿势
+        （用户 2026 实测反馈）。按下只是"可能要拖"，**位移才是拖动**。
+
+        ## `Pressed` 态里什么都不碰
+
+        姿势不动、静置计时照走、指针不变。唯一记下来的是"按在了窗口内的哪一点"
+        与按下的全局坐标——越过 `DRAG_START_DISTANCE` 之后交给 `_begin_drag()`。
+        """
+        if self.drag_controller.active or self._press_pending:
+            return False
+        self._press_pending = True
+        self._press_local = QPoint(local_pos)
+        # 先把基准记在 DragState 里（`begin()` 还会再写一次，值相同、无副作用）：
+        # 判定越过阈值的那一次移动要靠 `press_global` 算"离按下点多远"。
+        self.drag_controller.state.press_global = QPoint(global_pos)
+        return True
+
+    def _begin_drag(self, press_global: QPoint) -> bool:
+        """越过阈值 → **`Dragging`（确定拖动）**：接管动作控制权、切指针形状。
 
         返回是否真的开始了（已经在拖动中 → `False`，不重复发 `drag_started`）。
 
@@ -1492,9 +1686,15 @@ class PetWindow(QWidget):
         2. **退出 `manual` 坐姿**：用户拖动 = "别一直坐着了"（task08 §2 第 8 条），
            这一步同时会把阶段切回 `IDLE`；
         3. 指针换成"移动"形状（松手还原）。
+
+        ⚠ **`begin()` 要收下按下那一刻的全局坐标**（不是现在这个）：`DragState`
+        的位置公式是"基准 + 累计位移"，而"基准"是**按下时**的窗口位置。
+        传现在这个坐标会把前 `DRAG_START_DISTANCE` 像素的位移吞掉
+        （窗口会从那一点起"多走"一小截之外的东西——表现是拖动起步时一顿）。
         """
         if self.drag_controller.active:
             return False
+        self._press_pending = False
 
         self.set_action_suspended(True)
         # 拖动开始就先摆好 idle 的姿势：还没位移时"该播什么"没有依据，
@@ -1507,15 +1707,25 @@ class PetWindow(QWidget):
             self.exit_manual_rest()
             if self.pet.has_action(IDLE_ACTION):
                 self.play_action(IDLE_ACTION)
-        self.drag_controller.begin(local_pos, global_pos, self._base_pos)
+        # 按下点用 `Pressed` 记下的那一个：基准位置必须配"按下那一刻"的全局坐标。
+        self.drag_controller.begin(self._press_local, press_global, self._base_pos)
         self.setCursor(Qt.SizeAllCursor)
         return True
 
     def _apply_drag(self, global_pos: QPoint) -> None:
-        """拖动中的一次移动：算位置 → **夹取** → 写权威位置 → 按方向切动作。"""
+        """拖动中的一次移动：算位置 → **夹取** → 写权威位置 → 按方向切动作。
+
+        ⚠ **键盘形态只移动窗口、绝不碰动作**（task21 UX-09）：KV 没有"当前动作",
+        而 `play_action('running_*')` 不但会换掉切回宠物形态时看到的那一帧，
+        还会**把帧定时器拉起来**——闭着形态分支时，拖完一次 KV 再退出 KV，
+        人物会从一个莫名其妙的位置接着跑。所以形态判断放在**最前面**，
+        连 `drag_controller.update()` 的动作结果都不看。
+        """
         target, action = self.drag_controller.update(global_pos)
         # 夹取在 `_move_clamped()` 里，**早于** `move_to()` 写权威位置（§4.5）。
         self._move_clamped(target.x(), target.y())
+        if self._content.form == FORM_KEYVIEW:
+            return
         if action is None:
             # 纯竖直移动：沿用上次方向（不切、不闪）——`direction_action()` 的返回值
             # 表达的就是"没有依据"，不是"该停了"。
@@ -1537,7 +1747,7 @@ class PetWindow(QWidget):
         state = self.drag_controller.state
         final = state.target_position(global_pos)
         self._move_clamped(final.x(), final.y())
-        # 松手回 `idle`（task08 §2 第 3 条）。键盘形态下不碰动作（见 `_start_drag`）。
+        # 松手回 `idle`（task08 §2 第 3 条）。键盘形态下不碰动作（见 `_begin_drag`）。
         if self._content.form != FORM_KEYVIEW and self.pet.has_action(IDLE_ACTION):
             self.play_action(IDLE_ACTION)
 
@@ -1654,7 +1864,7 @@ class PetWindow(QWidget):
         """退出 `manual`（主动坐姿）并站起来；返回是否真的退出了。
 
         退出方式有三条（task07 §4）：**再次点菜单 / 双击宠物 / 拖动**。
-        task08 已把拖动这条接上（见 `_start_drag`）。
+        task08 已把拖动这条接上（task21 起是 `_begin_drag`：越过 `DRAG_START_DISTANCE` 才起拖）。
         """
         if self._idle is None:
             if not self._manual_rest:
@@ -1849,15 +2059,59 @@ class PetWindow(QWidget):
 
         关着的时候**必须用默认阈值**：那是 task15 之前的既有行为，
         改它会动到"关掉就与以前一模一样"那条基线（§0/§2.8/§4.9/§4.12）。
+
+        ## ⚠ 区域要**缓存**（task21 UX-05）
+
+        遮罩窗口每换一次形状，合成器就要重做一次（agent.md §4.9 量过：
+        真窗口比纯调度多约 8 ms/帧）。而**同一张渲染图**的区域永远一样——
+        素材是逐帧固定的。所以按"图"缓存区域：换帧命中缓存时连
+        `createAlphaMask()` 都不必重算，只做一次 `setMask()`。
+        判据：连播一轮之后 `region_builds` 只涨一轮的量，而不是每帧都涨。
         """
-        region = hit_test.region_for_frame(
-            image, alpha_threshold=self._mask_threshold
-        )
+        region = self._region_for(image)
         if region is None or region.isEmpty():
             self.clearMask()
             return False
         self.setMask(region)
         return True
+
+    def _region_for(self, image: QImage | None):
+        """取 ``image`` 的窗口区域，**按图缓存**（键就是图本身）。
+
+        渲染层对同一帧返回的本来就是**同一个对象**，所以"身份"就足以当键
+        （见 `_region_cache` 的说明：`QImage` 在 PySide6 里**不可哈希**）。
+        缓存按 LRU 封顶（``REGION_CACHE_LIMIT``）：1~10 档来回切时区域大小差着
+        两个数量级，留太多等于白吃内存——而**单帧**的区域只有几 KB 量级，
+        逐帧播放永远只用到"当前这一张"。
+        """
+        # ⚠ 键里**必须**带 `id(image)` 的身份，不能只用尺寸：同一档位下所有帧的
+        # 尺寸都一样，只用 `(宽, 高, 阈值)` 会让整轮播放共用第一个区域的区域
+        # （"能点到的范围"与"看到的画面"当场分叉，§2.8 的红线）。
+        key = (id(image), int(image.width()), int(image.height()), self._mask_threshold)
+        if key in self._region_cache:
+            self._region_cache.move_to_end(key)
+            return self._region_cache[key]
+        region = hit_test.region_for_frame(
+            image, alpha_threshold=self._mask_threshold
+        )
+        self.region_builds += 1
+        self._region_cache[key] = region
+        self._region_owner[key] = image
+        limit = self._region_limit()
+        while len(self._region_cache) > limit:
+            self._region_cache.popitem(last=False)
+            self._region_owner.popitem(last=False)
+        return region
+
+    def _region_limit(self) -> int:
+        """这个窗口的区域缓存该留几条（**跟着当前动作的帧数走**）。
+
+        单个 `QRegion` 只有几 KB 量级，几十条也只占一小块内存；而"帧数放不下"
+        会让一轮播放里反复重算（与 task16 修过的渲染缓存是同一个坑）。
+        """
+        action = self.pet.action(self._animation.action)
+        frames = action.frame_count if action is not None else 0
+        return max(REGION_CACHE_LIMIT, int(frames)) + REGION_CACHE_HEADROOM
 
     @property
     def _mask_threshold(self) -> int:
@@ -1885,7 +2139,7 @@ class PetWindow(QWidget):
             painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        """左键按下：进入拖动。
+        """左键按下：进入 **`Pressed`（候选拖动）**，此刻**不改任何状态**。
 
         **只有按在人物身上才起拖**由 `setMask` 负责——点击透明区时事件
         由系统级穿透到下面的窗口，本窗口根本收不到 `mousePressEvent`。
@@ -1895,29 +2149,72 @@ class PetWindow(QWidget):
         两种坐标**不可混用**（agent.md §4.9）：
 
         - 位移用 `globalPosition()`（屏幕坐标）；
-        - 命中判定用 `position()`（窗口内坐标）——本 task 只把它记进
+        - 命中判定用 `position()`（窗口内坐标）——这里把它记进
           `DragState.grab_offset`，供诊断与将来的自窗口内判定使用。
+
+        ⚠ **点一下不等于拖动**（task21 UX-03）：姿势、静置计时、指针三样都
+        原样留着，等 `mouseMoveEvent` 越过 `DRAG_START_DISTANCE` 再交给
+        `_begin_drag()`。
         """
         if event.button() == Qt.LeftButton:
             # 记下"按下这一刻是不是 manual 坐姿"：双击要用**按下前**的值，
-            # 而 `_start_drag()` 会把 manual 退出掉（见 mouseDoubleClickEvent）。
+            # 而 `_begin_drag()` 会把 manual 退出掉（见 mouseDoubleClickEvent）。
             self._manual_rest_at_press = self.manual_rest
-            self._start_drag(
+            self._press(
                 event.position().toPoint(),
                 event.globalPosition().toPoint(),
             )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        """拖动：位移一律用**全局坐标**算（窗口内坐标是给命中判定用的）。"""
-        if self.drag_controller.active and event.buttons() & Qt.LeftButton:
-            self._apply_drag(event.globalPosition().toPoint())
+        """拖动：位移一律用**全局坐标**算（窗口内坐标是给命中判定用的）。
+
+        两段：`Pressed` 里先看"离按下点够不够远"，够了才转 `Dragging`；
+        转的那一下**接着就用同一个事件算位置**，所以越过阈值几乎没有延迟
+        （真正的跟手位移从第一个移动事件就全部算上）。
+        """
+        if not event.buttons() & Qt.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+        global_pos = event.globalPosition().toPoint()
+        if self._press_pending:
+            if not self._press_exceeded(global_pos):
+                super().mouseMoveEvent(event)
+                return
+            self._begin_drag(self.drag_controller.state.press_global)
+        if self.drag_controller.active:
+            self._apply_drag(global_pos)
         super().mouseMoveEvent(event)
 
+    def _press_exceeded(self, global_pos: QPoint) -> bool:
+        """`Pressed` 态里"这一次移动够不够格算拖动"。
+
+        判据是**离按下点的直线距离**（x、y 都算）：纯竖直拖动也要能起拖，
+        否则"往上拖"会永远卡在候选态。
+        """
+        delta = QPoint(global_pos) - self.drag_controller.state.press_global
+        return (
+            abs(delta.x()) >= DRAG_START_DISTANCE
+            or abs(delta.y()) >= DRAG_START_DISTANCE
+        )
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and self.drag_controller.active:
+        """松手：真的拖动过才算一次完整收尾；**只点了一下**就安静收尾。
+
+        单击（`Pressed` 里松手，从没越过阈值）走 `_cancel_press()`：
+        不写配置、不发 `drag_finished`、不切动作、不碰静置计时——
+        那一下**什么都没发生**，正是 task21 UX-03 要的结果。
+        """
+        if event.button() == Qt.LeftButton:
+            if self.drag_controller.active:
             self._finish_drag(event.globalPosition().toPoint())
+            elif self._press_pending:
+                self._cancel_press()
         super().mouseReleaseEvent(event)
+
+    def _cancel_press(self) -> None:
+        """`Pressed` 态里松手 / 被打断：**什么都不留**（与 `abort_drag()` 同一种语义）。"""
+        self._press_pending = False
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         """双击宠物：**完整挥手一次 + 播 `waving`**（task10 §4"双击手势"）。
@@ -1943,15 +2240,16 @@ class PetWindow(QWidget):
         ## 为什么最后要 `abort_drag()`
 
         双击的第 2 次按下会先来一个 `mousePressEvent`（Qt 的固定顺序是
-        press → release → **dblclick**），于是 `_start_drag()` 已经把它当成
-        一次拖动的开始：窗口进入 `dragging`、静置逻辑被挂起。
+        press → release → **dblclick**），于是窗口已经进入了 `Pressed`
+        （task21 之前则是直接进了 `Dragging`：静置逻辑被挂起、姿势被改成 `idle`）。
         紧接着到来的 `dblclick` **没有**配对的 release（第 2 次按下的 release
-        在 dblclick 之后才到），所以这一次"拖动"会一直挂在那儿——
+        在 dblclick 之后才到），所以这一次"按下"会一直挂在那儿——
         表现是**双击之后宠物僵住**（`dragging` 恒为真 → 右键菜单永远不弹、
         静置逻辑永远被挂起）。
 
         task07 的自检当场抓到了这一条（双击后 `suspended` 变成 `True` 且不再恢复）。
-        对策是双击时**明确中止**这次拖动：动作控制权还回去、指针还原。
+        对策是双击时**明确中止**这次按下：`Pressed` 清掉、真的在拖动时把
+        动作控制权还回去、指针还原。
         用户真要拖动时，第二次按下之后**移动**会重新进入拖动——
         双击的那两次点击本身没有位移，中止它不会丢任何东西。
 
@@ -1969,11 +2267,15 @@ class PetWindow(QWidget):
             super().mouseDoubleClickEvent(event)
             self.abort_drag()
             return
+        # `Pressed`（按了但没挪）时双击：**必须**把候选收掉再走手势。
+        # task21 起"按下"不再接管任何状态，所以这里不需要也不应该
+        # 走上面那条"拖动中忽略"的路径——单击/双击照常挥手。
+        self._cancel_press()
 
         if self._manual_rest_at_press:
             # `manual` 坐姿中双击 → 站起来回 `auto`（task07 §2 第 6 条）。
-            # ⚠ 看的是**按下时**记下的值：双击的第 2 次按下会先走一遍
-            # `_start_drag()`，而它会把 `manual` 退出掉（拖动 = "别坐着了"）。
+            # ⚠ 看的是**按下时**记下的值：第二次按下之后若真的拖起来，
+            # `_begin_drag()` 会把 `manual` 退出掉（拖动 = "别坐着了"）。
             # 此刻再问 `manual_rest` 就永远是假，这一条就失效了。
             self.exit_manual_rest()
 
@@ -2041,10 +2343,10 @@ class PetWindow(QWidget):
         """立即中止当前拖动（不写配置、不发 `drag_finished`）；返回是否真的中止了。
 
         用途只有一个：**双击**。双击的第 2 次按下先来一个 `mousePressEvent`
-        （Qt 的顺序是 press → release → dblclick），于是 `_start_drag()` 已经
-        把窗口置成 `dragging`、并挂起了静置逻辑；而这一次按下**不会**有配对的
+        （Qt 的顺序是 press → release → dblclick），于是窗口已经被置成
+        `Pressed`（task21 之前是直接 `Dragging`）；而这一次按下**不会**有配对的
         `mouseReleaseEvent` 走到 `_finish_drag()`（它的 release 在 dblclick 之后，
-        且此时 `active` 已经被这里清掉）。
+        且此时标志已经被这里清掉）。
 
         "中止"与"松手"是两件事，所以**故意不复用** `_finish_drag()`：
 
@@ -2054,12 +2356,31 @@ class PetWindow(QWidget):
         动作控制权照常还回去，并**重新计时**（与松手一致）——
         否则静置逻辑会一直停摆，宠物再也不会张望。
         """
+        # `Pressed`（按下但还没越过阈值）也要收掉：task21 起"双击的第 2 次按下"
+        # 只可能停在候选态，那时没有任何状态被接管过，清掉标志就够了。
+        self._press_pending = False
         if not self.drag_controller.active:
             return False
         self.drag_controller.active = False
         self.set_action_suspended(False)
         self.unsetCursor()
         return True
+
+
+def _union_box(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """两个窗口内矩形 `(x, y, w, h)` 的**并集外接矩形**（task21 UX-06）。
+
+    夹取要的是"这两块一起放得下"的那一块：并集之后，换姿势只会让夹取
+    **更保守**，不会让上一块已经合规的画面因为换帧而越界。
+    """
+    x0 = min(first[0], second[0])
+    y0 = min(first[1], second[1])
+    x1 = max(first[0] + first[2], second[0] + second[2])
+    y1 = max(first[1] + first[3], second[1] + second[3])
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
 def _pick_action(pet: PetSpec, preferred: str) -> str:

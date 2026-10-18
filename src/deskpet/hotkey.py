@@ -362,7 +362,10 @@ def _register_window_class() -> None:  # pragma: no cover - 需要 Windows
     info = WNDCLASSEXW()
     info.cbSize = ctypes.sizeof(WNDCLASSEXW)
     info.lpfnWndProc = ctypes.cast(_WINDOW_PROC, ctypes.c_void_p)
-    info.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)  # type: ignore[attr-defined]
+    # ⚠ 句柄走 `win32` 那一层（`HMODULE` 已声明成指针宽度，task21 CODE-02）：
+    # 这里原先裸调 `ctypes.windll.kernel32.GetModuleHandleW(None)`，没有原型 →
+    # 64 位下返回值被当 32 位 int，截断后的实例句柄拿去注册窗口类，好坏看运气。
+    info.hInstance = win32.get_module_handle()
     info.lpszClassName = _WINDOW_CLASS_NAME
     if not user32.RegisterClassExW(ctypes.byref(info)):
         # 已经注册过（同一个进程跑第二遍）不是错误：继续用已有的类。
@@ -426,6 +429,8 @@ def _create_window(class_name: str) -> int:  # pragma: no cover - 需要 Windows
         ctypes.c_void_p,
     ]
     user32.CreateWindowExW.restype = wintypes.HWND
+    # ⚠ 参数类型**必须**声明（task21 CODE-02）：`hMenu` / `hInstance` 都是指针
+    # 宽度，漏声明就等于把 8 字节压成 4 字节传进去。
     return int(
         user32.CreateWindowExW(
             0,
@@ -438,7 +443,8 @@ def _create_window(class_name: str) -> int:  # pragma: no cover - 需要 Windows
             0,
             _HWND_MESSAGE,
             None,
-            ctypes.windll.kernel32.GetModuleHandleW(None),  # type: ignore[attr-defined]
+            # 与 `RegisterClassExW` 用的是同一个实例句柄（同一个函数取，不重复实现）。
+            win32.get_module_handle(),
             None,
         )
         or 0
@@ -446,9 +452,10 @@ def _create_window(class_name: str) -> int:  # pragma: no cover - 需要 Windows
 
 
 def _destroy_message_window(hwnd: int) -> None:  # pragma: no cover - 需要 Windows
-    import ctypes
-
-    ctypes.windll.user32.DestroyWindow(hwnd)  # type: ignore[attr-defined]
+    # 同样走 `win32`：`DestroyWindow` 的 `HWND` 与返回值都得是原型声明的类型
+    # （task21 CODE-02）。失败只记日志——这是退出收尾，不能因为关窗口失败就抛。
+    if not win32.destroy_window(hwnd):
+        logger.warning("销毁热键消息窗口失败（hwnd=%s）", hwnd)
 
 
 # ------------------------------------------------------------------ 管理器
